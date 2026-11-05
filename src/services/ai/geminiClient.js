@@ -414,18 +414,21 @@ const API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
  */
 const DEFAULT_CHAIN = ["gemini-3.5-flash", "gemini-3.1-flash-lite"];
 
-function buildModelChain() {
-  const fromList = String(process.env.GEMINI_MODELS || "")
-    .split(",")
+function splitList(value) {
+  return String(value || "")
+    .split(/[,\s]+/)
     .map((m) => m.trim())
     .filter(Boolean);
+}
 
-  const legacy = String(process.env.GEMINI_MODEL || "").trim();
-  const legacyIsDead = legacy.startsWith("gemini-2.0");
-
-  const chain = fromList.length
-    ? fromList
-    : [...(legacy && !legacyIsDead ? [legacy] : []), ...DEFAULT_CHAIN];
+function buildModelChain() {
+  // GEMINI_MODELS aur GEMINI_MODEL dono me comma-separated list chalegi.
+  // Shut-down 2.0 family ke models automatically hata diye jate hain.
+  const chain = [
+    ...splitList(process.env.GEMINI_MODELS),
+    ...splitList(process.env.GEMINI_MODEL),
+    ...DEFAULT_CHAIN,
+  ].filter((m) => !m.startsWith("gemini-2.0"));
 
   return [...new Set(chain)];
 }
@@ -622,6 +625,16 @@ async function callModel({ model, apiKey, body, validateText }) {
     // (403 kabhi kabhi model-specific hota hai, isliye usko next_model rakha)
     if (status === 403) {
       return { ok: false, action: "next_model", status, reason: "forbidden" };
+    }
+    // 400 jo model naam ki wajah se hai -> agla model try karo
+    if (status === 400 && /model/i.test(errText)) {
+      setCooldown(model, COOLDOWN_404_MS);
+      return {
+        ok: false,
+        action: "next_model",
+        status,
+        reason: "bad model name",
+      };
     }
     return {
       ok: false,

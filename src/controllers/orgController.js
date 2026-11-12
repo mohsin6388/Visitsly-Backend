@@ -47,6 +47,18 @@ const updateOrg = asyncHandler(async (req, res) => {
   const allowed = ['name', 'city', 'businessType', 'gstin', 'billingEmail', 'phone'];
   const $set = {};
   for (const key of allowed) if (req.body[key] !== undefined) $set[key] = req.body[key];
+  // Billing market (India / UAE) can be changed by the customer only before a
+  // paid subscription exists; after that the Visitsly team changes it.
+  if (req.body.region !== undefined && req.body.region !== org.region) {
+    if (org.status === 'active' || org.razorpay?.subscriptionId) {
+      throw ApiError.badRequest('Paid plan chalu hone ke baad billing country support team hi badal sakti hai.');
+    }
+    $set.region = req.body.region;
+  }
+  // Bulk-messaging details the customer controls.
+  if (req.body.postalAddress !== undefined) $set['messaging.postalAddress'] = req.body.postalAddress;
+  if (req.body.quietHoursStart !== undefined) $set['messaging.quietHoursStart'] = req.body.quietHoursStart || null;
+  if (req.body.quietHoursEnd !== undefined) $set['messaging.quietHoursEnd'] = req.body.quietHoursEnd || null;
   if ($set.name) $set['onboarding.companyDone'] = true;
   await Organization.updateOne({ _id: org._id }, { $set });
   orgService.invalidate(org._id);

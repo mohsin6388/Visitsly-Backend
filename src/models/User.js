@@ -29,6 +29,7 @@ const userSchema = new Schema(
       businessType: { type: String, enum: ['broker', 'agency', 'builder', 'other'], default: 'broker' },
       phone: { type: String, trim: true, default: '' },
       plan: { type: String, default: null },
+      region: { type: String, enum: ['in', 'ae'], default: 'in' },
     },
     phone: { type: String, trim: true },
     passwordHash: { type: String, required: true, select: false },

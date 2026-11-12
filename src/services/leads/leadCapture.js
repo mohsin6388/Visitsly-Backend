@@ -117,6 +117,11 @@ async function captureLead(input) {
       channelPartnerId: input.channelPartnerId || null,
       cpProtectedUntil: input.cpProtectedUntil || null,
       tags: [input.source || 'website_form'],
+      // The buyer enquired themselves → consent to be contacted about it (source kept as proof).
+      consent: {
+        whatsapp: phone ? { status: 'opted_in', source: `enquiry:${clean(input.source, 60) || 'website_form'}`, at: new Date() } : undefined,
+        email: email ? { status: 'opted_in', source: `enquiry:${clean(input.source, 60) || 'website_form'}`, at: new Date() } : undefined,
+      },
     });
   } catch (err) {
     if (err.code === 11000) return captureLead(input); // concurrent duplicate — merge path

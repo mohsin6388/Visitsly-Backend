@@ -80,5 +80,8 @@ outboundJobSchema.index({ batchId: 1, status: 1 });
 outboundJobSchema.index({ campaignId: 1, channel: 1, status: 1 });
 // Outreach page ki list (owner + channel, schedule order)
 outboundJobSchema.index({ ownerId: 1, channel: 1, scheduledFor: 1, seq: 1 });
+// Safety rules: rolling 24h daily caps + per-contact weekly frequency cap.
+outboundJobSchema.index({ ownerId: 1, channel: 1, status: 1, sentAt: -1 });
+outboundJobSchema.index({ leadId: 1, channel: 1, status: 1, sentAt: -1 });
 
 module.exports = mongoose.model("OutboundJob", outboundJobSchema);

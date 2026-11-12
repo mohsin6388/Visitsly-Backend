@@ -221,14 +221,16 @@ const organizationSchema = new Schema(
     // ---- Subscription ----
     plan: {
       type: String,
-      enum: ["trial", "starter", "growth", "builder", "enterprise"],
+      enum: ["trial", "solo", "starter", "growth", "builder", "enterprise"],
       default: "trial",
     },
     billingCycle: {
       type: String,
-      enum: ["monthly", "annual"],
+      enum: ["monthly", "halfyearly", "annual"],
       default: "monthly",
     },
+    // Market the company is billed in: "in" = India (INR + GST), "ae" = UAE (AED + VAT).
+    region: { type: String, enum: ["in", "ae"], default: "in", index: true },
     status: { type: String, enum: STATUSES, default: "trialing", index: true },
     trialEndsAt: { type: Date, default: null },
     currentPeriodEnd: { type: Date, default: null },
@@ -247,9 +249,12 @@ const organizationSchema = new Schema(
     },
     // Platform admin can give a customer custom limits (null = unlimited).
     limitOverrides: { type: Schema.Types.Mixed, default: {} },
+    // Platform admin can switch single features on/off for a customer, e.g.
+    // { bulkWhatsapp: true } to keep bulk messaging for an older Starter client.
+    featureOverrides: { type: Schema.Types.Mixed, default: {} },
     // Platform admin can mark special deals (e.g. founding client discount).
     notes: { type: String, default: "" },
-    priceOverride: { type: Number, default: null }, // custom monthly price (INR) for this org
+    priceOverride: { type: Number, default: null }, // custom monthly price (in the org's currency)
 
     // ---- WhatsApp (Meta Cloud API) — one connected number per org ----
     whatsapp: {
@@ -368,6 +373,25 @@ const organizationSchema = new Schema(
       defaultCommissionPct: { type: Number, default: 2 },
       leadProtectionDays: { type: Number, default: 60 },
       autoApprove: { type: Boolean, default: false },
+    },
+
+    // ---- Bulk messaging safety (WhatsApp + email campaigns) ----
+    messaging: {
+      // Workspace owner/manager accepted the Bulk Messaging Policy.
+      policyVersion: { type: String, default: null },
+      policyAcceptedAt: { type: Date, default: null },
+      policyAcceptedBy: { type: Schema.Types.ObjectId, ref: "User", default: null },
+      // Daily caps (null = platform default from .env).
+      whatsappDailyLimit: { type: Number, default: null },
+      emailDailyLimit: { type: Number, default: null },
+      // Marketing messages only go out inside this local window (HH:mm).
+      quietHoursStart: { type: String, default: null }, // e.g. "21:00"
+      quietHoursEnd: { type: String, default: null }, // e.g. "09:00"
+      // Postal address printed in every campaign email footer (anti-spam laws).
+      postalAddress: { type: String, trim: true, default: "" },
+      // Set by the safety guard when campaigns were auto-paused.
+      autoPausedAt: { type: Date, default: null },
+      autoPausedReason: { type: String, default: null },
     },
 
     weeklyReport: {

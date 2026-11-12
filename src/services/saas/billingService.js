@@ -8,23 +8,36 @@ const OutboundJob = require('../../models/OutboundJob');
 const ApiError = require('../../utils/ApiError');
 const logger = require('../../utils/logger');
 const orgService = require('./orgService');
-const { getPlan, GST_RATE } = require('../../config/plans');
+const { getPlan, getRegion, getCycle, regionOf, isSoldIn, priceFor: catalogPrice } = require('../../config/plans');
 
 /**
- * Razorpay Subscriptions billing for PropAI.
+ * Razorpay Subscriptions billing for Visitsly / PropAI — India (INR + GST)
+ * and UAE (AED + VAT).
  *
  * Flow: Billing page → POST /billing/checkout → Razorpay Checkout popup
  * (card / UPI AutoPay / netbanking e-mandate) → POST /billing/verify →
  * company becomes `active`. Renewals, failures and cancellations arrive on
  * POST /api/webhooks/razorpay and keep the company status in sync.
  *
+ * Cycles: monthly (+ setup fee), halfyearly (6 × monthly, setup waived),
+ * annual (10 × monthly, setup waived).
+ *
+ * UAE (AED) online checkout needs Razorpay international payments enabled on
+ * the account — set RAZORPAY_INTL_ENABLED=true once it is. Until then UAE
+ * customers pay by bank transfer and the platform admin activates them with
+ * "Record offline payment".
+ *
  * Without Razorpay keys the platform admin can still activate companies and
- * record offline payments (UPI / bank transfer) from the Platform panel.
+ * record offline payments from the Platform panel.
  */
 const rzp = axios.create({ baseURL: 'https://api.razorpay.com/v1', timeout: 20000 });
 
 function configured() {
   return Boolean(env.razorpay.keyId && env.razorpay.keySecret);
+}
+
+function intlEnabled() {
+  return String(process.env.RAZORPAY_INTL_ENABLED || '').toLowerCase() === 'true';
 }
 
 function auth() {
@@ -37,61 +50,86 @@ function rzpFail(err, fallback) {
   return ApiError.badRequest(e?.description || err.message || fallback, { code: 'RAZORPAY_ERROR' });
 }
 
-const withGst = (inr) => Math.round(inr * (1 + GST_RATE));
+/** Amount + the region's tax (GST 18% in India, VAT in the UAE). */
+function withTax(amount, region = 'in') {
+  return Math.round(amount * (1 + getRegion(region).taxRate));
+}
+// Back-compat name (India).
+const withGst = (inr) => withTax(inr, 'in');
 
-/** Monthly / annual price (INR, before GST) for this org, honouring a custom price. */
+/** Price for one billing period (before tax) for this org, honouring a custom monthly price. */
 function priceFor(org, planCode, cycle) {
-  const plan = getPlan(planCode);
-  if (org?.priceOverride && planCode === org.plan) {
-    return cycle === 'annual' ? org.priceOverride * 10 : org.priceOverride;
-  }
-  return cycle === 'annual' ? plan.annual : plan.monthly;
+  const c = getCycle(cycle);
+  if (org?.priceOverride && planCode === org.plan) return org.priceOverride * c.multiplier;
+  return catalogPrice(planCode, regionOf(org), c.code).periodPrice;
 }
 
-function quote(org, planCode, cycle) {
+function quote(org, planCode, cycle = 'monthly') {
   const plan = getPlan(planCode);
-  const base = priceFor(org, planCode, cycle);
-  const setupFee = org?.razorpay?.setupFeePaid ? 0 : plan.setupFee || 0;
+  const region = getRegion(org);
+  const c = getCycle(cycle);
+  const catalog = catalogPrice(plan.code, region.code, c.code);
+  const base = priceFor(org, plan.code, c.code);
+  // Setup is charged once, and never on half-yearly / yearly prepay.
+  const setupFee = org?.razorpay?.setupFeePaid ? 0 : catalog.setupDue;
   return {
     plan: plan.code,
     planName: plan.name,
-    cycle,
+    cycle: c.code,
+    cycleLabel: c.label,
+    months: c.months,
+    region: region.code,
+    currency: region.currency,
+    taxLabel: region.taxLabel,
+    taxRate: region.taxRate,
     price: base,
-    priceWithGst: withGst(base),
+    priceWithTax: withTax(base, region.code),
     setupFee,
-    setupFeeWithGst: withGst(setupFee),
-    gstRate: GST_RATE,
-    firstPayment: withGst(base) + withGst(setupFee),
+    setupFeeWithTax: withTax(setupFee, region.code),
+    setupWaived: catalog.setupWaived && !org?.razorpay?.setupFeePaid,
+    firstPayment: withTax(base, region.code) + withTax(setupFee, region.code),
+    // Back-compat field names used by the old Billing page.
+    gstRate: region.taxRate,
+    priceWithGst: withTax(base, region.code),
+    setupFeeWithGst: withTax(setupFee, region.code),
   };
 }
 
-async function ensurePlanId(planCode, cycle, amountInr) {
-  const envKey = `RAZORPAY_PLAN_${planCode.toUpperCase()}_${cycle.toUpperCase()}`;
-  const amountPaise = withGst(amountInr) * 100;
-  const standard = cycle === 'annual' ? getPlan(planCode).annual : getPlan(planCode).monthly;
-  if (process.env[envKey] && amountInr === standard) return process.env[envKey];
+const PERIOD = {
+  monthly: { period: 'monthly', interval: 1, totalCount: 120 },
+  halfyearly: { period: 'monthly', interval: 6, totalCount: 20 },
+  annual: { period: 'yearly', interval: 1, totalCount: 10 },
+};
 
-  const existing = await RazorpayPlan.findOne({ code: planCode, cycle, amountPaise }).lean();
+async function ensurePlanId(planCode, cycle, amount, region) {
+  const reg = getRegion(region);
+  const envKey = `RAZORPAY_PLAN_${planCode.toUpperCase()}_${cycle.toUpperCase()}${reg.code === 'in' ? '' : `_${reg.code.toUpperCase()}`}`;
+  const amountMinor = withTax(amount, reg.code) * 100;
+  const standard = catalogPrice(planCode, reg.code, cycle).periodPrice;
+  if (process.env[envKey] && amount === standard) return process.env[envKey];
+
+  const existing = await RazorpayPlan.findOne({ code: planCode, cycle, amountPaise: amountMinor, currency: reg.currency }).lean();
   if (existing) return existing.planId;
 
+  const p = PERIOD[cycle] || PERIOD.monthly;
   try {
     const { data } = await rzp.post(
       '/plans',
       {
-        period: cycle === 'annual' ? 'yearly' : 'monthly',
-        interval: 1,
+        period: p.period,
+        interval: p.interval,
         item: {
-          name: `${env.saas.productName} ${getPlan(planCode).name} (${cycle})`,
-          amount: amountPaise,
-          currency: 'INR',
-          description: `Incl. ${Math.round(GST_RATE * 100)}% GST`,
+          name: `${env.saas.productName} ${getPlan(planCode).name} (${cycle}${reg.code === 'in' ? '' : `, ${reg.name}`})`,
+          amount: amountMinor,
+          currency: reg.currency,
+          description: reg.taxRate ? `Incl. ${Math.round(reg.taxRate * 100)}% ${reg.taxLabel}` : `Excl. ${reg.taxLabel}`,
         },
-        notes: { code: planCode, cycle },
+        notes: { code: planCode, cycle, region: reg.code },
       },
       { auth: auth() }
     );
-    await RazorpayPlan.create({ code: planCode, cycle, amountPaise, planId: data.id });
-    logger.info(`[billing] Created Razorpay plan ${data.id} for ${planCode}/${cycle} — set ${envKey}=${data.id} to pin it`);
+    await RazorpayPlan.create({ code: planCode, cycle, amountPaise: amountMinor, currency: reg.currency, planId: data.id });
+    logger.info(`[billing] Created Razorpay plan ${data.id} for ${planCode}/${cycle}/${reg.code} — set ${envKey}=${data.id} to pin it`);
     return data.id;
   } catch (err) {
     throw rzpFail(err, 'Razorpay plan create failed');
@@ -102,23 +140,32 @@ async function createCheckout(orgId, { plan: planCode, cycle = 'monthly' }, user
   const plan = getPlan(planCode);
   if (!plan.public || plan.code === 'trial') throw ApiError.badRequest('Ye plan online nahi kharida ja sakta');
   if (plan.contactSales) throw ApiError.badRequest('Enterprise ke liye sales team se baat karein');
-  if (!configured()) {
-    throw ApiError.badRequest('Online payment abhi set nahi hai. PropAI team se UPI/bank transfer se payment karke activate karwayein.', { code: 'BILLING_NOT_CONFIGURED' });
-  }
 
   const org = await Organization.findById(orgId).lean();
-  const q = quote(org, plan.code, cycle);
-  const planId = await ensurePlanId(plan.code, cycle, q.price);
+  const region = getRegion(org);
+  if (!isSoldIn(plan.code, region.code)) {
+    throw ApiError.badRequest(`${plan.name} plan ${region.name} mein available nahi hai.`);
+  }
+  if (!configured()) {
+    throw ApiError.badRequest('Online payment abhi set nahi hai. Visitsly team se UPI/bank transfer se payment karke activate karwayein.', { code: 'BILLING_NOT_CONFIGURED' });
+  }
+  if (region.code !== 'in' && !intlEnabled()) {
+    throw ApiError.badRequest('UAE (AED) online payment abhi on nahi hai. Bank transfer se payment karein — hamari team plan activate kar degi.', { code: 'INTL_BILLING_NOT_ENABLED' });
+  }
+
+  const c = getCycle(cycle);
+  const q = quote(org, plan.code, c.code);
+  const planId = await ensurePlanId(plan.code, c.code, q.price, region.code);
 
   const body = {
     plan_id: planId,
-    total_count: cycle === 'annual' ? 10 : 120,
+    total_count: (PERIOD[c.code] || PERIOD.monthly).totalCount,
     quantity: 1,
     customer_notify: 1,
-    notes: { orgId: String(orgId), plan: plan.code, cycle },
+    notes: { orgId: String(orgId), plan: plan.code, cycle: c.code, region: region.code },
   };
   if (q.setupFee) {
-    body.addons = [{ item: { name: 'One-time setup & onboarding', amount: q.setupFeeWithGst * 100, currency: 'INR' } }];
+    body.addons = [{ item: { name: 'One-time setup & onboarding', amount: q.setupFeeWithTax * 100, currency: region.currency } }];
   }
 
   let sub;
@@ -130,7 +177,7 @@ async function createCheckout(orgId, { plan: planCode, cycle = 'monthly' }, user
 
   await Organization.updateOne(
     { _id: orgId },
-    { $set: { pendingPlan: plan.code, pendingCycle: cycle, 'razorpay.pendingSubscriptionId': sub.id, 'razorpay.planId': planId } }
+    { $set: { pendingPlan: plan.code, pendingCycle: c.code, 'razorpay.pendingSubscriptionId': sub.id, 'razorpay.planId': planId } }
   );
   orgService.invalidate(orgId);
 
@@ -154,6 +201,7 @@ function verifySignature(paymentId, subscriptionId, signature) {
 function periodEndFrom(cycle, fromDate = new Date()) {
   const d = new Date(fromDate);
   if (cycle === 'annual') d.setFullYear(d.getFullYear() + 1);
+  else if (cycle === 'halfyearly') d.setMonth(d.getMonth() + 6);
   else d.setMonth(d.getMonth() + 1);
   return d;
 }
@@ -213,12 +261,14 @@ async function verifyCheckout(orgId, { razorpay_payment_id: paymentId, razorpay_
     plan: org.pendingPlan,
     cycle: org.pendingCycle,
     subscriptionId,
-    setupFeePaid: q.setupFee > 0 || org.razorpay?.setupFeePaid,
+    // A waived setup (half-yearly / yearly prepay) also counts as done.
+    setupFeePaid: q.setupFee > 0 || q.setupWaived || org.razorpay?.setupFeePaid,
   });
   await recordInvoice(orgId, {
     plan: updated.plan,
     billingCycle: updated.billingCycle,
     amount: q.firstPayment,
+    currency: q.currency,
     description: `${q.planName} (${q.cycle})${q.setupFee ? ' + setup' : ''}`,
     razorpayPaymentId: paymentId,
     razorpaySubscriptionId: subscriptionId,
@@ -284,6 +334,7 @@ async function handleWebhook(event) {
           plan: updated.plan,
           billingCycle: updated.billingCycle,
           amount: Math.round((payment.amount || 0) / 100),
+          currency: payment.currency || getRegion(updated).currency,
           description: `${getPlan(updated.plan).name} (${updated.billingCycle})`,
           razorpayPaymentId: payment.id,
           razorpayInvoiceId: payment.invoice_id || null,
@@ -315,6 +366,7 @@ async function handleWebhook(event) {
           plan: org.plan,
           billingCycle: org.billingCycle,
           amount: Math.round((payment.amount || 0) / 100),
+          currency: payment.currency || getRegion(org).currency,
           status: 'failed',
           description: payment.error_description || 'Payment failed',
           razorpayPaymentId: payment.id,
@@ -339,6 +391,7 @@ async function recordOfflinePayment(orgId, { plan, cycle = 'monthly', amount, no
     plan: updated.plan,
     billingCycle: cycle,
     amount: Number(amount) || 0,
+    currency: getRegion(org).currency,
     description: note ? `Offline: ${note}` : 'Offline payment',
     periodStart: from,
     periodEnd,
@@ -357,4 +410,6 @@ module.exports = {
   recordOfflinePayment,
   activate,
   withGst,
+  withTax,
+  intlEnabled,
 };

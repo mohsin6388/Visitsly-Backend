@@ -53,6 +53,7 @@ const signupSchema = z.object({
     city: z.string().trim().max(80).optional(),
     businessType: z.enum(['broker', 'agency', 'builder', 'other']).optional(),
     plan: z.string().max(30).optional(),
+    region: z.enum(['in', 'ae']).optional(),
   }),
 });
 

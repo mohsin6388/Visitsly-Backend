@@ -11,6 +11,7 @@
     "seed:client": "node src/utils/seedClient.js",
     "migrate:lead-contact-indexes": "node src/scripts/migrateLeadContactIndexes.js",
     "saas:migrate": "node src/scripts/migrateToSaas.js",
+    "plans:grandfather": "node src/scripts/grandfatherPlans2026.js",
     "seed:superadmin": "node src/utils/seedSuperAdmin.js"
   },
   "dependencies": {

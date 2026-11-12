@@ -29,7 +29,7 @@ const campaignSchema = new Schema(
     // Ek din mein kitni LEADS ko message jayega (har lead = WhatsApp + Email).
     // Keep campaigns paced by default; the worker still sends one message at a time.
     dailyLimit: { type: Number, default: 100, min: 1, max: 5000 },
-    // HH:mm, Asia/Kolkata. Har din is time par us din ka batch shuru hota hai.
+    // HH:mm, company's local time (Asia/Kolkata or Asia/Dubai). Har din is time par us din ka batch shuru hota hai.
     sendTime: { type: String, default: "10:00" },
     // YYYY-MM-DD (Asia/Kolkata) — pehla batch is din
     startDate: { type: String, required: true },
@@ -53,6 +53,24 @@ const campaignSchema = new Schema(
       // Plain text snapshot; {{name}} placeholder supported. Existing campaigns remain unchanged if template edited later.
       body: { type: String, default: "", maxlength: 5000 },
       imageUrl: { type: String, default: "" },
+    },
+
+    // Bulk Messaging Policy acceptance for THIS campaign (who, when, which version).
+    compliance: {
+      policyVersion: { type: String, default: null },
+      acceptedBy: { type: Schema.Types.ObjectId, ref: "User", default: null },
+      acceptedAt: { type: Date, default: null },
+      consentConfirmed: { type: Boolean, default: false },
+      ip: { type: String, default: null },
+      // Contacts dropped at launch because they opted out / bounced / were contacted too recently.
+      suppressedAtLaunch: { type: Number, default: 0 },
+    },
+    // Safety guard counters + auto-pause reason.
+    safety: {
+      optOuts: { type: Number, default: 0 },
+      skipped: { type: Number, default: 0 },
+      autoPausedAt: { type: Date, default: null },
+      autoPausedReason: { type: String, default: null },
     },
 
     status: {

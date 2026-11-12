@@ -26,21 +26,35 @@ const oid = (id) => new mongoose.Types.ObjectId(String(id));
 
 /** Aaj ki date IST mein, 'YYYY-MM-DD' */
 function todayIST() {
+  return todayIn("Asia/Kolkata");
+}
+
+/** Aaj ki date kisi timezone mein, 'YYYY-MM-DD' */
+function todayIn(timeZone = "Asia/Kolkata") {
   return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Kolkata",
+    timeZone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   }).format(new Date());
 }
 
-/** startDate + dayIndex din ka `sendTime` (IST) ek UTC Date ke roop mein */
-function runAtForDay(startDate, sendTime, dayIndex) {
+// India (+05:30) and UAE (+04:00) have no daylight saving, so fixed offsets are safe.
+const TZ_OFFSETS = { "Asia/Kolkata": "+05:30", "Asia/Dubai": "+04:00" };
+
+/** Company's timezone (from its billing region) for the current tenant. */
+function tenantTimezone() {
+  const org = require("../../context/tenantContext").getOrg();
+  return require("../../config/plans").getRegion(org).timezone;
+}
+
+/** startDate + dayIndex din ka `sendTime` (company local time) ek UTC Date ke roop mein */
+function runAtForDay(startDate, sendTime, dayIndex, offset = IST_OFFSET) {
   const [y, m, d] = startDate.split("-").map(Number);
   const day = new Date(Date.UTC(y, m - 1, d + dayIndex))
     .toISOString()
     .slice(0, 10);
-  return new Date(`${day}T${sendTime}:00${IST_OFFSET}`);
+  return new Date(`${day}T${sendTime}:00${offset}`);
 }
 
 /* ------------------------------------------------------------------ */
@@ -186,6 +200,7 @@ async function enqueueLeads({ ownerId, leadIds, batchId }) {
  */
 async function scheduleCampaignJobs({ campaign, leads }) {
   const now = new Date();
+  const offset = TZ_OFFSETS[tenantTimezone()] || IST_OFFSET;
   const perDay = campaign.dailyLimit > 0 ? campaign.dailyLimit : 0;
   const wantWa = campaign.channels.whatsapp;
   const wantEmail = campaign.channels.email;
@@ -205,7 +220,7 @@ async function scheduleCampaignJobs({ campaign, leads }) {
     const dayIndex = perDay ? Math.floor(eligibleIndex / perDay) : 0;
     const runAt = perDay
       ? (() => {
-          const scheduled = runAtForDay(campaign.startDate, campaign.sendTime, dayIndex);
+          const scheduled = runAtForDay(campaign.startDate, campaign.sendTime, dayIndex, offset);
           return scheduled < now ? now : scheduled;
         })()
       : now;
@@ -413,12 +428,26 @@ async function pauseCampaign(ownerId, campaignId) {
 async function resumeCampaign(ownerId, campaignId) {
   const campaign = await findCampaign(ownerId, campaignId);
   if (!campaign) return null;
+  // Safety: don't push more WhatsApp marketing while Meta rates the number RED.
+  const org = require("../../context/tenantContext").getOrg();
+  if (campaign.channels?.whatsapp && String(org?.whatsapp?.qualityRating || "").toUpperCase() === "RED") {
+    const ApiError = require("../../utils/ApiError");
+    throw ApiError.badRequest(
+      "WhatsApp number ki quality abhi RED hai. Quality GREEN/YELLOW hone tak WhatsApp campaign resume nahi ho sakta — tab tak sirf reply karne wale leads se baat karein.",
+      { code: "WHATSAPP_QUALITY_RED" },
+    );
+  }
   const res = await OutboundJob.updateMany(
     { campaignId: campaign._id, status: "paused" },
     { $set: { status: "pending" } },
   );
   if (campaign.status === "paused") {
     campaign.status = "active";
+    // Customer reviewed the safety pause and chose to continue.
+    if (campaign.safety?.autoPausedReason) {
+      campaign.safety.autoPausedReason = null;
+      campaign.safety.autoPausedAt = null;
+    }
     await campaign.save();
   }
   return { campaign, modified: res.modifiedCount };
@@ -481,6 +510,8 @@ module.exports = {
   CHANNELS,
   STATUSES,
   todayIST,
+  todayIn,
+  tenantTimezone,
   runAtForDay,
   enqueueLeads,
   scheduleCampaignJobs,

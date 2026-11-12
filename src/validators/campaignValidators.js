@@ -26,6 +26,9 @@ const launchCampaignSchema = z.object({
     whatsappTemplateHeader: z.string().trim().max(200).optional().default(""),
     whatsappTemplateFooter: z.string().trim().max(200).optional().default(""),
     whatsappTemplateButtons: z.array(z.string().trim().max(60)).max(10).optional().default([]),
+    // Bulk Messaging Policy — both must be true to launch.
+    acceptPolicy: z.boolean().optional().default(false),
+    consentConfirmed: z.boolean().optional().default(false),
     whatsappTemplateVariables: z.array(z.object({
       index: z.number().int().min(1).max(10),
       source: z.enum(["name", "phone", "email", "static"]),
@@ -44,6 +47,12 @@ const launchCampaignSchema = z.object({
     }
     if (b.channels.whatsapp && !b.whatsappTemplateName) {
       ctx.addIssue({ code: "custom", path: ["whatsappTemplateName"], message: "Select an approved WhatsApp template." });
+    }
+    if (!b.acceptPolicy) {
+      ctx.addIssue({ code: "custom", path: ["acceptPolicy"], message: "Accept the Bulk Messaging Policy to launch." });
+    }
+    if (!b.consentConfirmed) {
+      ctx.addIssue({ code: "custom", path: ["consentConfirmed"], message: "Confirm these contacts agreed to hear from you." });
     }
   }),
 });

@@ -213,8 +213,10 @@
 const { z } = require("zod");
 
 const orgRoles = z.enum(["manager", "agent"]);
-const planCode = z.enum(["starter", "growth", "builder", "enterprise"]);
-const cycle = z.enum(["monthly", "annual"]);
+const planCode = z.enum(["solo", "starter", "growth", "builder", "enterprise"]);
+const cycle = z.enum(["monthly", "halfyearly", "annual"]);
+const region = z.enum(["in", "ae"]);
+const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Use HH:mm");
 
 const updateOrgSchema = z.object({
   body: z.object({
@@ -224,6 +226,10 @@ const updateOrgSchema = z.object({
     gstin: z.string().trim().max(20).optional(),
     billingEmail: z.string().email().optional().or(z.literal("")),
     phone: z.string().trim().max(20).optional(),
+    region: region.optional(),
+    postalAddress: z.string().trim().max(300).optional(),
+    quietHoursStart: hhmm.optional().or(z.literal("")).nullable(),
+    quietHoursEnd: hhmm.optional().or(z.literal("")).nullable(),
   }),
 });
 
@@ -346,9 +352,20 @@ const platformUpdateSchema = z.object({
   params: z.object({ id: z.string().regex(/^[a-f\d]{24}$/i) }),
   body: z.object({
     plan: z
-      .enum(["trial", "starter", "growth", "builder", "enterprise"])
+      .enum(["trial", "solo", "starter", "growth", "builder", "enterprise"])
       .optional(),
     billingCycle: cycle.optional(),
+    region: region.optional(),
+    featureOverrides: z.record(z.string().max(40), z.boolean()).nullable().optional(),
+    messaging: z
+      .object({
+        whatsappDailyLimit: z.number().int().min(0).max(1000000).nullable().optional(),
+        emailDailyLimit: z.number().int().min(0).max(1000000).nullable().optional(),
+        quietHoursStart: hhmm.nullable().optional(),
+        quietHoursEnd: hhmm.nullable().optional(),
+        clearAutoPause: z.boolean().optional(),
+      })
+      .optional(),
     status: z
       .enum(["trialing", "active", "past_due", "suspended", "cancelled"])
       .optional(),
@@ -442,6 +459,8 @@ const customerRequestSchema = z.object({
         "extraAiConversations",
         "voiceMinute",
         "leadRevival",
+        "metaAdsManagement",
+        "projectLaunch",
       ])
       .optional(),
     quantity: z.number().int().min(1).max(1000).optional(),
@@ -452,7 +471,7 @@ const customerRequestSchema = z.object({
 const offlinePaymentSchema = z.object({
   params: z.object({ id: z.string().regex(/^[a-f\d]{24}$/i) }),
   body: z.object({
-    plan: z.enum(["starter", "growth", "builder", "enterprise"]).optional(),
+    plan: planCode.optional(),
     cycle: cycle.default("monthly"),
     amount: z.number().min(0),
     note: z.string().max(300).optional(),

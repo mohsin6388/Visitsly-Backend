@@ -9,7 +9,7 @@ const AuditLog = require('../models/AuditLog');
 const orgService = require('../services/saas/orgService');
 const billing = require('../services/saas/billingService');
 const { orgSummary } = require('../services/saas/orgSummary');
-const { getPlan, PLANS } = require('../config/plans');
+const { getPlan, PLANS, CYCLES } = require('../config/plans');
 const { subscriptionState } = require('../services/saas/subscription');
 const PlatformRequest = require('../models/PlatformRequest');
 const env = require('../config/env');
@@ -17,17 +17,22 @@ const { signSupportToken } = require('../utils/tokens');
 
 const DAY = 24 * 60 * 60 * 1000;
 
-/** Monthly recurring revenue contribution of one org (INR, before GST). */
+/** AED → INR for platform stats (set AED_TO_INR in .env to the current rate). */
+const AED_TO_INR = Number.parseFloat(process.env.AED_TO_INR || '25.8') || 25.8;
+
+/** Monthly recurring revenue contribution of one org (INR, before tax; AED converted). */
 function mrrOf(org) {
   if (org.status !== 'active' && org.status !== 'past_due') return 0;
-  const plan = getPlan(org.plan);
-  const monthly = org.priceOverride || (org.billingCycle === 'annual' ? plan.annual / 12 : plan.monthly);
-  return Math.round(monthly);
+  const region = org.region === 'ae' ? 'ae' : 'in';
+  const p = getPlan(org.plan).pricing[region] || getPlan(org.plan).pricing.in || { monthly: 0 };
+  const cycle = CYCLES[org.billingCycle] || CYCLES.monthly;
+  const monthly = org.priceOverride || (p.monthly * cycle.multiplier) / cycle.months;
+  return Math.round(region === 'ae' ? monthly * AED_TO_INR : monthly);
 }
 
 /** GET /api/platform/stats */
 const stats = asyncHandler(async (req, res) => {
-  const orgs = await Organization.find({}).select('plan status billingCycle priceOverride trialEndsAt createdAt usage').lean();
+  const orgs = await Organization.find({}).select('plan status billingCycle region priceOverride trialEndsAt createdAt usage').lean();
   const now = Date.now();
   const byStatus = {};
   const byPlan = {};
@@ -111,10 +116,10 @@ const getOrgDetail = asyncHandler(async (req, res) => {
   const [team, invoices, org] = await Promise.all([
     User.find({ orgId: snap._id }).select('name email phone orgRole isActive lastLoginAt createdAt').lean(),
     Invoice.find({ orgId: snap._id }).sort({ createdAt: -1 }).limit(50).lean(),
-    Organization.findById(snap._id).select('notes limitOverrides priceOverride suspendedReason addons branding').lean(),
+    Organization.findById(snap._id).select('notes limitOverrides featureOverrides priceOverride suspendedReason addons branding messaging region').lean(),
   ]);
   return new ApiResponse(200, {
-    org: { ...(await orgSummary(snap)), notes: org.notes, limitOverrides: org.limitOverrides || {}, suspendedReason: org.suspendedReason, addons: org.addons || {}, branding: org.branding || {} },
+    org: { ...(await orgSummary(snap)), notes: org.notes, limitOverrides: org.limitOverrides || {}, featureOverrides: org.featureOverrides || {}, messagingAdmin: org.messaging || {}, suspendedReason: org.suspendedReason, addons: org.addons || {}, branding: org.branding || {} },
     team,
     invoices,
   }).send(res);
@@ -130,11 +135,25 @@ const updateOrg = asyncHandler(async (req, res) => {
     org.plan = b.plan;
   }
   if (b.billingCycle) org.billingCycle = b.billingCycle;
+  if (b.region) org.region = b.region;
+  if (b.featureOverrides !== undefined) {
+    org.featureOverrides = b.featureOverrides || {};
+    org.markModified('featureOverrides');
+  }
+  if (b.messaging) {
+    for (const k of ['whatsappDailyLimit', 'emailDailyLimit', 'quietHoursStart', 'quietHoursEnd']) {
+      if (b.messaging[k] !== undefined) org.messaging[k] = b.messaging[k];
+    }
+    if (b.messaging.clearAutoPause) {
+      org.messaging.autoPausedAt = null;
+      org.messaging.autoPausedReason = null;
+    }
+  }
   if (b.status) {
     org.status = b.status;
     org.suspendedReason = b.status === 'suspended' ? b.suspendedReason || 'Suspended by PropAI' : null;
     if (b.status === 'active' && (!org.currentPeriodEnd || org.currentPeriodEnd < new Date())) {
-      org.currentPeriodEnd = new Date(Date.now() + (org.billingCycle === 'annual' ? 365 : 30) * DAY);
+      org.currentPeriodEnd = new Date(Date.now() + ({ annual: 365, halfyearly: 182 }[org.billingCycle] || 30) * DAY);
     }
   }
   if (b.extendTrialDays) {

@@ -235,7 +235,7 @@ const getMe = asyncHandler(async (req, res) => {
  */
 const signup = asyncHandler(async (req, res) => {
   if (!env.saas.enabled || !env.saas.signupEnabled) throw ApiError.forbidden('Signup is disabled');
-  const { companyName, name, email, phone, password, city, businessType, plan } = req.body;
+  const { companyName, name, email, phone, password, city, businessType, plan, region } = req.body;
   const normalizedEmail = String(email || '').trim().toLowerCase();
 
   if (isDisposableEmail(normalizedEmail)) {
@@ -251,7 +251,8 @@ const signup = asyncHandler(async (req, res) => {
 
   const rawToken = generateRawToken();
   const baseSlug = Organization.slugify(companyName);
-  const pendingPlan = plan && PLANS[plan]?.public ? plan : null;
+  const signupRegion = region === 'ae' ? 'ae' : 'in';
+  const pendingPlan = plan && PLANS[plan]?.public && require('../config/plans').isSoldIn(plan, signupRegion) ? plan : null;
   const user = new User({
     name,
     email: normalizedEmail,
@@ -268,6 +269,7 @@ const signup = asyncHandler(async (req, res) => {
       businessType: businessType || 'broker',
       phone: phone || '',
       plan: pendingPlan,
+      region: signupRegion,
     },
   });
   user.setPassword(password);
@@ -334,6 +336,7 @@ const verifyEmail = asyncHandler(async (req, res) => {
       billingEmail: user.email,
       phone: pending.phone || user.phone || '',
       plan: 'trial',
+      region: pending.region === 'ae' ? 'ae' : 'in',
       status: 'trialing',
       trialEndsAt: new Date(Date.now() + TRIAL_DAYS * 24 * 60 * 60 * 1000),
       pendingPlan: pending.plan && PLANS[pending.plan]?.public ? pending.plan : null,

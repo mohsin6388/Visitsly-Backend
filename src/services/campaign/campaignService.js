@@ -196,7 +196,9 @@ const Conversation = require("../../models/Conversation");
 const AuditLog = require("../../models/AuditLog");
 const ApiError = require("../../utils/ApiError");
 const { importLeadRows } = require("../leads/leadImportService");
-const { scheduleCampaignJobs, todayIST } = require("../queue/outboundQueue");
+const { scheduleCampaignJobs, todayIn, tenantTimezone } = require("../queue/outboundQueue");
+const policy = require("../compliance/messagingPolicy");
+const { hasFeature, upgradeMessageFor, limitsFor } = require("../../config/plans");
 const { emitToUser } = require("../../sockets");
 
 /**
@@ -227,6 +229,29 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
 
   // SaaS plan limit: campaigns per month.
   const tenantOrg = require("../../context/tenantContext").getOrg();
+
+  // Plan features: bulk WhatsApp / email campaigns are Growth+ (trial can try them).
+  if (tenantOrg) {
+    if (selectedChannels.whatsapp && !hasFeature(tenantOrg, "bulkWhatsapp")) {
+      throw new ApiError(403, upgradeMessageFor("bulkWhatsapp", tenantOrg), { code: "PLAN_FEATURE", feature: "bulkWhatsapp" });
+    }
+    if (selectedChannels.email && !hasFeature(tenantOrg, "emailCampaigns")) {
+      throw new ApiError(403, upgradeMessageFor("emailCampaigns", tenantOrg), { code: "PLAN_FEATURE", feature: "emailCampaigns" });
+    }
+  }
+
+  // Bulk Messaging Policy: the person launching confirms consent + accepts the rules.
+  if (!config.acceptPolicy || !config.consentConfirmed) {
+    throw ApiError.badRequest(
+      "Campaign launch karne se pehle Bulk Messaging Policy accept karein aur confirm karein ki in contacts ne aapse message lene ki permission di hai.",
+      { code: "POLICY_NOT_ACCEPTED" },
+    );
+  }
+  // Marketing only inside the allowed local hours: a send time at night is
+  // moved to the morning window (the worker also holds night-time jobs).
+  const clamped = policy.clampSendTime(tenantOrg, config.sendTime);
+  config.sendTime = clamped.sendTime;
+
   if (tenantOrg) {
     const { assertWithinLimit, monthlyUsage } = require("../saas/subscription");
     assertWithinLimit(
@@ -272,12 +297,38 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
     }
   }
 
-  const whatsappLeads = leads.filter(
-    (lead) => selectedChannels.whatsapp && Boolean(lead.phone),
-  );
-  const emailLeads = leads.filter(
-    (lead) => selectedChannels.email && Boolean(lead.email),
-  );
+  // Consent / suppression: opted-out, do-not-contact, bounced and spam-complaint
+  // contacts are dropped per channel (they stay in the CRM).
+  const suppressed = { whatsapp: 0, email: 0, reasons: {} };
+  const waOk = (lead) => {
+    if (!selectedChannels.whatsapp || !lead.phone) return false;
+    const r = policy.suppressionReason(lead, "whatsapp");
+    if (r) {
+      suppressed.whatsapp += 1;
+      suppressed.reasons[r] = (suppressed.reasons[r] || 0) + 1;
+      return false;
+    }
+    return true;
+  };
+  const emOk = (lead) => {
+    if (!selectedChannels.email || !lead.email) return false;
+    const r = policy.suppressionReason(lead, "email");
+    if (r) {
+      suppressed.email += 1;
+      suppressed.reasons[r] = (suppressed.reasons[r] || 0) + 1;
+      return false;
+    }
+    return true;
+  };
+  const usable = new Map(leads.map((lead) => [String(lead._id), { wa: waOk(lead), email: emOk(lead) }]));
+  const whatsappLeads = leads.filter((lead) => usable.get(String(lead._id)).wa);
+  const emailLeads = leads.filter((lead) => usable.get(String(lead._id)).email);
+  if (!whatsappLeads.length && !emailLeads.length && (suppressed.whatsapp || suppressed.email)) {
+    throw ApiError.badRequest(
+      "Selected saare contacts ne opt-out kiya hai ya unke email bounce/spam ho chuke hain — inhe campaign nahi bheja ja sakta.",
+      { code: "ALL_SUPPRESSED" },
+    );
+  }
   if (selectedChannels.whatsapp && !config.whatsappTemplateName) {
     throw ApiError.badRequest(
       "Bulk WhatsApp ke liye Meta ka approved template select karein.",
@@ -309,11 +360,10 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
   }
 
   // Only queue contacts that match the selected channel; contact rows themselves remain in CRM.
-  const eligibleLeads = leads.filter(
-    (lead) =>
-      (selectedChannels.whatsapp && Boolean(lead.phone)) ||
-      (selectedChannels.email && Boolean(lead.email)),
-  );
+  const eligibleLeads = leads.filter((lead) => {
+    const u = usable.get(String(lead._id));
+    return u.wa || u.email;
+  });
   if (!eligibleLeads.length) {
     throw ApiError.badRequest(
       "Selected channel ke liye matching contact fields nahi hain.",
@@ -342,18 +392,37 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
     );
   }
 
-  const today = todayIST();
+  const today = todayIn(tenantTimezone());
   const startDate =
     config.startDate && config.startDate >= today ? config.startDate : today;
+
+  // Never schedule more per day than the company's daily safety cap allows.
+  let dailyLimit = config.dailyLimit;
+  if (tenantOrg) {
+    const caps = [];
+    if (selectedChannels.whatsapp) caps.push(await policy.dailyCap(tenantOrg, ownerId, "whatsapp"));
+    if (selectedChannels.email) caps.push(await policy.dailyCap(tenantOrg, ownerId, "email"));
+    const cap = Math.min(...caps.filter((c) => Number.isFinite(c) && c > 0));
+    if (Number.isFinite(cap) && dailyLimit > cap) dailyLimit = cap;
+  }
+  const policyAcceptedAt = new Date();
   const campaign = await Campaign.create({
     ownerId,
     name: config.name,
     audienceId: config.audienceId || null,
     phoneNumberId: config.phoneNumberId || null,
     channels: selectedChannels,
-    dailyLimit: config.dailyLimit,
+    dailyLimit,
     sendTime: config.sendTime,
     startDate,
+    compliance: {
+      policyVersion: policy.POLICY_VERSION,
+      acceptedBy: userId || null,
+      acceptedAt: policyAcceptedAt,
+      consentConfirmed: true,
+      ip: ip || null,
+      suppressedAtLaunch: suppressed.whatsapp + suppressed.email,
+    },
     whatsappTemplate: selectedChannels.whatsapp
       ? {
           name: config.whatsappTemplateName,
@@ -385,8 +454,8 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
     campaign,
     leads: eligibleLeads.map((lead) => ({
       _id: lead._id,
-      hasPhone: Boolean(lead.phone),
-      hasEmail: Boolean(lead.email),
+      hasPhone: usable.get(String(lead._id)).wa,
+      hasEmail: usable.get(String(lead._id)).email,
       email: lead.email || "",
       name: lead.name || "",
     })),
@@ -411,12 +480,24 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
       skipped,
       invalid,
       channels: selectedChannels,
-      dailyLimit: config.dailyLimit,
+      dailyLimit,
       sendTime: config.sendTime,
       whatsappTemplateName: config.whatsappTemplateName || null,
+      policyVersion: policy.POLICY_VERSION,
+      consentConfirmed: true,
+      suppressed,
     },
     ip,
   });
+
+  // Remember that this workspace accepted the current policy version.
+  if (tenantOrg && tenantOrg.messaging?.policyVersion !== policy.POLICY_VERSION) {
+    await require("../../models/Organization").updateOne(
+      { _id: tenantOrg._id },
+      { $set: { "messaging.policyVersion": policy.POLICY_VERSION, "messaging.policyAcceptedAt": policyAcceptedAt, "messaging.policyAcceptedBy": userId || null } },
+    );
+    require("../saas/orgService").invalidate(tenantOrg._id);
+  }
 
   emitToUser(ownerId, "outreach:campaign", {
     campaignId: String(campaign._id),
@@ -437,9 +518,11 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
     queued: { whatsapp: plan.whatsapp, email: plan.email },
     withoutEmail: campaign.leadsWithoutEmail,
     withoutPhone: eligibleLeads.filter((lead) => !lead.phone).length,
-    whatsappAvailable: eligibleLeads.filter((lead) => Boolean(lead.phone))
-      .length,
-    emailAvailable: eligibleLeads.filter((lead) => Boolean(lead.email)).length,
+    whatsappAvailable: whatsappLeads.length,
+    emailAvailable: emailLeads.length,
+    suppressed,
+    dailyLimit,
+    sendTimeShifted: clamped.shifted,
     totalDays: plan.totalDays,
     firstRunAt: plan.firstRunAt,
     lastRunAt: plan.lastRunAt,

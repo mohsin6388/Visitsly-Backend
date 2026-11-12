@@ -216,27 +216,66 @@ async function sendPasswordResetEmail(toEmail, resetLink) {
   }, idempotencyKey);
 }
 
-/** One lead / one email API send. Body is plain text and converted to safe HTML. */
-async function sendCampaignEmail({ to, subject, body, imageUrl = "", vars = {}, companyName = "", replyTo, idempotencyKey, tags = [] }) {
+/**
+ * One lead / one campaign email. Body is plain text and converted to safe HTML.
+ *
+ * Bulk-email rules applied to every campaign email:
+ *   - a visible unsubscribe link (works without login),
+ *   - List-Unsubscribe + List-Unsubscribe-Post headers (Gmail / Yahoo one-click),
+ *   - the sender company's name and postal address in the footer
+ *     (CAN-SPAM-style requirement; also expected by UAE TDRA and Indian rules).
+ */
+async function sendCampaignEmail({
+  to,
+  subject,
+  body,
+  imageUrl = "",
+  vars = {},
+  companyName = "",
+  replyTo,
+  idempotencyKey,
+  tags = [],
+  unsubscribeUrl = "",
+  oneClickUnsubscribe = false,
+  postalAddress = "",
+  region = "in",
+}) {
   const finalSubject = renderTemplate(subject, vars);
   const finalBody = renderTemplate(body, vars);
-  const footer = companyName ? `${companyName}\n` : "";
-  const unsubscribeNote = "Agar aap ye emails nahi chahte to kripya sender se contact karke unsubscribe request karein.";
+  const footerLines = [companyName, postalAddress].filter(Boolean);
+  const whyText = region === "ae"
+    ? "You are receiving this email because you enquired about a property or shared your contact with us."
+    : "Aapko ye email isliye mila kyunki aapne property ke baare mein enquiry ki thi ya apna contact share kiya tha.";
+  const unsubText = region === "ae" ? "Unsubscribe" : "Unsubscribe (aage se emails band karein)";
+  const fallbackNote = "Agar aap ye emails nahi chahte to is email ka reply karke 'unsubscribe' likhein.";
+  const unsubLink = unsubscribeUrl && /^https?:\/\//i.test(unsubscribeUrl) ? unsubscribeUrl : "";
   const htmlContent = `
     <div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;color:#1e293b">
       ${imageUrl && /^https:\/\//i.test(imageUrl) ? `<img src="${escapeHtml(imageUrl)}" alt="Property image" style="display:block;max-width:100%;height:auto;border-radius:10px;margin:0 0 20px;" />` : ""}
       ${textToHtml(finalBody)}
       <hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0">
-      <p style="font-size:12px;color:#64748b;line-height:1.5">${escapeHtml(footer)}${escapeHtml(unsubscribeNote)}</p>
+      <p style="font-size:12px;color:#64748b;line-height:1.5;margin:0 0 6px">${footerLines.map(escapeHtml).join("<br>")}</p>
+      <p style="font-size:12px;color:#64748b;line-height:1.5;margin:0">${escapeHtml(whyText)}
+        ${unsubLink ? `<br><a href="${escapeHtml(unsubLink)}" style="color:#2563eb">${escapeHtml(unsubText)}</a>` : `<br>${escapeHtml(fallbackNote)}`}
+      </p>
     </div>`;
+  const textFooter = [footerLines.join("\n"), whyText, unsubLink ? `${unsubText}: ${unsubLink}` : fallbackNote]
+    .filter(Boolean)
+    .join("\n");
+  const headers = {};
+  if (unsubLink) {
+    headers["List-Unsubscribe"] = `<${unsubLink}>`;
+    if (oneClickUnsubscribe) headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click";
+  }
   const selectedReplyTo = normalizeReplyTo(replyTo || env.brevo.replyTo);
   const payload = {
     to: [{ email: normalizeEmailAddress(to) }],
     subject: finalSubject,
     htmlContent,
-    textContent: `${finalBody}\n\n--\n${footer}${unsubscribeNote}`,
+    textContent: `${finalBody}\n\n--\n${textFooter}`,
     ...(selectedReplyTo ? { replyTo: selectedReplyTo } : {}),
     ...(tags.length ? { tags: normalizeTags(tags) } : {}),
+    ...(Object.keys(headers).length ? { headers } : {}),
   };
   return sendViaBrevo(payload, idempotencyKey);
 }

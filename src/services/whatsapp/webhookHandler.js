@@ -4,6 +4,7 @@ const Message = require("../../models/Message");
 const User = require("../../models/User");
 const Notification = require("../../models/Notification");
 const logger = require("../../utils/logger");
+const policy = require("../compliance/messagingPolicy");
 const { emitToUser } = require("../../sockets");
 const conversationEngine = require("../ai/conversationEngine");
 const env = require("../../config/env");
@@ -172,6 +173,8 @@ async function createLeadForUnknownSender(phone, contactName) {
       name: contactName || `WhatsApp ${phone}`,
       phone,
       source: "whatsapp_inbound",
+      // The person messaged us first.
+      consent: { whatsapp: { status: "opted_in", source: "inbound_whatsapp", at: new Date() } },
     });
   } catch (err) {
     if (err.code === 11000) {
@@ -324,6 +327,38 @@ async function handleInboundMessage(waMessage, contact) {
     .sendTypingIndicator(whatsappMessageId)
     .catch(() => {});
 
+  // Opt-out / opt-in keywords (STOP, UNSUBSCRIBE, BAND KARO, إلغاء … / START).
+  // Handled before the AI so the contact gets a clear confirmation and is
+  // never messaged by a campaign again. The AI does not reply to these.
+  const keyword = policy.classifyKeyword(rawText);
+  if (keyword) {
+    try {
+      await policy.applyWhatsAppKeyword(lead, keyword);
+      const org = tenantContext.getOrg();
+      const confirmText = policy.confirmationText(keyword, org);
+      if (confirmText) {
+        const sent = await require("./metaWhatsappClient").sendTextMessage({ phone: lead.phone, text: confirmText });
+        await Message.create({
+          conversationId: conversation._id,
+          leadId: lead._id,
+          direction: "outbound",
+          sender: "ai",
+          text: confirmText,
+          whatsappMessageId: sent?.messageId || null,
+          timestamp: new Date(),
+        }).catch(() => {});
+      }
+      if (keyword === "opt_out") {
+        // Stop AI follow-ups for this contact; a human can still reply if the buyer writes again.
+        await Conversation.updateOne({ _id: conversation._id, status: "ai_active" }, { $set: { status: "manual" } }).catch(() => {});
+      }
+      logger.info(`[whatsapp] Lead ${lead._id} ${keyword === "opt_out" ? "opted out" : "opted in"} via keyword`);
+    } catch (kwErr) {
+      logger.error("[whatsapp] Opt-out keyword handling failed", { error: kwErr.message });
+    }
+    return;
+  }
+
   // Hand off to the AI engine. Awaited so replies for a given lead stay in
   // order, but wrapped in its own try/catch — an AI failure must never
   // surface back as a webhook failure (which would trigger Meta retries).
@@ -355,8 +390,19 @@ async function handleWebhook(payload) {
     for (const entry of entries) {
       const changes = Array.isArray(entry.changes) ? entry.changes : [];
       for (const change of changes) {
-        if (change.field !== "messages") continue; // ignore non-message webhook fields
         const value = change.value || {};
+        // Number quality alerts → pause WhatsApp campaigns when RED / FLAGGED.
+        if (change.field === "phone_number_quality_update" && env.saas.enabled) {
+          // entry.id = the WhatsApp Business Account (WABA) id of the company.
+          const Organization = require("../../models/Organization");
+          const org = await Organization.findOne({
+            $or: [{ "whatsapp.businessAccountId": String(entry.id || "") }, { "extraNumbers.businessAccountId": String(entry.id || "") }],
+          }).lean();
+          if (org) await policy.handleWhatsAppQuality(org, value).catch((err) => logger.error("[whatsapp] Quality update failed", { error: err.message }));
+          else logger.warn("[whatsapp] Quality update for unknown WABA", { wabaId: entry.id, event: value.event });
+          continue;
+        }
+        if (change.field !== "messages") continue; // ignore other non-message webhook fields
 
         // SaaS: one Meta app webhook serves every company. Route each change
         // to the company that owns the receiving phone number.

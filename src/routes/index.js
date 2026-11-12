@@ -33,6 +33,15 @@ router.use('/platform', require('./platformRoutes'));
 router.get('/public/plans', require('../controllers/billingController').listPlans);
 router.get('/public/branding', require('../controllers/billingController').branding);
 
+// Public unsubscribe for campaign emails (no login; HMAC-signed token).
+const unsubscribe = require('../controllers/unsubscribeController');
+router.get('/public/unsubscribe/:token/status', unsubscribe.status);
+router.get('/public/unsubscribe/:token', unsubscribe.show);
+router.post('/public/unsubscribe/:token', unsubscribe.confirm);
+
+// Public Bulk Messaging Policy text (shown in the app and linked from the website).
+router.get('/public/messaging-policy', require('../controllers/policyController').getPolicy);
+
 router.get('/health', (req, res) => res.json({ success: true, message: 'API is healthy' }));
 
 module.exports = router;

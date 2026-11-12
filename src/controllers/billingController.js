@@ -6,17 +6,24 @@ const AuditLog = require('../models/AuditLog');
 const billing = require('../services/saas/billingService');
 const orgService = require('../services/saas/orgService');
 const { orgSummary } = require('../services/saas/orgSummary');
-const { publicPlans, ADDONS, GST_RATE, TRIAL_DAYS, PLANS } = require('../config/plans');
+const { publicPlans, publicAddons, getRegion, regionOf, REGIONS, CYCLES, TRIAL_DAYS, PLANS } = require('../config/plans');
 const logger = require('../utils/logger');
 
 /** GET /api/public/plans — pricing page (no login). */
 const listPlans = asyncHandler(async (req, res) => {
   const env = require('../config/env');
+  const region = getRegion(req.query.region === 'ae' ? 'ae' : 'in');
   return new ApiResponse(200, {
-    plans: publicPlans(),
-    trial: { limits: PLANS.trial.limits, features: PLANS.trial.features, highlights: PLANS.trial.highlights },
-    addons: ADDONS,
-    gstRate: GST_RATE,
+    region: region.code,
+    currency: region.currency,
+    taxLabel: region.taxLabel,
+    taxRate: region.taxRate,
+    regions: Object.values(REGIONS).map(({ code, name, currency, taxLabel, taxRate }) => ({ code, name, currency, taxLabel, taxRate })),
+    cycles: Object.values(CYCLES),
+    plans: publicPlans(region.code),
+    trial: { limits: PLANS.trial.limits[region.code], features: PLANS.trial.features, highlights: PLANS.trial.highlights[region.code] },
+    addons: publicAddons(region.code),
+    gstRate: region.taxRate,
     trialDays: TRIAL_DAYS,
     sales: { phone: env.saas.salesPhone, email: env.saas.salesEmail },
   }).send(res);
@@ -36,11 +43,18 @@ const branding = asyncHandler(async (req, res) => {
 const getBilling = asyncHandler(async (req, res) => {
   if (!req.org) throw ApiError.badRequest('No company selected');
   const invoices = await Invoice.find({ orgId: req.org._id }).sort({ createdAt: -1 }).limit(50).lean();
+  const region = getRegion(req.org);
   return new ApiResponse(200, {
     org: await orgSummary(req.org),
-    plans: publicPlans(),
-    addons: ADDONS,
-    gstRate: GST_RATE,
+    region: region.code,
+    currency: region.currency,
+    taxLabel: region.taxLabel,
+    taxRate: region.taxRate,
+    cycles: Object.values(CYCLES),
+    plans: publicPlans(regionOf(req.org)),
+    addons: publicAddons(regionOf(req.org)),
+    gstRate: region.taxRate,
+    intlCheckout: region.code === 'in' || billing.intlEnabled(),
     invoices,
   }).send(res);
 });

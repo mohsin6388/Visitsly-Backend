@@ -36,7 +36,17 @@
 //     cancelAtPeriodEnd: !!org.cancelAtPeriodEnd,
 //     priceOverride: org.priceOverride || null,
 //     limits: limitsFor(org),
-//     features: plan.features,
+//     features: featuresFor(org),
+//    messaging: {
+//      policyVersion: POLICY_VERSION,
+//      policyAccepted: org.messaging?.policyVersion === POLICY_VERSION,
+//      policyAcceptedAt: org.messaging?.policyAcceptedAt || null,
+//      postalAddress: org.messaging?.postalAddress || "",
+//      quietHoursStart: org.messaging?.quietHoursStart || null,
+//      quietHoursEnd: org.messaging?.quietHoursEnd || null,
+//      autoPausedAt: org.messaging?.autoPausedAt || null,
+//      autoPausedReason: org.messaging?.autoPausedReason || null,
+//    },
 //     usage: { ...usage, contacts, users },
 //     whatsapp: publicView(org),
 //     onboarding: org.onboarding || {},
@@ -59,7 +69,8 @@
 const Lead = require("../../models/Lead");
 const User = require("../../models/User");
 const env = require("../../config/env");
-const { getPlan, limitsFor } = require("../../config/plans");
+const { getPlan, limitsFor, featuresFor, getRegion } = require("../../config/plans");
+const { POLICY_VERSION } = require("../compliance/messagingPolicy");
 const { subscriptionState, bulkUsedFor } = require("./subscription");
 const { usageFor } = require("./orgService");
 const { publicView } = require("./whatsappConnect");
@@ -87,6 +98,9 @@ async function orgSummary(org) {
     planName: plan.name,
     pendingPlan: org.pendingPlan || null,
     billingCycle: org.billingCycle,
+    region: getRegion(org).code,
+    currency: getRegion(org).currency,
+    taxLabel: getRegion(org).taxLabel,
     status: org.status,
     subscription: subscriptionState(org),
     trialEndsAt: org.trialEndsAt,
@@ -94,7 +108,17 @@ async function orgSummary(org) {
     cancelAtPeriodEnd: !!org.cancelAtPeriodEnd,
     priceOverride: org.priceOverride || null,
     limits: limitsFor(org),
-    features: plan.features,
+    features: featuresFor(org),
+    messaging: {
+      policyVersion: POLICY_VERSION,
+      policyAccepted: org.messaging?.policyVersion === POLICY_VERSION,
+      policyAcceptedAt: org.messaging?.policyAcceptedAt || null,
+      postalAddress: org.messaging?.postalAddress || "",
+      quietHoursStart: org.messaging?.quietHoursStart || null,
+      quietHoursEnd: org.messaging?.quietHoursEnd || null,
+      autoPausedAt: org.messaging?.autoPausedAt || null,
+      autoPausedReason: org.messaging?.autoPausedReason || null,
+    },
     usage: { ...usage, contacts, users, bulkMessages: bulkUsedFor(org) },
     whatsapp: publicView(org),
     onboarding: org.onboarding || {},

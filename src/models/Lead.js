@@ -51,6 +51,36 @@ const leadSchema = new Schema(
     channelPartnerId: { type: Schema.Types.ObjectId, ref: 'ChannelPartner', default: null, index: true },
     cpProtectedUntil: { type: Date, default: null },
 
+    // ---- Consent & suppression (bulk WhatsApp / email) ----
+    // whatsapp.status: unknown → never asked (lead came from a form/import),
+    //                  opted_in → contact agreed to WhatsApp messages,
+    //                  opted_out → replied STOP / asked not to be contacted.
+    // Opted-out and suppressed contacts are skipped by every campaign.
+    consent: {
+      whatsapp: {
+        status: { type: String, enum: ["unknown", "opted_in", "opted_out"], default: "unknown" },
+        source: { type: String, trim: true, default: null }, // "form", "import", "keyword", "manual"…
+        at: { type: Date, default: null },
+      },
+      email: {
+        status: { type: String, enum: ["unknown", "opted_in", "opted_out"], default: "unknown" },
+        source: { type: String, trim: true, default: null },
+        at: { type: Date, default: null },
+      },
+    },
+    // Email address that must never be mailed again (hard bounce / spam complaint).
+    emailSuppressed: {
+      reason: { type: String, enum: ["bounced", "complained", "unsubscribed", null], default: null },
+      at: { type: Date, default: null },
+    },
+    // Last campaign (marketing) message per channel — used for frequency caps.
+    lastMarketingAt: {
+      whatsapp: { type: Date, default: null },
+      email: { type: Date, default: null },
+    },
+    // Manual "never contact" flag from the CRM.
+    doNotContact: { type: Boolean, default: false },
+
     // ---- Deal ----
     bookedAt: { type: Date, default: null },
     dealValue: { type: Number, default: null },
@@ -72,6 +102,8 @@ leadSchema.index({ ownerId: 1, importFile: 1, createdAt: 1 });
 leadSchema.index({ ownerId: 1, assignedTo: 1 });
 leadSchema.index({ ownerId: 1, source: 1, createdAt: -1 });
 leadSchema.index({ ownerId: 1, externalId: 1 });
+leadSchema.index({ ownerId: 1, "consent.whatsapp.status": 1 });
+leadSchema.index({ ownerId: 1, "consent.email.status": 1 });
 leadSchema.index({ name: 'text', notes: 'text', requirements: 'text' });
 
 leadSchema.statics.STATUSES = LEAD_STATUSES;

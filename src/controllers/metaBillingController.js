@@ -15,7 +15,7 @@ const getMetaBilling = asyncHandler(async (req, res) => {
   // SaaS: the Meta billing dashboard is a Growth+ feature (trial included).
   if (req.org) {
     const { getPlan } = require('../config/plans');
-    if (!getPlan(req.org.plan).features?.metaBilling) {
+    if (!require('../config/plans').hasFeature(req.org, 'metaBilling')) {
       return new ApiResponse(200, {
         configured: false,
         locked: true,

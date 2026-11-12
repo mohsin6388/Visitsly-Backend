@@ -273,6 +273,20 @@ async function processTransactionalEvent(event) {
     ...(Object.keys(update).length ? { $set: update } : {}),
     ...(eventId ? { $addToSet: { eventIds: eventId } } : {}),
   });
+
+  // Suppression list: never email this address again after a hard bounce,
+  // spam complaint or provider-side unsubscribe.
+  const suppressAs = { hardbounce: "bounced", invalid: "bounced", spam: "complained", unsubscribed: "unsubscribed" }[eventName];
+  if (suppressAs) {
+    const msg = await EmailMessage.findById(tracked._id).select("leadId campaignId").lean();
+    if (msg?.leadId) {
+      const policy = require("../services/compliance/messagingPolicy");
+      await policy.applyEmailOptOut(msg.leadId, suppressAs).catch((err) =>
+        logger.warn("[brevo-webhook] Could not suppress lead", { error: err.message }),
+      );
+      if (msg.campaignId) policy.evaluateCampaignHealth(msg.campaignId).catch(() => {});
+    }
+  }
 }
 
 async function handler(req, res) {

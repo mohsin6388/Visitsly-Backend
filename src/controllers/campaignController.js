@@ -14,7 +14,8 @@ const launch = asyncHandler(async (req, res) => {
 
   const result = await launchCampaign({
     ownerId: req.user.id,
-    userId: req.user.id,
+    // The person who accepted the Bulk Messaging Policy (teammate, not just the workspace owner).
+    userId: req.user.actorId || req.user.id,
     ip: req.ip,
     rows,
     leadIds,
@@ -44,8 +45,14 @@ const launch = asyncHandler(async (req, res) => {
       totalDays: result.totalDays,
       firstRunAt: result.firstRunAt,
       lastRunAt: result.lastRunAt,
+      suppressed: result.suppressed,
+      dailyLimit: result.dailyLimit,
+      sendTimeShifted: result.sendTimeShifted,
     },
-    `Campaign started: ${result.insertedCount} leads, ${parts.join(" + ")} scheduled over ${result.totalDays} day(s).`,
+    `Campaign started: ${result.insertedCount} leads, ${parts.join(" + ")} scheduled over ${result.totalDays} day(s).` +
+      (result.suppressed && result.suppressed.whatsapp + result.suppressed.email
+        ? ` ${result.suppressed.whatsapp + result.suppressed.email} opted-out / bounced contacts skipped.`
+        : ""),
   ).send(res);
 });
 

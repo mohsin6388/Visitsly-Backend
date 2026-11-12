@@ -733,6 +733,7 @@ const {
   subscriptionState,
   bulkMessagesRemaining,
 } = require("../saas/subscription");
+const policy = require("../compliance/messagingPolicy");
 
 /**
  * Bulk outreach worker (WhatsApp + Email).
@@ -806,6 +807,9 @@ const ownerPausedUntil = new Map(); // ownerId -> ts (WhatsApp pause for that co
 const ownerNextAt = new Map(); // `${channel}:${ownerId}` -> ts (per-company send gap)
 const busyOwners = new Set(); // `${channel}:${ownerId}` currently being processed
 const lastPauseNotifyAt = new Map(); // `${channel}:${ownerId}` -> ts
+// Safety holds (quiet hours / daily cap): company's campaign jobs on that
+// channel are not claimed until this time. `${channel}:${ownerId}` -> ts
+const ownerHoldUntil = new Map();
 const CONCURRENCY = Math.max(
   1,
   parseInt(process.env.BULK_WORKER_CONCURRENCY || "4", 10),
@@ -894,14 +898,41 @@ function blockedOwners(channel, now = Date.now()) {
   return [...out];
 }
 
+/** Companies whose CAMPAIGN jobs are on a safety hold (their 1:1 jobs still run). */
+function heldOwners(channel, now = Date.now()) {
+  const out = [];
+  for (const [key, ts] of ownerHoldUntil)
+    if (ts > now && key.startsWith(`${channel}:`)) out.push(key.slice(channel.length + 1));
+  return out;
+}
+
+/** Puts a job back for later without burning an attempt (safety deferral). */
+async function deferJob(job, until, reason) {
+  await OutboundJob.updateOne(
+    { _id: job._id },
+    {
+      $set: { status: "pending", lockedAt: null, nextRunAt: until, lastError: reason },
+      $inc: { attempts: -1 },
+    },
+  );
+}
+
+async function countSkip(job) {
+  if (!job.campaignId) return;
+  await Campaign.updateOne({ _id: job.campaignId }, { $inc: { "safety.skipped": 1 } }).catch(() => {});
+}
+
 async function claimNext(channels) {
   const now = Date.now();
-  const or = channels.map((channel) => {
+  const or = [];
+  for (const channel of channels) {
     const blocked = blockedOwners(channel, now);
-    return blocked.length
-      ? { channel, ownerId: { $nin: blocked } }
-      : { channel };
-  });
+    const held = heldOwners(channel, now).filter((o) => !blocked.includes(o));
+    const notIn = [...blocked, ...held];
+    or.push(notIn.length ? { channel, ownerId: { $nin: notIn } } : { channel });
+    // Held companies: only non-campaign (lead reply / opening) messages.
+    if (held.length) or.push({ channel, ownerId: { $in: held }, campaignId: null });
+  }
   return OutboundJob.findOneAndUpdate(
     {
       status: "pending",
@@ -1267,12 +1298,18 @@ async function processEmail(job, lead) {
     tracked.errorMessage = null;
     await tracked.save();
 
+    const tenantOrg = tenantContext.getOrg();
     const sent = await sendCampaignEmail({
       to: lead.email,
       subject: campaign.email.subject,
       body: campaign.email.body,
       imageUrl: campaign.email.imageUrl || "",
       companyName: settings.companyName || "",
+      // Mandatory for bulk email: working unsubscribe + sender's postal address.
+      unsubscribeUrl: policy.unsubscribeUrl(lead._id, "email"),
+      oneClickUnsubscribe: policy.oneClickSupported(),
+      postalAddress: tenantOrg?.messaging?.postalAddress || "",
+      region: tenantOrg?.region || "in",
       replyTo: makeReplyAddress(tracked.trackingId),
       idempotencyKey: `propai-campaign-${job._id}`,
       tags: [
@@ -1380,7 +1417,69 @@ async function processJobInTenant(job) {
     return Lead.findById(job.leadId);
   }
 
+  // ---- Bulk messaging safety rules (campaign messages only) ----
+  const isCampaign = Boolean(job.campaignId);
+  const holdKey = `${channel}:${job.ownerId}`;
+  if (isCampaign) {
+    // Quiet hours: no marketing at night — wait for the morning window.
+    if (policy.isQuietHours(org)) {
+      const until = policy.nextSendTime(org);
+      ownerHoldUntil.set(holdKey, until.getTime());
+      await deferJob(job, until, "Quiet hours — subah allowed time par bheja jayega");
+      return Lead.findById(job.leadId);
+    }
+    // Meta rated the number RED: stop marketing on WhatsApp until it recovers.
+    if (channel === "whatsapp" && String(org?.whatsapp?.qualityRating || "").toUpperCase() === "RED") {
+      await OutboundJob.updateOne(
+        { _id: job._id },
+        { $set: { status: "paused", lockedAt: null, lastError: "Safety pause: WhatsApp quality RED" }, $inc: { attempts: -1 } },
+      );
+      return Lead.findById(job.leadId);
+    }
+    // Daily cap per company (rolling 24h) + email warm-up.
+    const cap = await policy.dailyCapStatus(org, job.ownerId, channel);
+    if (!cap.ok) {
+      const until = new Date(Date.now() + 60 * 60 * 1000);
+      ownerHoldUntil.set(holdKey, until.getTime());
+      await deferJob(job, until, `Daily safety limit ${cap.used}/${cap.cap} — baaki messages baad mein jayenge`);
+      const nKey = `dailycap:${holdKey}`;
+      if (Date.now() - (lastPauseNotifyAt.get(nKey) || 0) > 12 * 60 * 60 * 1000) {
+        lastPauseNotifyAt.set(nKey, Date.now());
+        await notify(org?.ownerUserId || job.ownerId, {
+          type: "daily_limit",
+          title: `${channel === "email" ? "Email" : "WhatsApp"} daily safety limit poori hui`,
+          body: `24 ghante mein ${cap.cap} campaign messages ki limit hai (number / domain ko block hone se bachane ke liye). Baaki messages apne aap aage bheje jayenge.`,
+          link: "/outreach",
+        });
+      }
+      return Lead.findById(job.leadId);
+    }
+  }
+
   const lead = await Lead.findById(job.leadId);
+
+  // Consent: opted-out / do-not-contact / bounced contacts are never messaged.
+  if (lead) {
+    const blocked = policy.suppressionReason(lead, channel);
+    if (blocked) {
+      await markCancelled(job, `Skipped: ${policy.SKIP_LABELS[blocked] || blocked}`);
+      await countSkip(job);
+      return lead;
+    }
+    if (isCampaign) {
+      const freq = await policy.frequencyReason(lead, channel);
+      if (freq === "contacted_recently") {
+        const last = new Date(lead.lastMarketingAt?.[channel] || Date.now()).getTime();
+        await deferJob(job, new Date(last + policy.RULES.minGapHours * 60 * 60 * 1000 + 60 * 1000), `Wait: ${policy.SKIP_LABELS[freq]}`);
+        return lead;
+      }
+      if (freq) {
+        await markCancelled(job, `Skipped: ${policy.SKIP_LABELS[freq] || freq}`);
+        await countSkip(job);
+        return lead;
+      }
+    }
+  }
 
   // Frontend: "ab ye lead bheji ja rahi hai" (spinner)
   emitJob(job, lead);
@@ -1485,6 +1584,16 @@ async function loop(workerNo) {
           emitJob(fresh, lead);
           const stats = await emitCampaignProgress(fresh);
           await checkCompletion(fresh, stats);
+          if (fresh.status === "sent" && fresh.campaignId) {
+            // Frequency cap bookkeeping + auto-pause guard.
+            policy.markMarketingSent(fresh.leadId, channel).catch(() => {});
+            policy.evaluateCampaignHealth(fresh.campaignId).catch((err) =>
+              logger.warn("[safety] Health check failed", { error: err.message }),
+            );
+          }
+          if (fresh.status === "failed" && fresh.campaignId) {
+            policy.evaluateCampaignHealth(fresh.campaignId).catch(() => {});
+          }
           if (fresh.status === "sent") {
             const org = await orgService
               .getSnapshotForOwner(job.ownerId)

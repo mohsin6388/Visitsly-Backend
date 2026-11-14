@@ -474,7 +474,7 @@ async function flagRuntimeError(orgId, metaError) {
  * exactly what is missing.
  */
 async function healthCheck(orgId) {
-  const org = await Organization.findById(orgId).select('+whatsapp.accessTokenEncrypted whatsapp').lean();
+  const org = await Organization.findById(orgId).select('+whatsapp.accessTokenEncrypted').lean();
   const wa = org?.whatsapp || {};
   const viaEnv = wa.connectedVia === 'env';
   const token = viaEnv ? env.platformMeta.accessToken : decrypt(wa.accessTokenEncrypted);
@@ -558,7 +558,7 @@ async function healthCheck(orgId) {
 
 /** "Fix karein" for a missing webhook subscription. */
 async function resubscribeWebhook(orgId) {
-  const org = await Organization.findById(orgId).select('+whatsapp.accessTokenEncrypted whatsapp').lean();
+  const org = await Organization.findById(orgId).select('+whatsapp.accessTokenEncrypted').lean();
   const wa = org?.whatsapp || {};
   const viaEnv = wa.connectedVia === 'env';
   const token = viaEnv ? env.platformMeta.accessToken : decrypt(wa.accessTokenEncrypted);

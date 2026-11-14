@@ -108,8 +108,8 @@ const settingsSchema = new Schema(
     // Which approved WhatsApp message TEMPLATE opens a brand-new
     // conversation (the very first, business-initiated message to a lead —
     // required by Meta's WhatsApp Cloud API, see metaWhatsappClient.js).
-    // Falls back to META_WHATSAPP_OPENING_TEMPLATE_NAME/LANGUAGE from the
-    // environment when left blank here.
+    // Legacy single-client (SAAS_MODE=false) selection only. In SaaS mode the
+    // opening template lives on Organization.whatsapp.openingTemplate*.
     // Site visit se pehle WhatsApp par "kya aap aa rahe hain?" confirmation.
     // Lead ne 24 ghante me message nahi kiya ho to approved template chahiye.
     visitConfirm: {

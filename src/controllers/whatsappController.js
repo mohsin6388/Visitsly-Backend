@@ -10,6 +10,7 @@ const metaWhatsappClient = require("../services/whatsapp/metaWhatsappClient");
 const { handleWebhook } = require("../services/whatsapp/webhookHandler");
 const settingsService = require("../services/settings/settingsService");
 const logger = require("../utils/logger");
+const openingTemplateService = require("../services/whatsapp/openingTemplateService");
 const axios = require("axios");
 
 /**
@@ -238,8 +239,9 @@ const sendTestTemplate = asyncHandler(async (req, res) => {
     throw ApiError.badRequest("WhatsApp messaging is paused for this workspace. Resume messaging before sending a test.");
   }
 
-  const fallbackName = settings.openingTemplate?.name || env.metaWhatsapp.openingTemplateName;
-  const fallbackLanguage = settings.openingTemplate?.language || env.metaWhatsapp.openingTemplateLanguage;
+  const orgWa = tenantContext.getOrg()?.whatsapp || {};
+  const fallbackName = orgWa.openingTemplateName || settings.openingTemplate?.name;
+  const fallbackLanguage = orgWa.openingTemplateLanguage || settings.openingTemplate?.language;
   const templateName = String(requestedTemplateName || fallbackName || '').trim();
   const templateLanguage = String(requestedLanguage || fallbackLanguage || 'en_US').trim();
   if (!templateName) throw ApiError.badRequest("No approved WhatsApp template is configured. Select an approved template first.");
@@ -425,15 +427,17 @@ const getStatus = asyncHandler(async (req, res) => {
     liveStatus,
     qualityRating,
     openingTemplateConfigured: Boolean(
-      settings.openingTemplate?.name || env.metaWhatsapp.openingTemplateName,
+      tenantContext.getOrg()?.whatsapp?.openingTemplateName ||
+        settings.openingTemplate?.name,
     ),
     openingTemplateName:
+      tenantContext.getOrg()?.whatsapp?.openingTemplateName ||
       settings.openingTemplate?.name ||
-      env.metaWhatsapp.openingTemplateName ||
       null,
     openingTemplateLanguage:
+      tenantContext.getOrg()?.whatsapp?.openingTemplateLanguage ||
       settings.openingTemplate?.language ||
-      env.metaWhatsapp.openingTemplateLanguage,
+      null,
     disconnected: settings.whatsappDisconnected,
     webhookLastReceivedAt: tenantContext.getOrg()?.whatsapp?.webhookLastReceivedAt || null,
     webhookLastMessageAt: tenantContext.getOrg()?.whatsapp?.webhookLastMessageAt || null,
@@ -482,32 +486,15 @@ const reconnect = asyncHandler(async (req, res) => {
 });
 
 async function fetchMetaTemplates() {
-  if (!env.metaWhatsapp.accessToken || !env.metaWhatsapp.businessAccountId) {
-    throw ApiError.badRequest("Meta WhatsApp access token aur Business Account ID configure karein.");
+  // Always the CURRENT organization's own WABA (cached per org + WABA).
+  try {
+    return await openingTemplateService.getTemplates({ force: true });
+  } catch (err) {
+    if (err.code === 'WHATSAPP_NOT_CONNECTED' || err.code === 'TENANT_CONTEXT_MISSING') {
+      throw ApiError.badRequest(err.message, { code: err.code });
+    }
+    throw err;
   }
-  const all = [];
-  let url = `https://graph.facebook.com/${env.metaWhatsapp.apiVersion}/${env.metaWhatsapp.businessAccountId}/message_templates`;
-  let params = { fields: "name,language,status,category,components,rejected_reason", limit: 100 };
-  // A few bounded pages are enough for this client's template catalogue and avoid an unbounded API loop.
-  for (let page = 0; url && page < 5; page += 1) {
-    const response = await axios.get(url, {
-      params,
-      headers: { Authorization: `Bearer ${env.metaWhatsapp.accessToken}` },
-      timeout: 15000,
-    });
-    all.push(...(response.data?.data || []));
-    url = response.data?.paging?.next || null;
-    params = undefined;
-  }
-  return all.map((item) => ({
-    id: item.id || null,
-    name: item.name,
-    language: item.language,
-    category: item.category || "",
-    status: item.status || "UNKNOWN",
-    rejectedReason: item.rejected_reason && item.rejected_reason !== "NONE" ? item.rejected_reason : "",
-    components: item.components || [],
-  }));
 }
 
 

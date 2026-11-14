@@ -62,6 +62,46 @@ const MIGRATIONS = [
       return { updated: done };
     },
   },
+  {
+    id: "2026-11-org-opening-template",
+    // The opening template is now per organization (Organization.whatsapp).
+    // Copy each organization's OWN previous selection from its Settings
+    // document. The legacy META_WHATSAPP_OPENING_TEMPLATE_NAME env value is
+    // copied ONLY into the organization that was migrated onto the platform's
+    // own WhatsApp credentials (connectedVia = "env") - its WABA is the one
+    // that template was approved in - and never into any other tenant.
+    async run() {
+      const orgs = mongoose.connection.collection("organizations");
+      const settings = mongoose.connection.collection("settings");
+      let fromSettings = 0;
+      let fromEnv = 0;
+      const cursor = orgs.find({
+        $or: [
+          { "whatsapp.openingTemplateName": null },
+          { "whatsapp.openingTemplateName": { $exists: false } },
+        ],
+      });
+      for await (const org of cursor) {
+        const own = await settings.findOne({ orgId: org._id });
+        let name = own?.openingTemplate?.name || null;
+        let language = own?.openingTemplate?.language || null;
+        let via = "settings";
+        if (!name && org.whatsapp?.connectedVia === "env") {
+          name = process.env.META_WHATSAPP_OPENING_TEMPLATE_NAME || null;
+          language = process.env.META_WHATSAPP_OPENING_TEMPLATE_LANGUAGE || "en_US";
+          via = "env";
+        }
+        if (!name) continue;
+        await orgs.updateOne(
+          { _id: org._id },
+          { $set: { "whatsapp.openingTemplateName": name, "whatsapp.openingTemplateLanguage": language || "en_US" } },
+        );
+        if (via === "env") fromEnv += 1;
+        else fromSettings += 1;
+      }
+      return { fromSettings, fromEnv };
+    },
+  },
 ];
 
 async function runStartupMigrations() {

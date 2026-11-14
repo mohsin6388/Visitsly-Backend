@@ -24,6 +24,8 @@ const {
 } = require("../calendar/googleCalendarService");
 const { enqueueLeads } = require("../queue/outboundQueue");
 const env = require("../../config/env");
+const tenantContext = require("../../context/tenantContext");
+const openingTemplateService = require("../whatsapp/openingTemplateService");
 const { emitToUser } = require("../../sockets");
 const logger = require("../../utils/logger");
 
@@ -1488,51 +1490,31 @@ async function startConversation({
         { phone: lead.phone, reason: "24h-window-open" },
       );
     } else {
-      // New lead / closed 24-hour window: approved template first.
-      // ENV value takes priority over an old template saved in Settings.
-      const templateName =
-        env.metaWhatsapp.openingTemplateName || settings.openingTemplate?.name;
+      // New lead / closed 24-hour window: WhatsApp requires an approved
+      // template. It comes ONLY from this lead's organization (selected in its
+      // WhatsApp settings and re-validated against its own Meta account).
+      // There is deliberately no env / other-tenant / plain-text fallback.
+      const resolved = await openingTemplateService.resolveForSend({ lead });
 
-      const templateLanguage =
-        env.metaWhatsapp.openingTemplateLanguage ||
-        settings.openingTemplate?.language;
-
-      if (!templateName) {
-        const err = new Error(
-          "Opening template is not configured. Set META_WHATSAPP_OPENING_TEMPLATE_NAME.",
+      let messageId;
+      try {
+        ({ messageId } = await metaWhatsappClient.sendTemplateMessage({
+          phone: lead.phone,
+          templateName: resolved.templateName,
+          languageCode: resolved.languageCode,
+          components: resolved.components,
+        }));
+      } catch (sendErr) {
+        throw openingTemplateService.translateSendError(
+          sendErr,
+          resolved.templateName,
         );
-        err.code = "OPENING_TEMPLATE_MISSING";
-        throw err;
       }
-
-      const components = [];
-
-      // Use this only if the approved template has an IMAGE header.
-      const imageUrl = process.env.META_WHATSAPP_OPENING_TEMPLATE_IMAGE_URL;
-
-      if (imageUrl) {
-        components.push({
-          type: "header",
-          parameters: [
-            {
-              type: "image",
-              image: { link: imageUrl },
-            },
-          ],
-        });
-      }
-
-      const { messageId } = await metaWhatsappClient.sendTemplateMessage({
-        phone: lead.phone,
-        templateName,
-        languageCode: templateLanguage,
-        components,
-      });
 
       outbound = await recordOutboundMessage({
         conversationId: conversation._id,
         leadId: lead._id,
-        text: `[Template: ${templateName}]`,
+        text: resolved.preview,
         sender: "ai",
         whatsappMessageId: messageId || null,
       });
@@ -1540,8 +1522,9 @@ async function startConversation({
       usedTemplate = true;
 
       logger.info(`[ai] Opening WhatsApp template sent for lead ${lead._id}`, {
-        templateName,
-        templateLanguage,
+        organizationId: resolved.organizationId,
+        templateName: resolved.templateName,
+        templateLanguage: resolved.languageCode,
         reason: "24h-window-closed",
       });
     }
@@ -1551,6 +1534,7 @@ async function startConversation({
       {
         error: err.metaError || err.response?.data || err.message,
         code: err.code,
+        organizationId: tenantContext.orgId() ? String(tenantContext.orgId()) : null,
         phone: lead.phone,
       },
     );

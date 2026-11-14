@@ -11,6 +11,7 @@ const AuditLog = require('../models/AuditLog');
 const orgService = require('../services/saas/orgService');
 const { orgSummary } = require('../services/saas/orgSummary');
 const whatsappConnect = require('../services/saas/whatsappConnect');
+const openingTemplateService = require('../services/whatsapp/openingTemplateService');
 const { assertWithinLimit } = require('../services/saas/subscription');
 const logger = require('../utils/logger');
 
@@ -162,18 +163,61 @@ const disconnectWhatsapp = asyncHandler(async (req, res) => {
   return new ApiResponse(200, { whatsapp: whatsappConnect.publicView(fresh) }, 'WhatsApp disconnected').send(res);
 });
 
+function openingTemplateError(err) {
+  const known = {
+    WHATSAPP_NOT_CONNECTED: 409,
+    TENANT_CONTEXT_MISSING: 400,
+    OPENING_TEMPLATE_UNAVAILABLE: 422,
+    OPENING_TEMPLATE_NOT_ELIGIBLE: 422,
+    OPENING_TEMPLATE_VARIABLES_MISSING: 422,
+    OPENING_TEMPLATE_MEDIA_MISSING: 422,
+    TEMPLATES_FETCH_FAILED: 502,
+  };
+  if (known[err.code]) {
+    return new ApiError(known[err.code], err.message, {
+      code: err.code,
+      reasons: err.reasons,
+      unresolved: err.unresolved,
+    });
+  }
+  return err;
+}
+
+/** GET /api/org/whatsapp/opening-template/options — this org's templates + eligibility. */
+const listOpeningTemplateOptions = asyncHandler(async (req, res) => {
+  requireOrg(req);
+  try {
+    const data = await openingTemplateService.listForCurrentOrg({ force: req.query.refresh === 'true' });
+    return new ApiResponse(200, data, 'Templates loaded').send(res);
+  } catch (err) {
+    throw openingTemplateError(err);
+  }
+});
+
+/** PATCH /api/org/whatsapp/opening-template — select (or clear with name=null) the opening template. */
 const updateOpeningTemplate = asyncHandler(async (req, res) => {
   const org = requireOrg(req);
-  await Organization.updateOne(
-    { _id: org._id },
-    {
-      $set: {
-        'whatsapp.openingTemplateName': req.body.name || null,
-        'whatsapp.openingTemplateLanguage': req.body.language || null,
-      },
+  try {
+    if (!req.body.name) {
+      await openingTemplateService.clearSelection();
+    } else {
+      if (!req.body.language) throw ApiError.badRequest('Template language is required');
+      await openingTemplateService.saveSelection({
+        name: req.body.name,
+        language: req.body.language,
+        variables: req.body.variables || [],
+        userId: req.user?.actorId || null,
+      });
     }
-  );
-  orgService.invalidate(org._id);
+  } catch (err) {
+    throw openingTemplateError(err);
+  }
+  await AuditLog.create({
+    userId: req.user.actorId,
+    action: 'org.whatsapp.openingTemplate',
+    meta: { name: req.body.name || null, language: req.body.language || null },
+    ip: req.ip,
+  }).catch(() => {});
   const fresh = await orgService.getSnapshot(org._id, { fresh: true });
   return new ApiResponse(200, { whatsapp: whatsappConnect.publicView(fresh) }, 'Opening template saved').send(res);
 });
@@ -389,6 +433,7 @@ module.exports = {
   connectManual,
   disconnectWhatsapp,
   updateOpeningTemplate,
+  listOpeningTemplateOptions,
   listTeam,
   inviteMember,
   updateMember,

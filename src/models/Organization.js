@@ -88,8 +88,28 @@ const organizationSchema = new Schema(
       verifiedName: { type: String, default: null },
       qualityRating: { type: String, default: null },
       accessTokenEncrypted: { type: String, default: null, select: false },
+      // Opening template chosen by THIS organization (approved in its own WABA).
       openingTemplateName: { type: String, default: null },
       openingTemplateLanguage: { type: String, default: null },
+      openingTemplateId: { type: String, default: null },
+      openingTemplateCategory: { type: String, default: null },
+      // How each {{variable}} of the template is filled for every lead.
+      openingTemplateVariables: {
+        type: [
+          new Schema(
+            {
+              component: { type: String, enum: ['header', 'body'] },
+              key: { type: String },
+              source: { type: String, enum: ['name', 'phone', 'email', 'company', 'fixed'] },
+              value: { type: String, default: '' },
+            },
+            { _id: false }
+          ),
+        ],
+        default: [],
+      },
+      openingTemplateSelectedAt: { type: Date, default: null },
+      openingTemplateSelectedBy: { type: Schema.Types.ObjectId, ref: 'User', default: null },
       connectedAt: { type: Date, default: null },
       lastError: { type: String, default: null },
       lastErrorCode: { type: String, default: null },

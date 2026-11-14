@@ -20,9 +20,6 @@ META_WHATSAPP_DEFAULT_COUNTRY_CODE=91
 
 # Required for proactive messages when the lead has not messaged you in the
 # last 24 hours. Use the EXACT approved template name and language.
-META_WHATSAPP_OPENING_TEMPLATE_NAME=YOUR_APPROVED_TEMPLATE
-META_WHATSAPP_OPENING_TEMPLATE_LANGUAGE=en_US
-META_WHATSAPP_OPENING_TEMPLATE_INCLUDE_LEAD_NAME=false
 
 # Used when the lead already has an open 24h customer-service window.
 META_WHATSAPP_OPENING_TEXT=Namaste sir, main Tamanna, Deific Digital se baat kar rahi hoon. Kya abhi 2 minute baat ho sakti hai?

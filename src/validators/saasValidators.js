@@ -86,6 +86,18 @@ const openingTemplateSchema = z.object({
   body: z.object({
     name: z.string().trim().max(512).nullable().optional(),
     language: z.string().trim().max(15).nullable().optional(),
+    // How template {{variables}} are filled for every lead.
+    variables: z
+      .array(
+        z.object({
+          component: z.enum(["header", "body"]),
+          key: z.string().trim().min(1).max(60),
+          source: z.enum(["name", "phone", "email", "company", "fixed"]),
+          value: z.string().trim().max(1024).optional(),
+        }),
+      )
+      .max(20)
+      .optional(),
   }),
 });
 

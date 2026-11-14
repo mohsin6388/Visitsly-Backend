@@ -131,9 +131,13 @@ async function sendTemplateMessage({
 }) {
   assertConfigured();
 
+  if (!languageCode) {
+    throw new Error("WhatsApp template language is required");
+  }
+
   if (!templateName) {
     throw new Error(
-      "No WhatsApp template name configured — set META_WHATSAPP_OPENING_TEMPLATE_NAME once your template is approved in WhatsApp Manager",
+      "No WhatsApp template name provided for this send",
     );
   }
 
@@ -144,7 +148,7 @@ async function sendTemplateMessage({
     template: {
       name: templateName,
       language: {
-        code: languageCode || env.metaWhatsapp.openingTemplateLanguage,
+        code: languageCode,
       },
       ...(components.length ? { components } : {}),
     },

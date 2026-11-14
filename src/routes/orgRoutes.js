@@ -39,6 +39,7 @@ router.post('/whatsapp/embedded-signup/prepare', managers, validate(v.embeddedSi
 router.post('/whatsapp/embedded-signup/complete', managers, validate(v.embeddedSignupCompleteSchema), c.completeEmbeddedSignup);
 router.post('/whatsapp/manual', managers, validate(v.manualConnectSchema), c.connectManual);
 router.post('/whatsapp/disconnect', managers, c.disconnectWhatsapp);
+router.get('/whatsapp/opening-template/options', managers, c.listOpeningTemplateOptions);
 router.patch('/whatsapp/opening-template', managers, validate(v.openingTemplateSchema), c.updateOpeningTemplate);
 
 router.post('/whatsapp/numbers', managers, validate(s.number), c.addNumber);

@@ -18,9 +18,10 @@ Cloud API** (Graph API) instead — no third-party relay, direct to Meta.
   handles Meta's one-time webhook-verification handshake (`hub.challenge`).
 - **The first business-initiated message is sent as normal text only when Meta accepts that the customer-service window is open; otherwise the backend automatically falls back to an approved WhatsApp message
   TEMPLATE** — this is a Meta platform rule (business-initiated messages outside
-  the 24h window must be templates). Set `META_WHATSAPP_OPENING_TEMPLATE_NAME` /
-  `META_WHATSAPP_OPENING_TEMPLATE_LANGUAGE` (or the equivalent fields on the Settings page) once
-  your template is approved in WhatsApp Manager. Only once the lead actually **replies** to that
+  the 24h window must be templates). Each organization picks its own approved template under
+  **WhatsApp → Opening template** (stored on that organization; never in `.env`). It is re-validated
+  against the organization's own WhatsApp Business Account before every send, and nothing is sent
+  as a text fallback when no valid template exists. Only once the lead actually **replies** to that
   template does the real AI conversation (property discovery, everything in `promptBuilder.js`)
   start — same as before, unchanged.
 - `Conversation.unipileChatId` is gone (Meta has no per-thread chat-id concept — every send just
@@ -45,8 +46,6 @@ META_WHATSAPP_BUSINESS_ACCOUNT_ID=...
 META_WHATSAPP_API_VERSION=v21.0
 META_WHATSAPP_VERIFY_TOKEN=...
 META_WHATSAPP_APP_SECRET=...           # optional but recommended
-META_WHATSAPP_OPENING_TEMPLATE_NAME=...
-META_WHATSAPP_OPENING_TEMPLATE_LANGUAGE=en_US
 
 REFERRAL_ENABLED=true
 REFERRAL_PERSON_NAME=Monica
@@ -75,8 +74,7 @@ account's email with "Make changes to events" permission.
    `META_WHATSAPP_VERIFY_TOKEN` → click Verify and Save → subscribe to the `messages` field.
 5. Under WhatsApp Manager → Message Templates, create and submit your opening template for
    approval (e.g. a short "Hi {{1}}, this is X from Y, reaching out about your property enquiry"
-   template). Once **Approved**, set its exact name/language as
-   `META_WHATSAPP_OPENING_TEMPLATE_NAME` / `META_WHATSAPP_OPENING_TEMPLATE_LANGUAGE`.
+   template). Once **Approved**, select it in **WhatsApp → Opening template** inside the app.
 
 ---
 

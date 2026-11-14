@@ -69,12 +69,6 @@ const {
         );
       }
 
-      if (!env.metaWhatsapp.openingTemplateName) {
-        logger.warn(
-          "[server] META_WHATSAPP_OPENING_TEMPLATE_NAME is missing. Leads outside the 24h customer-service window will require an approved template before the first outbound message can be sent.",
-        );
-      }
-
       // Make sure Meta has this app subscribed to the WABA so inbound messages
       // and delivery/read status events can reach this backend. If another app
       // (for example n8n) owns the same Meta App webhook, set

@@ -151,17 +151,9 @@ const env = {
     autoSubscribe: process.env.META_WHATSAPP_AUTO_SUBSCRIBE !== "false",
     forwardSecret: process.env.META_WHATSAPP_FORWARD_SECRET || null,
 
-    // The very FIRST message to a lead (before they've ever messaged us) can
-    // only legally be an approved message TEMPLATE — Meta blocks free-text
-    // business-initiated messages outside the 24h customer service window.
-    // Get this name/language exactly as approved in Meta Business Manager ->
-    // WhatsApp Manager -> Message Templates.
-    openingTemplateName:
-      process.env.META_WHATSAPP_OPENING_TEMPLATE_NAME || null,
-    openingTemplateLanguage:
-      process.env.META_WHATSAPP_OPENING_TEMPLATE_LANGUAGE || "en_US",
-    openingTemplateIncludeLeadName:
-      process.env.META_WHATSAPP_OPENING_TEMPLATE_INCLUDE_LEAD_NAME === "true",
+    // NOTE: the opening WhatsApp template is NOT platform configuration. Every
+    // organization selects its own approved template (stored on the
+    // Organization document) — see services/whatsapp/openingTemplateService.js.
     // Used when the lead's WhatsApp 24-hour customer-service window is already open.
     // In that case we can send ordinary text immediately; no template is needed.
     openingText: process.env.META_WHATSAPP_OPENING_TEXT || "",
@@ -243,9 +235,6 @@ Object.defineProperty(env, "metaWhatsapp", {
           phoneNumberId: extra.phoneNumberId,
           businessAccountId:
             extra.businessAccountId || wa.businessAccountId || null,
-          openingTemplateName: wa.openingTemplateName || null,
-          openingTemplateLanguage:
-            wa.openingTemplateLanguage || platformMeta.openingTemplateLanguage,
           openingText: "",
         };
       }
@@ -256,9 +245,6 @@ Object.defineProperty(env, "metaWhatsapp", {
       accessToken: wa.accessToken || null,
       phoneNumberId: wa.phoneNumberId || null,
       businessAccountId: wa.businessAccountId || null,
-      openingTemplateName: wa.openingTemplateName || null,
-      openingTemplateLanguage:
-        wa.openingTemplateLanguage || platformMeta.openingTemplateLanguage,
       openingText: "",
     };
   },

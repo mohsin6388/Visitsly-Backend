@@ -37,6 +37,9 @@ const leadSchema = new Schema(
     // Customer asked us to stop messaging (STOP / unsubscribe). Campaigns,
     // follow-ups and AI must skip this lead until they message us again.
     optedOut: { type: Boolean, default: false, index: true },
+    // Clicked "unsubscribe" in a bulk email. Only stops EMAIL campaigns (WhatsApp is unaffected).
+    emailOptedOut: { type: Boolean, default: false },
+    emailOptedOutAt: { type: Date, default: null },
     warmAlertSentAt: { type: Date, default: null },
 
     duplicateOf: { type: Schema.Types.ObjectId, ref: 'Lead', default: null },

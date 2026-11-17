@@ -7,8 +7,8 @@
 4. **Cloudinary** (recommended): WhatsApp photos / PDFs are copied there so they stay viewable after Meta's 30-day expiry.
 5. **Razorpay webhook** (`/api/webhooks/razorpay`) — enable events: `subscription.*`, `payment.captured`, `payment.failed`, `order.paid`.
    For AED/USD/GBP pricing turn on *International payments* in Razorpay; until then checkout automatically falls back to INR.
-6. **Bolna** (AI calling, per company): each company pastes its own API key + agent ID on *WhatsApp AI → Visit confirmation*,
-   and sets the webhook URL shown there in its Bolna agent. Add extraction keys `visit_confirmed`, `visit_date`, `visit_time`.
+6. **AI calling** (platform-managed): Plivo number + ElevenLabs voice + Gemini (Groq fallback). Set the env vars in
+   `VOICE_SETUP.md` once; companies only switch the automatic confirmation call ON/OFF on *WhatsApp AI → Visit confirmation*.
 7. Scaling to many instances: set `REDIS_URL` (realtime across instances). Background jobs use a MongoDB lock
    (`scheduler_locks` collection) so only one instance runs each scheduler.
 8. One-time data fixes run automatically at boot (`app_migrations` collection): follow-ups default to *auto*,

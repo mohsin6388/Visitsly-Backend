@@ -47,9 +47,18 @@ const embeddedSignupCompleteSchema = z.object({
       .string()
       .regex(/^[a-f\d]{24}$/i, "Invalid or expired connection attempt"),
     phoneNumberId: z.string().trim().regex(/^\d+$/, "Invalid Phone Number ID"),
+    // Required for a NEW number; not used for coexistence (existing Business app number).
     pin: z
       .string()
-      .regex(/^\d{6}$/, "Registration PIN must be exactly 6 digits"),
+      .regex(/^\d{6}$/, "Registration PIN must be exactly 6 digits")
+      .optional(),
+  }),
+});
+
+const whatsappTestMessageSchema = z.object({
+  body: z.object({
+    phone: z.string().trim().min(8).max(20),
+    text: z.string().trim().max(500).optional(),
   }),
 });
 
@@ -68,17 +77,17 @@ const manualConnectSchema = z.object({
   body: z.object({
     // Lenient on input (people paste with spaces / "Bearer " / quotes); the
     // service cleans and validates properly with friendly messages.
-    accessToken: z.string().trim().min(20, "Access token adhoora lag raha hai — poora copy karke paste karein").max(2000),
+    accessToken: z.string().trim().min(20, "The access token looks incomplete — paste the full token").max(2000),
     phoneNumberId: z
       .string()
       .trim()
       .transform((v) => v.replace(/\D/g, ""))
-      .refine((v) => v.length >= 8, "Phone Number ID sahi nahi hai (sirf numbers, WhatsApp Manager → API Setup se copy karein)"),
+      .refine((v) => v.length >= 8, "Invalid Phone Number ID (digits only, from WhatsApp Manager → API Setup)"),
     businessAccountId: z
       .string()
       .trim()
       .transform((v) => v.replace(/\D/g, ""))
-      .refine((v) => v.length >= 8, "WhatsApp Business Account ID sahi nahi hai (sirf numbers)"),
+      .refine((v) => v.length >= 8, "Invalid WhatsApp Business Account ID (digits only)"),
   }),
 });
 
@@ -118,25 +127,25 @@ const inviteSchema = z.object({
 
 const strongPassword = z
   .string()
-  .min(8, "Password kam se kam 8 characters ka ho")
+  .min(8, "Password must be at least 8 characters")
   .max(128)
-  .regex(/[A-Z]/, "Password mein ek capital letter (A-Z) hona chahiye")
-  .regex(/[0-9]/, "Password mein ek number (0-9) hona chahiye");
+  .regex(/[A-Z]/, "Password needs one capital letter (A-Z)")
+  .regex(/[0-9]/, "Password needs one number (0-9)");
 
 const bulkInviteSchema = z.object({
   body: z.object({
     members: z
       .array(
         z.object({
-          name: z.string().trim().min(2, "Naam likhein").max(100),
-          email: z.string().trim().email("Email sahi nahi hai"),
+          name: z.string().trim().min(2, "Enter a name").max(100),
+          email: z.string().trim().email("Invalid email"),
           phone: z.string().trim().max(20).optional().or(z.literal("")),
           orgRole: z.enum(["manager", "agent"]).default("agent"),
           password: strongPassword.optional().or(z.literal("").transform(() => undefined)),
         }),
       )
-      .min(1, "Kam se kam ek teammate add karein")
-      .max(50, "Ek baar mein 50 tak teammates add karein"),
+      .min(1, "Add at least one teammate")
+      .max(50, "Add up to 50 teammates at a time"),
   }),
 });
 
@@ -237,7 +246,7 @@ const adminCreateSchema = z.object({
     email: z.string().email(),
     password: z
       .string()
-      .min(10, "Admin password kam se kam 10 characters")
+      .min(10, "Admin password must be at least 10 characters")
       .regex(/[A-Z]/)
       .regex(/[0-9]/),
   }),
@@ -314,6 +323,7 @@ module.exports = {
   embeddedSignupSchema,
   embeddedSignupPrepareSchema,
   embeddedSignupCompleteSchema,
+  whatsappTestMessageSchema,
   manualConnectSchema,
   openingTemplateSchema,
   inviteSchema,

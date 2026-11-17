@@ -217,24 +217,26 @@ async function sendPasswordResetEmail(toEmail, resetLink) {
 }
 
 /** One lead / one email API send. Body is plain text and converted to safe HTML. */
-async function sendCampaignEmail({ to, subject, body, imageUrl = "", vars = {}, companyName = "", replyTo, idempotencyKey, tags = [] }) {
+async function sendCampaignEmail({ to, subject, body, imageUrl = "", vars = {}, companyName = "", replyTo, idempotencyKey, tags = [], unsubscribeUrl = "" }) {
   const finalSubject = renderTemplate(subject, vars);
   const finalBody = renderTemplate(body, vars);
   const footer = companyName ? `${companyName}\n` : "";
-  const unsubscribeNote = "Agar aap ye emails nahi chahte to kripya sender se contact karke unsubscribe request karein.";
+  const unsubscribeNote = unsubscribeUrl
+    ? "Don’t want these emails? Unsubscribe using the link below."
+    : "If you don’t want these emails, please contact the sender to unsubscribe.";
   const htmlContent = `
     <div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;color:#1e293b">
       ${imageUrl && /^https:\/\//i.test(imageUrl) ? `<img src="${escapeHtml(imageUrl)}" alt="Property image" style="display:block;max-width:100%;height:auto;border-radius:10px;margin:0 0 20px;" />` : ""}
       ${textToHtml(finalBody)}
       <hr style="border:none;border-top:1px solid #e2e8f0;margin:20px 0">
-      <p style="font-size:12px;color:#64748b;line-height:1.5">${escapeHtml(footer)}${escapeHtml(unsubscribeNote)}</p>
+      <p style="font-size:12px;color:#64748b;line-height:1.5">${escapeHtml(footer)}${escapeHtml(unsubscribeNote)}${unsubscribeUrl ? ` <a href="${escapeHtml(unsubscribeUrl)}" style="color:#64748b">Unsubscribe</a>` : ""}</p>
     </div>`;
   const selectedReplyTo = normalizeReplyTo(replyTo || env.brevo.replyTo);
   const payload = {
     to: [{ email: normalizeEmailAddress(to) }],
     subject: finalSubject,
     htmlContent,
-    textContent: `${finalBody}\n\n--\n${footer}${unsubscribeNote}`,
+    textContent: `${finalBody}\n\n--\n${footer}${unsubscribeNote}${unsubscribeUrl ? `\n${unsubscribeUrl}` : ""}`,
     ...(selectedReplyTo ? { replyTo: selectedReplyTo } : {}),
     ...(tags.length ? { tags: normalizeTags(tags) } : {}),
   };

@@ -87,6 +87,8 @@ const organizationSchema = new Schema(
       displayPhoneNumber: { type: String, default: null },
       verifiedName: { type: String, default: null },
       qualityRating: { type: String, default: null },
+      // Set when Meta rejects a send with 131042 (no payment method); cleared by a later successful send.
+      paymentIssueAt: { type: Date, default: null },
       accessTokenEncrypted: { type: String, default: null, select: false },
       // Opening template chosen by THIS organization (approved in its own WABA).
       openingTemplateName: { type: String, default: null },
@@ -118,6 +120,23 @@ const organizationSchema = new Schema(
       // Last verified delivery activity observed by PropAI's Meta webhook.
       webhookLastReceivedAt: { type: Date, default: null },
       webhookLastMessageAt: { type: Date, default: null },
+      // ---- Coexistence (number also runs in the WhatsApp Business phone app) ----
+      isCoexistence: { type: Boolean, default: false },
+      coexistence: {
+        onboardedAt: { type: Date, default: null }, // start of Meta's 24h sync window
+        contactsSyncRequestId: { type: String, default: null },
+        historySyncRequestId: { type: String, default: null },
+        // pending | requested | done | failed | declined
+        contactsSyncStatus: { type: String, default: null },
+        historySyncStatus: { type: String, default: null },
+        historySyncProgress: { type: Number, default: 0 }, // 0-100 from history webhooks
+        syncError: { type: String, default: null },
+        lastEchoAt: { type: Date, default: null },
+        disconnectedFromPhoneAt: { type: Date, default: null },
+      },
+      // Last "send test message" from the dashboard.
+      testMessageSentAt: { type: Date, default: null },
+      testMessageTo: { type: String, default: null },
     },
 
     // ---- Usage (reset each calendar month, Asia/Kolkata) ----
@@ -177,13 +196,10 @@ const organizationSchema = new Schema(
       agentsSeeOnlyAssigned: { type: Boolean, default: false },
     },
 
-    // ---- AI voice calling (Bolna) ----
+    // ---- AI voice calling (platform-managed: Plivo + ElevenLabs) ----
     voice: {
       enabled: { type: Boolean, default: false },
-      provider: { type: String, enum: ["bolna"], default: "bolna" },
-      apiKeyEncrypted: { type: String, default: null, select: false },
-      agentId: { type: String, default: null },
-      fromNumber: { type: String, default: null },
+      provider: { type: String, default: "plivo" },
       autoCallNewLeads: { type: Boolean, default: false }, // call when a new lead doesn't reply on WhatsApp
       autoCallAfterMinutes: { type: Number, default: 30 },
     },

@@ -6,7 +6,7 @@ const roleGuard = require('../middlewares/roleGuard');
 const validate = require('../middlewares/validate');
 const c = require('../controllers/reportsController');
 
-const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Date YYYY-MM-DD format mein ho');
+const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Date must be YYYY-MM-DD');
 const budgetSchema = z.object({
   body: z.object({
     enabled: z.boolean().optional(),

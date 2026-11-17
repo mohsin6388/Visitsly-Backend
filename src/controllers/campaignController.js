@@ -4,13 +4,27 @@ const ApiResponse = require("../utils/ApiResponse");
 const Campaign = require("../models/Campaign");
 const Audience = require("../models/Audience");
 const EmailMessage = require("../models/EmailMessage");
+const OutboundJob = require("../models/OutboundJob");
 const { launchCampaign } = require("../services/campaign/campaignService");
 const queue = require("../services/queue/outboundQueue");
 const { emitToUser } = require("../sockets");
 
 /** POST /api/campaigns/launch */
 const launch = asyncHandler(async (req, res) => {
-  const { rows, leadIds, audienceId, ...config } = req.body;
+  const { rows, audienceId, recipientFilter = "all", ...config } = req.body;
+  let { leadIds } = req.body;
+
+  // Optional: only first-message leads (never sent on this channel) or only follow-ups.
+  if (Array.isArray(leadIds) && leadIds.length && recipientFilter !== "all") {
+    const channel = config.channels?.whatsapp ? "whatsapp" : "email";
+    const sent = new Set((await OutboundJob.distinct("leadId", { ownerId: req.user.id, channel, status: "sent", leadId: { $in: leadIds } })).map(String));
+    leadIds = leadIds.filter((id) => (recipientFilter === "unsent" ? !sent.has(String(id)) : sent.has(String(id))));
+    if (!leadIds.length) {
+      throw new ApiError(400, recipientFilter === "unsent"
+        ? "All selected contacts were already messaged. Choose \"All selected\" or \"Follow-up\"."
+        : "None of the selected contacts were messaged before, so there is no one to follow up.");
+    }
+  }
 
   const result = await launchCampaign({
     ownerId: req.user.id,

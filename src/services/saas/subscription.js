@@ -32,7 +32,7 @@ function subscriptionState(org, now = Date.now()) {
     if (!end || end < now) {
       out.active = false;
       out.reason =
-        "Aapka free trial khatam ho gaya hai. Kaam jaari rakhne ke liye plan choose karein.";
+        "Your free trial has ended. Choose a plan to continue.";
     }
   } else if (status === "past_due") {
     const end = org.currentPeriodEnd
@@ -43,17 +43,17 @@ function subscriptionState(org, now = Date.now()) {
     if (graceEnd < now) {
       out.active = false;
       out.reason =
-        "Payment fail ho gaya hai. Billing page se payment update karein.";
+        "Payment failed. Update your payment on the Billing page.";
     }
   } else if (status === "suspended") {
     out.active = false;
     out.reason =
       org.suspendedReason ||
-      "Account suspend hai. PropAI support se baat karein.";
+      "Account suspended. Contact support.";
   } else if (status === "cancelled") {
     out.active = false;
     out.reason =
-      "Subscription cancel ho chuka hai. Dobara shuru karne ke liye plan choose karein.";
+      "Subscription cancelled. Choose a plan to restart.";
   } else if (status === "active" && org.currentPeriodEnd) {
     out.daysLeft = Math.max(
       0,
@@ -76,9 +76,9 @@ function checkLimit(org, key, current, adding = 1) {
   const labels = {
     users: "users",
     contacts: "contacts",
-    aiConversations: "AI conversations is mahine",
+    aiConversations: "AI conversations this month",
     whatsappNumbers: "WhatsApp numbers",
-    campaignsPerMonth: "campaigns is mahine",
+    campaignsPerMonth: "campaigns this month",
     bulkMessages: "bulk messages",
     aiRepliesPerContact: "AI replies per contact",
   };
@@ -88,7 +88,7 @@ function checkLimit(org, key, current, adding = 1) {
     current,
     message: ok
       ? null
-      : `${getPlan(org.plan).name} plan mein ${limit.toLocaleString("en-IN")} ${labels[key] || key} tak allowed hain (abhi ${current.toLocaleString("en-IN")}). Plan upgrade karein.`,
+      : `The ${getPlan(org.plan).name} plan allows up to ${limit.toLocaleString("en-IN")} ${labels[key] || key} (now ${current.toLocaleString("en-IN")}). Upgrade your plan.`,
   };
 }
 
@@ -172,8 +172,8 @@ function assertBulkMessagesAllowed(planned) {
   const planName = getPlan(org.plan).name;
   const message =
     remaining <= 0
-      ? `${planName} plan mein ${limit.toLocaleString("en-IN")} bulk messages ki limit poori ho chuki hai. Aur messages bhejne ke liye plan upgrade karein.`
-      : `${planName} plan mein ab sirf ${remaining.toLocaleString("en-IN")} bulk messages bache hain (limit ${limit.toLocaleString("en-IN")}), aapne ${planned.toLocaleString("en-IN")} select kiye hain. Contacts kam karein ya plan upgrade karein.`;
+      ? `The ${planName} plan’s ${limit.toLocaleString("en-IN")} bulk message limit is reached. Upgrade to send more.`
+      : `Only ${remaining.toLocaleString("en-IN")} bulk messages left on ${planName} (limit ${limit.toLocaleString("en-IN")}), but ${planned.toLocaleString("en-IN")} are selected. Select fewer contacts or upgrade.`;
   const ApiError = require("../../utils/ApiError");
   throw new ApiError(403, message, {
     code: "PLAN_LIMIT",

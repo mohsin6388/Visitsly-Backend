@@ -16,6 +16,9 @@ const meetingSchema = new Schema(
       default: 'scheduled',
     },
     notes: { type: String, default: '' },
+    // Customer said "yes" to a visit but no date/time was given yet — the
+    // confirmation call asks for one instead of reading out a default date.
+    dateTentative: { type: Boolean, default: false },
 
     // Where the visit was booked: by the AI inside a WhatsApp chat, or by a broker by hand.
     source: { type: String, enum: ['whatsapp_ai', 'voice_ai', 'manual'], default: 'manual', index: true },

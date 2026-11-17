@@ -111,7 +111,7 @@ const addonCheckout = asyncHandler(async (req, res) => {
 const addonVerify = asyncHandler(async (req, res) => {
   const invoice = await billing.verifyAddonPayment(req.org._id, req.body);
   await AuditLog.create({ userId: req.user.actorId, action: 'billing.addon_paid', meta: { paymentId: req.body.razorpay_payment_id, addon: invoice?.addon?.key }, ip: req.ip });
-  return new ApiResponse(200, { invoice, org: await orgSummary(await orgService.getSnapshot(req.org._id, { fresh: true })) }, 'Payment successful — add-on chalu ho gaya').send(res);
+  return new ApiResponse(200, { invoice, org: await orgSummary(await orgService.getSnapshot(req.org._id, { fresh: true })) }, 'Payment successful — add-on activated').send(res);
 });
 
 module.exports = { branding, listPlans, getBilling, getQuote, checkout, verify, cancel, razorpayWebhook, addonCheckout, addonVerify };

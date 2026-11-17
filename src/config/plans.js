@@ -62,17 +62,17 @@ function trialHighlights(l) {
     "CRM, leads, properties aur conversations",
     l.contacts == null
       ? "Unlimited leads / contacts"
-      : `${inNum(l.contacts)} leads / contacts tak`,
+      : `Up to ${inNum(l.contacts)} leads / contacts`,
     l.bulkMessages == null
       ? "Bulk WhatsApp / email messages"
       : `${inNum(l.bulkMessages)} bulk messages (WhatsApp / email)`,
     l.aiRepliesPerContact == null
       ? "AI chatting"
-      : `AI har contact ko ${inNum(l.aiRepliesPerContact)} replies tak karega`,
+      : `Up to ${inNum(l.aiRepliesPerContact)} AI replies per contact`,
     l.aiConversations == null
       ? "Unlimited AI conversations"
       : `${inNum(l.aiConversations)} AI conversations`,
-    "1 WhatsApp number connect karein",
+    "Connect 1 WhatsApp number",
     l.campaignsPerMonth == null
       ? "Unlimited campaigns"
       : `${inNum(l.campaignsPerMonth)} WhatsApp/email campaigns`,

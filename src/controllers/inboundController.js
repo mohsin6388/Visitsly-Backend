@@ -61,11 +61,11 @@ const submitLead = asyncHandler(async (req, res) => {
       source: pick(b, ['source', 'utm_source']) || 'website_form',
       sourceDetail: [pick(b, ['utm_campaign', 'campaign']), pick(b, ['page', 'page_url', 'form'])].filter(Boolean).join(' · ') || undefined,
     });
-    if (!result.lead) throw ApiError.badRequest('Phone ya email zaroori hai');
+    if (!result.lead) throw ApiError.badRequest('Phone or email is required');
     if (req.is('application/x-www-form-urlencoded') && b.redirect && /^https?:\/\//.test(b.redirect)) {
       return res.redirect(303, b.redirect);
     }
-    return new ApiResponse(201, { ok: true, repeat: !result.created }, 'Thank you! Hum jald contact karenge.').send(res);
+    return new ApiResponse(201, { ok: true, repeat: !result.created }, 'Thank you! We will contact you soon.').send(res);
   });
 });
 

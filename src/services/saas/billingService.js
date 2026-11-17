@@ -124,10 +124,10 @@ async function ensurePlanId(planCode, cycle, amount, currency = 'INR') {
 
 async function createCheckout(orgId, { plan: planCode, cycle = 'monthly' }, user) {
   const plan = getPlan(planCode);
-  if (!plan.public || plan.code === 'trial') throw ApiError.badRequest('Ye plan online nahi kharida ja sakta');
-  if (plan.contactSales) throw ApiError.badRequest('Enterprise ke liye sales team se baat karein');
+  if (!plan.public || plan.code === 'trial') throw ApiError.badRequest('This plan can’t be bought online');
+  if (plan.contactSales) throw ApiError.badRequest('Contact sales for Enterprise');
   if (!configured()) {
-    throw ApiError.badRequest('Online payment abhi set nahi hai. Team se UPI/bank transfer se payment karke activate karwayein.', { code: 'BILLING_NOT_CONFIGURED' });
+    throw ApiError.badRequest('Online payment is not set up yet. Pay via UPI/bank transfer and our team will activate it.', { code: 'BILLING_NOT_CONFIGURED' });
   }
 
   const org = await Organization.findById(orgId).lean();
@@ -140,7 +140,7 @@ async function createCheckout(orgId, { plan: planCode, cycle = 'monthly' }, user
     if (err.code !== 'CURRENCY_NOT_ENABLED') throw err;
     // International payments not enabled on the Razorpay account yet → bill in INR.
     logger.warn(`[billing] ${q.currency} not enabled on Razorpay — falling back to INR for org ${orgId}`);
-    currencyNote = `${q.currency} payment abhi available nahi hai, isliye payment INR mein hoga.`;
+    currencyNote = `${q.currency} payments are not available yet, so you will be charged in INR.`;
     q = quote(org, plan.code, cycle, 'INR');
     planId = await ensurePlanId(plan.code, cycle, q.price, 'INR');
   }
@@ -192,7 +192,7 @@ const ADDON_RULES = {
 
 function addonQuote(org, key, quantity) {
   const rule = ADDON_RULES[key];
-  if (!rule || !ADDONS[key]) throw ApiError.badRequest('Ye add-on available nahi hai');
+  if (!rule || !ADDONS[key]) throw ApiError.badRequest('This add-on is not available');
   const qty = Math.min(Math.max(Math.round(Number(quantity) || rule.min), rule.min), rule.max);
   const currency = currencyOf(org);
   const unit = pricing.addonPrice(key, currency);
@@ -201,7 +201,7 @@ function addonQuote(org, key, quantity) {
 }
 
 async function createAddonOrder(orgId, { addon, quantity }, user) {
-  if (!configured()) throw ApiError.badRequest('Online payment abhi set nahi hai. Team se add-on activate karwayein.', { code: 'BILLING_NOT_CONFIGURED' });
+  if (!configured()) throw ApiError.badRequest('Online payment is not set up yet. Ask our team to activate the add-on.', { code: 'BILLING_NOT_CONFIGURED' });
   const org = await Organization.findById(orgId).lean();
   let q = addonQuote(org, addon, quantity);
   let order;
@@ -266,7 +266,7 @@ async function grantAddon(orgId, invoice, paymentId) {
   if (key === 'leadRevival') {
     try {
       const PlatformRequest = require('../../models/PlatformRequest');
-      await PlatformRequest.create({ orgId, type: 'addon', addon: key, quantity: qty, message: 'Paid in-app — lead revival campaign set up karein', status: 'open' });
+      await PlatformRequest.create({ orgId, type: 'addon', addon: key, quantity: qty, message: 'Paid in-app — set up the lead revival campaign', status: 'open' });
     } catch (err) {
       logger.warn('[billing] could not create lead revival request', { error: err.message });
     }
@@ -276,9 +276,9 @@ async function grantAddon(orgId, invoice, paymentId) {
 }
 
 async function verifyAddonPayment(orgId, { razorpay_order_id: orderId, razorpay_payment_id: paymentId, razorpay_signature: signature }) {
-  if (!verifyOrderSignature(orderId, paymentId, signature)) throw ApiError.badRequest('Payment verify nahi hua. Agar paisa kat gaya hai to 5-10 minute mein apne aap update ho jayega, warna support se baat karein.');
+  if (!verifyOrderSignature(orderId, paymentId, signature)) throw ApiError.badRequest('Payment could not be verified. If money was deducted, it updates within 5–10 minutes; otherwise contact support.');
   const invoice = await Invoice.findOne({ orgId, razorpayOrderId: orderId });
-  if (!invoice) throw ApiError.badRequest('Ye payment is account ke order se match nahi karta');
+  if (!invoice) throw ApiError.badRequest('This payment does not match this account’s order');
   await grantAddon(orgId, invoice, paymentId);
   return Invoice.findById(invoice._id).lean();
 }
@@ -343,10 +343,10 @@ async function recordInvoice(orgId, data) {
 }
 
 async function verifyCheckout(orgId, { razorpay_payment_id: paymentId, razorpay_subscription_id: subscriptionId, razorpay_signature: signature }) {
-  if (!verifySignature(paymentId, subscriptionId, signature)) throw ApiError.badRequest('Payment signature verify nahi hua');
+  if (!verifySignature(paymentId, subscriptionId, signature)) throw ApiError.badRequest('Payment signature could not be verified');
   const org = await Organization.findById(orgId).lean();
   if (!org || org.razorpay?.pendingSubscriptionId !== subscriptionId) {
-    throw ApiError.badRequest('Ye payment is account ke checkout se match nahi karta');
+    throw ApiError.badRequest('This payment does not match this account’s checkout');
   }
   const q = quote(org, org.pendingPlan, org.pendingCycle || 'monthly');
   const updated = await activate(orgId, {

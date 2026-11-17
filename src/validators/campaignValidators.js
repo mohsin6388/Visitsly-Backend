@@ -8,9 +8,12 @@ const launchCampaignSchema = z.object({
     rows: z.array(importRowSchema).min(1).max(5000).optional(),
     leadIds: z.array(objectId).min(1).max(5000).optional(),
     audienceId: objectId.optional(),
+    // Who to send to among the selected leads: everyone, only leads never
+    // messaged on this channel (first message), or only already-messaged (follow-up).
+    recipientFilter: z.enum(["all", "unsent", "sent"]).optional().default("all"),
     phoneNumberId: z.string().regex(/^\d+$/).optional().nullable(),
     name: z.string().trim().min(1, "Campaign name required").max(120),
-    channels: z.object({ whatsapp: z.boolean(), email: z.boolean() }).refine((c) => c.whatsapp || c.email, "Kam se kam ek channel chuno"),
+    channels: z.object({ whatsapp: z.boolean(), email: z.boolean() }).refine((c) => c.whatsapp || c.email, "Choose at least one channel"),
     dailyLimit: z.number().int().min(1).max(5000).default(100),
     sendTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "sendTime must be HH:mm").default("10:00"),
     startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),

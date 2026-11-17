@@ -32,10 +32,10 @@ function rangeFor(range, custom = {}) {
   const ist = new Date(now.getTime() + IST_OFFSET_MIN * 60000);
   const y = ist.getUTCFullYear();
   const m = ist.getUTCMonth();
-  if (range === 'last_month') return { start: istMonthStart(y, m - 1), end: istMonthStart(y, m), label: 'Pichhla mahina' };
-  if (range === '30d') return { start: new Date(now.getTime() - 30 * 86400000), end: now, label: 'Pichhle 30 din' };
-  if (range === '7d') return { start: new Date(now.getTime() - 7 * 86400000), end: now, label: 'Pichhle 7 din' };
-  return { start: istMonthStart(y, m), end: now, label: 'Is mahine' };
+  if (range === 'last_month') return { start: istMonthStart(y, m - 1), end: istMonthStart(y, m), label: 'Last month' };
+  if (range === '30d') return { start: new Date(now.getTime() - 30 * 86400000), end: now, label: 'Last 30 days' };
+  if (range === '7d') return { start: new Date(now.getTime() - 7 * 86400000), end: now, label: 'Last 7 days' };
+  return { start: istMonthStart(y, m), end: now, label: 'This month' };
 }
 
 async function graphGet(path, params) {
@@ -63,7 +63,7 @@ async function getMetaUsage({ range = 'this_month', start, end } = {}) {
   const period = rangeFor(range, { start, end });
   const base = { configured: Boolean(accessToken && businessAccountId), period: { range, label: period.label, start: period.start, end: period.end } };
   if (!base.configured) {
-    return { ...base, error: 'Pehle apna WhatsApp number connect karein (WhatsApp → Connect), phir Meta billing yahan dikhega.' };
+    return { ...base, error: 'Connect your WhatsApp number first (WhatsApp → Connect number) to see Meta billing.' };
   }
 
   const key = `${businessAccountId}:${range}:${range === 'custom' ? `${period.start.getTime()}-${Math.floor(period.end.getTime() / CACHE_MS)}` : ''}`;
@@ -80,7 +80,7 @@ async function getMetaUsage({ range = 'this_month', start, end } = {}) {
   } catch (err) {
     const meta = err.response?.data?.error;
     logger.warn('[meta-billing] pricing_analytics request failed', { error: meta || err.message });
-    return { ...base, error: meta?.message ? `Meta: ${meta.message}` : 'Meta se usage data nahi mila. Access token aur permissions check karein.' };
+    return { ...base, error: meta?.message ? `Meta: ${meta.message}` : 'Could not get usage from Meta. Check your WhatsApp connection.' };
   }
 
   const points = pointsFrom(payload);

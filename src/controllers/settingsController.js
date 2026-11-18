@@ -58,19 +58,19 @@ const sendTestAlert = asyncHandler(async (req, res) => {
   const result = await sendOwnerAlert({
     kind: 'test',
     title: '✅ Test alert — Visitsly',
-    lines: ['Jab bhi koi lead HOT hogi ya site visit book/confirm hogi, aapko isi tarah WhatsApp par turant message aayega.'],
+    lines: ['You’ll get a WhatsApp like this whenever a lead turns HOT or a visit is booked/confirmed.'],
     link: '/settings',
     templateValues: ['Test lead', '-', '-', '100', 'Test alert'],
   });
   const ok = result.whatsapp.some((r) => r.ok);
   const anyNumber = result.whatsapp.length > 0;
   const message = ok
-    ? 'Test alert WhatsApp par bhej diya — apna WhatsApp check karein.'
+    ? 'Test alert sent — check your WhatsApp.'
     : !anyNumber
-      ? 'Alert number set nahi hai — upar apna WhatsApp number daal kar save karein.'
+      ? 'No alert number set — enter your WhatsApp number above and save.'
       : result.email?.ok
-        ? 'WhatsApp nahi gaya (24 ghante ka window band hai), isliye email par bheja. Apne number se business WhatsApp par "Hi" bhejiye ya alert template chuniye.'
-        : 'WhatsApp nahi gaya. Apne number se business WhatsApp number par "Hi" bhejiye (ya alert template chuniye) aur dobara try karein.';
+        ? 'WhatsApp not sent (24-hour window closed), so it was emailed. Send "Hi" from your number to the business WhatsApp or choose an alert template.'
+        : 'WhatsApp not sent. Send "Hi" from your number to the business WhatsApp (or choose an alert template) and try again.';
   return new ApiResponse(200, { result }, message).send(res);
 });
 

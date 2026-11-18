@@ -43,7 +43,7 @@ async function sourcesView(req, orgId) {
     forwardingEmail: inboundDomain ? `leads-${key}@${inboundDomain}` : null,
     embedSnippet: [
       `<form action="${inboundUrl}" method="POST">`,
-      '  <input name="name" placeholder="Aapka naam" required>',
+      '  <input name="name" placeholder="Your name" required>',
       '  <input name="phone" placeholder="Mobile number" required>',
       '  <input name="email" type="email" placeholder="Email (optional)">',
       '  <input name="project" type="hidden" value="">',
@@ -74,7 +74,7 @@ const updateLeadSources = asyncHandler(async (req, res) => {
   if (req.body.regenerateKey) $set['leadCapture.key'] = newKey();
   if (Object.keys($set).length) await Organization.updateOne({ _id: req.org._id }, { $set });
   orgService.invalidate(req.org._id);
-  return new ApiResponse(200, { sources: await sourcesView(req, req.org._id) }, req.body.regenerateKey ? 'Naya link ban gaya — purane form band ho gaye' : 'Saved').send(res);
+  return new ApiResponse(200, { sources: await sourcesView(req, req.org._id) }, req.body.regenerateKey ? 'New link created — old forms stopped working' : 'Saved').send(res);
 });
 
 const metaPages = asyncHandler(async (req, res) => {
@@ -85,7 +85,7 @@ const metaPages = asyncHandler(async (req, res) => {
 const metaConnect = asyncHandler(async (req, res) => {
   const page = await metaLeadAds.connectPage(req.org._id, req.body);
   await AuditLog.create({ userId: req.user.actorId, action: 'org.meta_leads.connect', meta: { pageId: page.pageId }, ip: req.ip });
-  return new ApiResponse(200, { sources: await sourcesView(req, req.org._id) }, `${page.pageName || 'Page'} connected — ab Facebook/Instagram lead form ki leads seedhe PropAI mein aayengi`).send(res);
+  return new ApiResponse(200, { sources: await sourcesView(req, req.org._id) }, `${page.pageName || 'Page'} connected — Facebook/Instagram lead form leads now arrive here`).send(res);
 });
 
 const metaDisconnect = asyncHandler(async (req, res) => {
@@ -141,14 +141,14 @@ const assignLeads = asyncHandler(async (req, res) => {
 /** POST /api/org/routing/distribute — round-robin all unassigned leads now. */
 const distributeUnassigned = asyncHandler(async (req, res) => {
   const users = await eligibleUsers(req.org);
-  if (!users.length) throw ApiError.badRequest('Pehle team mein agent add karein');
+  if (!users.length) throw ApiError.badRequest('Add an agent to your team first');
   const leads = await Lead.find({ ownerId: req.org.ownerUserId, assignedTo: null }).select('_id name ownerId').limit(5000).lean();
   let i = 0;
   for (const lead of leads) {
     await assignLead(lead, users[i % users.length], { notify: false });
     i += 1;
   }
-  return new ApiResponse(200, { assigned: leads.length }, `${leads.length} leads ${users.length} logon mein baant di`).send(res);
+  return new ApiResponse(200, { assigned: leads.length }, `${leads.length} leads split among ${users.length} people`).send(res);
 });
 
 /* ---------------- Weekly report ---------------- */
@@ -165,7 +165,7 @@ const updateWeeklyReport = asyncHandler(async (req, res) => {
 /* ---------------- Requests to PropAI ---------------- */
 const createRequest = asyncHandler(async (req, res) => {
   const r = await PlatformRequest.create({ orgId: req.org._id, userId: req.user.actorId, ...req.body });
-  return new ApiResponse(201, { request: r }, 'Request PropAI team ko bhej di — jald contact karenge').send(res);
+  return new ApiResponse(201, { request: r }, 'Request sent — our team will contact you soon').send(res);
 });
 
 const listMyRequests = asyncHandler(async (req, res) => {
@@ -188,13 +188,13 @@ const testLeadSource = asyncHandler(async (req, res) => {
       phone: req.body.phone,
       source: req.body.source || 'website_form',
       sourceDetail: 'Test enquiry (Lead sources page)',
-      message: 'Ye ek test lead hai — check kar rahe hain ki leads sahi se aa rahi hain.',
+      message: 'This is a test lead — checking that leads arrive correctly.',
     }),
   );
-  if (!result.lead) throw ApiError.badRequest('Mobile number sahi nahi hai');
+  if (!result.lead) throw ApiError.badRequest('Invalid mobile number');
   const text = result.created
-    ? 'Test lead ban gayi! 1-2 minute mein is number par WhatsApp message aana chahiye, aur lead AI inbox mein dikhegi.'
-    : 'Is number ki lead pehle se thi — dobara enquiry ke roop mein note ho gayi.';
+    ? 'Test lead created! You should get a WhatsApp message in 1–2 minutes, and the lead will show in the AI inbox.'
+    : 'This number already existed — logged as a repeat enquiry.';
   return new ApiResponse(201, { leadId: result.lead._id, created: result.created }, text).send(res);
 });
 

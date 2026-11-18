@@ -203,7 +203,7 @@ const listAdmins = asyncHandler(async (req, res) => {
 
 const createAdmin = asyncHandler(async (req, res) => {
   const email = String(req.body.email).trim().toLowerCase();
-  if (await User.exists({ email })) throw ApiError.conflict('Is email se pehle se login hai');
+  if (await User.exists({ email })) throw ApiError.conflict('A login already exists for this email');
   const user = new User({ name: req.body.name, email, role: 'admin', isSuperAdmin: true, orgId: null });
   user.setPassword(req.body.password);
   await user.save();
@@ -212,7 +212,7 @@ const createAdmin = asyncHandler(async (req, res) => {
 });
 
 const updateAdmin = asyncHandler(async (req, res) => {
-  if (req.params.id === req.admin.id && req.body.isActive === false) throw ApiError.badRequest('Aap khud ko deactivate nahi kar sakte');
+  if (req.params.id === req.admin.id && req.body.isActive === false) throw ApiError.badRequest('You can’t deactivate yourself');
   const user = await User.findOne({ _id: req.params.id, isSuperAdmin: true });
   if (!user) throw ApiError.notFound('Admin not found');
   if (typeof req.body.isActive === 'boolean') {

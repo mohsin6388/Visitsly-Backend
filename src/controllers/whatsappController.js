@@ -275,7 +275,7 @@ const sendTestTemplate = asyncHandler(async (req, res) => {
     const values = supplied[type];
     const required = Math.max(...indexes);
     if (values.length < required || indexes.some((index) => !values[index - 1])) {
-      throw ApiError.badRequest(`Template ${type.toLowerCase()} ke liye ${required} non-empty sample value(s) required hain.`);
+      throw ApiError.badRequest(`Template ${type.toLowerCase()} needs ${required} non-empty sample value(s).`);
     }
     const parameters = indexes.map((index) => ({ type: 'text', text: values[index - 1] }));
     components.push({ type: type.toLowerCase(), parameters });
@@ -508,7 +508,7 @@ async function addTemplateAssets(templates, ownerId) {
 }
 
 async function uploadTemplateImageToMeta(imageUrl) {
-  if (!env.metaWhatsapp.appId) throw ApiError.badRequest('Image-header Meta templates ke liye backend META_APP_ID bhi configure karein. Cloudinary upload URL ko Meta template sample ke roop mein submit karne ke liye App ID zaroori hai.');
+  if (!env.metaWhatsapp.appId) throw ApiError.badRequest('Image-header templates need META_APP_ID configured on the server.');
   let parsedUrl;
   try { parsedUrl = new URL(imageUrl); } catch { throw ApiError.badRequest('Header image must be a valid HTTPS Cloudinary URL.'); }
   if (parsedUrl.protocol !== 'https:' || !['res.cloudinary.com', 'cloudinary.com'].includes(parsedUrl.hostname.toLowerCase())) {
@@ -517,18 +517,18 @@ async function uploadTemplateImageToMeta(imageUrl) {
   const imageResponse = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 20000, maxContentLength: 8 * 1024 * 1024 });
   const buffer = Buffer.from(imageResponse.data);
   const mime = String(imageResponse.headers['content-type'] || 'image/jpeg').split(';')[0];
-  if (!mime.startsWith('image/')) throw ApiError.badRequest('Template header URL par valid image nahi mili.');
-  if (buffer.length > 5 * 1024 * 1024) throw ApiError.badRequest('Meta template header example image 5 MB se chhoti honi chahiye.');
+  if (!mime.startsWith('image/')) throw ApiError.badRequest('No valid image at the template header URL.');
+  if (buffer.length > 5 * 1024 * 1024) throw ApiError.badRequest('Template header image must be under 5 MB.');
   const init = await axios.post(`https://graph.facebook.com/${env.metaWhatsapp.apiVersion}/${env.metaWhatsapp.appId}/uploads`, null, {
     params: { file_length: buffer.length, file_type: mime, access_token: env.metaWhatsapp.accessToken }, timeout: 20000,
   });
   const sessionId = init.data?.id;
-  if (!sessionId) throw ApiError.badRequest('Meta image upload session create nahi hui. META_APP_ID aur token permissions check karein.');
+  if (!sessionId) throw ApiError.badRequest('Could not start the Meta image upload. Check META_APP_ID and token permissions.');
   const uploaded = await axios.post(`https://graph.facebook.com/${env.metaWhatsapp.apiVersion}/${sessionId}`, buffer, {
     headers: { Authorization: `OAuth ${env.metaWhatsapp.accessToken}`, 'Content-Type': 'application/octet-stream', file_offset: '0' }, timeout: 30000, maxBodyLength: 8 * 1024 * 1024,
   });
   const handle = uploaded.data?.h;
-  if (!handle) throw ApiError.badRequest('Meta se image handle nahi mila.');
+  if (!handle) throw ApiError.badRequest('Meta did not return an image handle.');
   return handle;
 }
 
@@ -539,7 +539,7 @@ const deleteTemplate = asyncHandler(async (req, res) => {
     throw ApiError.badRequest('Invalid template name.');
   }
   if (!env.metaWhatsapp.accessToken || !env.metaWhatsapp.businessAccountId) {
-    throw ApiError.badRequest('Meta WhatsApp access token aur Business Account ID configure karein.');
+    throw ApiError.badRequest('Connect your WhatsApp account first.');
   }
 
   try {
@@ -557,7 +557,7 @@ const deleteTemplate = asyncHandler(async (req, res) => {
     const metaError = err.response?.data?.error;
     logger.warn('[whatsapp] Template delete failed', { name, error: metaError || err.message });
     throw new ApiError(err.response?.status && err.response.status < 500 ? 400 : 502,
-      metaError?.error_user_msg || metaError?.message || 'Meta template delete nahi ho paya. Permissions aur template name check karein.',
+      metaError?.error_user_msg || metaError?.message || 'Could not delete the template from Meta.',
       metaError || null);
   }
 });
@@ -591,7 +591,7 @@ const listAllTemplates = asyncHandler(async (req, res) => {
 /** POST /api/whatsapp/templates — create a template in Meta and submit it for review. */
 const createTemplate = asyncHandler(async (req, res) => {
   if (!env.metaWhatsapp.accessToken || !env.metaWhatsapp.businessAccountId) {
-    throw ApiError.badRequest("Meta WhatsApp access token aur Business Account ID configure karein.");
+    throw ApiError.badRequest("Connect your WhatsApp account first.");
   }
   const name = String(req.body?.name || "").trim().toLowerCase();
   const category = String(req.body?.category || "MARKETING").trim().toUpperCase();
@@ -602,19 +602,19 @@ const createTemplate = asyncHandler(async (req, res) => {
   const footerText = String(req.body?.footerText || "").trim();
   const rawSamples = Array.isArray(req.body?.sampleValues) ? req.body.sampleValues : [];
   if (!/^[a-z0-9]+(?:_[a-z0-9]+)*$/.test(name) || name.length > 512) {
-    throw ApiError.badRequest("Template name mein sirf lowercase letters, numbers aur single underscores use karein (e.g. property_offer_2026).");
+    throw ApiError.badRequest("Template names can use lowercase letters, numbers and single underscores only (e.g. property_offer_2026).");
   }
-  if (!["MARKETING", "UTILITY"].includes(category)) throw ApiError.badRequest("Is builder mein category MARKETING ya UTILITY honi chahiye.");
-  if (!/^[a-z]{2}(?:_[A-Z]{2})?$/.test(language)) throw ApiError.badRequest("Language code e.g. en_US ya hi_IN use karein.");
-  if (!bodyText || bodyText.length > 1024) throw ApiError.badRequest("Body required hai aur 1,024 characters se zyada nahi ho sakta.");
-  if (headerText.length > 60 || footerText.length > 60) throw ApiError.badRequest("Header/footer maximum 60 characters ke ho sakte hain.");
+  if (!["MARKETING", "UTILITY"].includes(category)) throw ApiError.badRequest("Category must be MARKETING or UTILITY.");
+  if (!/^[a-z]{2}(?:_[A-Z]{2})?$/.test(language)) throw ApiError.badRequest("Use a language code like en_US or hi_IN.");
+  if (!bodyText || bodyText.length > 1024) throw ApiError.badRequest("Body is required and must be at most 1,024 characters.");
+  if (headerText.length > 60 || footerText.length > 60) throw ApiError.badRequest("Header and footer can be up to 60 characters.");
   const bodyIndexes = [...bodyText.matchAll(/\{\{(\d+)\}\}/g)].map((match) => Number(match[1]));
   if (bodyIndexes.some((value) => value < 1)) {
-    throw ApiError.badRequest("Template variables {{1}}, {{2}} jaise format mein honi chahiye.");
+    throw ApiError.badRequest("Template variables must look like {{1}}, {{2}}.");
   }
   const uniqueIndexes = [...new Set(bodyIndexes)].sort((a, b) => a - b);
   if (uniqueIndexes.some((value, index) => value !== index + 1)) {
-    throw ApiError.badRequest("Template variables sequential honi chahiye: {{1}}, {{2}}, {{3}} without gaps.");
+    throw ApiError.badRequest("Template variables must be sequential: {{1}}, {{2}}, {{3}} without gaps.");
   }
   const components = [];
   if (headerImageUrl) {
@@ -629,7 +629,7 @@ const createTemplate = asyncHandler(async (req, res) => {
   if (variableCount > 0) {
     const samples = rawSamples.map((value) => String(value || "").trim());
     if (samples.length < variableCount || samples.slice(0, variableCount).some((value) => !value)) {
-      throw ApiError.badRequest(`{{1}} se {{${variableCount}}} ke liye ${variableCount} sample value(s) deni hongi.`);
+      throw ApiError.badRequest(`Provide ${variableCount} sample value(s) for {{1}} to {{${variableCount}}}.`);
     }
     bodyComponent.example = { body_text: [samples.slice(0, variableCount)] };
   }
@@ -651,11 +651,11 @@ const createTemplate = asyncHandler(async (req, res) => {
     return new ApiResponse(201, {
       template: { id: created.id || null, name, language, category, status: created.status || "PENDING", components, imageUrl: headerImageUrl, bodyText },
       meta: created,
-    }, "Template Meta ko approval ke liye submit ho gaya. Approval status kuch samay baad refresh karein.").send(res);
+    }, "Template submitted to Meta for approval. Refresh later to see the status.").send(res);
   } catch (err) {
     const metaError = err.response?.data?.error;
     logger.warn("[whatsapp] Template creation failed", { name, category, error: metaError || err.message });
-    throw new ApiError(err.response?.status && err.response.status < 500 ? 400 : 502, metaError?.error_user_msg || metaError?.message || "Meta template submit nahi ho paya. Permissions aur template fields check karein.", metaError || null);
+    throw new ApiError(err.response?.status && err.response.status < 500 ? 400 : 502, metaError?.error_user_msg || metaError?.message || "Could not submit the template to Meta. Check the fields.", metaError || null);
   }
 });
 

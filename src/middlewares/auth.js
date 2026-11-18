@@ -66,7 +66,7 @@ const authenticate = async (req, res, next) => {
 
     if (!orgId) {
       throw ApiError.unauthorized(isSuperAdmin(user)
-        ? 'PropAI admin login admin panel se karein'
+        ? 'Admins must log in from the admin panel'
         : 'This login is not linked to any company');
     }
 

@@ -19,14 +19,16 @@ const ownerFilter = (req) => ({ ownerId: req.user.id });
 /** GET /api/email/account */
 const getAccount = asyncHandler(async (req, res) => {
   const account = await accounts.getAccount(req.user.id);
-  return new ApiResponse(200, { account: accounts.publicView(account) }).send(res);
+  const view = accounts.publicView(account);
+  if (account) view.sentToday = await accounts.sentToday(req.user.id);
+  return new ApiResponse(200, { account: view }).send(res);
 });
 
 /** PUT /api/email/account — login verify hota hai, tabhi save. */
 const saveAccount = asyncHandler(async (req, res) => {
   try {
     const account = await accounts.saveAccount(req.user.id, req.body || {});
-    return new ApiResponse(200, { account }, "Email account connect ho gaya").send(res);
+    return new ApiResponse(200, { account }, "Email account connected").send(res);
   } catch (err) {
     if (String(err.code || "").startsWith("EMAIL_")) throw ApiError.badRequest(err.message);
     throw err;
@@ -36,17 +38,17 @@ const saveAccount = asyncHandler(async (req, res) => {
 /** POST /api/email/account/test — apne aap ko test email. */
 const testAccount = asyncHandler(async (req, res) => {
   const account = await accounts.getAccount(req.user.id, { withPassword: true });
-  if (!account) throw ApiError.badRequest("Pehle email account connect karein.");
+  if (!account) throw ApiError.badRequest("Connect an email account first.");
   const to = String(req.body?.to || account.fromEmail).trim();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) throw ApiError.badRequest("Sahi email address daaliye.");
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) throw ApiError.badRequest("Enter a valid email address.");
   try {
     await accounts.sendMail(account, {
       to,
       subject: "Visitsly test email",
-      text: "Ye Visitsly se ek test email hai. Agar ye mil gayi, to aapka email account sahi connect hai.",
+      text: "This is a test email from Visitsly. If you received it, your email account is connected.",
     });
     await accounts.getAccount(req.user.id).then((a) => a && a.updateOne({ $set: { status: "connected", lastError: null } }));
-    return new ApiResponse(200, { to }, `Test email ${to} par bhej di`).send(res);
+    return new ApiResponse(200, { to }, `Test email sent to ${to}`).send(res);
   } catch (err) {
     const message = accounts.friendlyError(err);
     await accounts.markError(req.user.id, message);
@@ -184,4 +186,24 @@ function scopedMatch(scoped) {
   return { $and: scoped.$and.map(cast) };
 }
 
-module.exports = { getAccount, saveAccount, testAccount, removeAccount, details };
+/**
+ * GET|POST /api/webhooks/email-unsubscribe/:token — public. The link in every bulk email
+ * (and the one-click List-Unsubscribe header) lands here. Only stops EMAIL campaigns.
+ */
+const unsubscribe = async (req, res) => {
+  const leadId = require("../utils/emailUnsub").verifyToken(req.params.token);
+  const page = (title, text) => res.status(leadId ? 200 : 400).type("html").send(
+    `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head><body style="font-family:Arial,Helvetica,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;background:#f8fafc;margin:0"><div style="max-width:420px;padding:32px;text-align:center;background:#fff;border-radius:14px;box-shadow:0 1px 8px rgba(0,0,0,.08)"><h2 style="margin:0 0 10px;color:#064e3b">${title}</h2><p style="color:#475569;line-height:1.6;margin:0">${text}</p></div></body></html>`,
+  );
+  if (!leadId) return page("Invalid link", "This unsubscribe link is invalid or incomplete.");
+  try {
+    await require("../models/Lead").updateOne({ _id: leadId }, { $set: { emailOptedOut: true, emailOptedOutAt: new Date() } });
+  } catch (err) {
+    logger.error("[email] unsubscribe failed", { error: err.message });
+    return res.status(500).type("html").send("Something went wrong. Please try again later.");
+  }
+  if (req.method === "POST") return res.json({ ok: true }); // mail clients' one-click
+  return page("You are unsubscribed", "You will no longer receive emails from this company.");
+};
+
+module.exports = { unsubscribe, getAccount, saveAccount, testAccount, removeAccount, details };

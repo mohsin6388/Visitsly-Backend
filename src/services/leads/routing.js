@@ -28,7 +28,7 @@ async function assignLead(lead, user, { notify = true } = {}) {
       userId: lead.ownerId,
       type: 'lead_assigned',
       title: `${lead.name} → ${user.name}`,
-      body: `Nayi lead ${user.name} ko assign hui${lead.source ? ` (${lead.source})` : ''}.`,
+      body: `New lead assigned to ${user.name}${lead.source ? ` (${lead.source})` : ''}.`,
       link: `/whatsapp/conversations?lead=${lead._id}`,
     }).catch(() => {});
   }

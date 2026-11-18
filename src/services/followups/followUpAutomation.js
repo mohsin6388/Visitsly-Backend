@@ -30,15 +30,15 @@ const STOP_STATUSES = ['closed', 'lost', 'site_visit'];
 const DEFAULTS = { mode: 'auto', gapsDays: [1, 3, 7], startHour: 10, endHour: 19, timezone: 'Asia/Kolkata', messages: [], useAiDate: true, templateName: '', templateLanguage: '', templateVariableCount: 0 };
 
 const REENGAGE_TEXT = [
-  'Namaste {name}! Pichhli baar aapne bataya tha ki abhi zarurat nahi hai — koi baat nahi 🙂 Kuch naye options aur offers aaye hain. Agar aap dekhna chahein to bas "Haan" likh dijiye.',
-  'Namaste {name}, bas ek baar check kar rahe the — kya ab aap property dekh rahe hain? Zarurat ho to yahin message kar dijiye, hum turant madad karenge. (Message band karwane ke liye STOP likhein.)',
+  'Hi {name}! Last time you said it wasn’t the right time — no problem 🙂 We have some new options and offers. Reply "Yes" if you’d like to see them.',
+  'Hi {name}, just checking in — are you looking for a property now? Message us here anytime. (Reply STOP to opt out.)',
 ];
 
 const DEFAULT_TEXT = [
-  'Namaste {name}! Aapki property requirement par aage baat karni thi. Kya aap abhi dekh rahe hain? Bataiye, main madad kar dun.',
-  'Namaste {name}, aapke liye kuch achhe options aur details ready hain. Chahein to site visit bhi book kar dein, bas bata dijiye.',
-  'Namaste {name}, aakhri baar pooch raha hoon. Agar abhi zarurat nahi hai to koi baat nahi, jab bhi chahiye ho yahin message kar dena.',
-  'Namaste {name}, agar aap abhi bhi property dekh rahe hain to bataiye, hum madad ke liye taiyaar hain.',
+  'Hi {name}! Following up on your property requirement. Are you still looking? Happy to help.',
+  'Hi {name}, we have some good options ready for you. Would you like to book a site visit?',
+  'Hi {name}, checking one last time. No worries if now isn’t the time — message us here whenever you need.',
+  'Hi {name}, let us know if you’re still looking for a property — we’re here to help.',
 ];
 
 function config(settings) {
@@ -114,14 +114,14 @@ function inWorkingHours(cfg) {
  */
 async function sendFollowUpNow(followUp, { text } = {}) {
   const lead = await Lead.findById(followUp.leadId);
-  if (!lead?.phone) throw new Error('Lead ka WhatsApp number nahi hai');
+  if (!lead?.phone) throw new Error('Lead has no WhatsApp number');
   const conversation = await Conversation.findOne({ leadId: lead._id });
-  if (!conversation) throw new Error('Is lead ki WhatsApp chat shuru nahi hui, pehle pehla message bhejein');
-  if (conversation.optedOut || lead.optedOut) throw new Error('Customer ne STOP likh kar messages band karwaye hain');
+  if (!conversation) throw new Error('No WhatsApp chat with this lead yet — send the first message first');
+  if (conversation.optedOut || lead.optedOut) throw new Error('Customer opted out (STOP)');
   const settings = await require('../settings/settingsService').getOrCreateSettings();
   const cfg = config(settings);
   const body = String(text || followUp.nextFollowUpMessage || '').trim();
-  if (!body) throw new Error('Message khali hai');
+  if (!body) throw new Error('Message is empty');
 
   const lastInbound = conversation.lastInboundAt ? new Date(conversation.lastInboundAt).getTime() : 0;
   const windowOpen = Date.now() - lastInbound < DAY;
@@ -138,7 +138,7 @@ async function sendFollowUpNow(followUp, { text } = {}) {
       ({ messageId } = await metaWhatsappClient.sendTemplateMessage({ phone: lead.phone, templateName: cfg.templateName, languageCode: cfg.templateLanguage || 'en_US', components }));
       shown = `[Follow-up template: ${cfg.templateName}] ${body}`;
     } else {
-      throw new Error('Lead ne 24 ghante se message nahi kiya, isliye free message nahi ja sakta. Follow-ups page par "Setup" me ek approved template chunein.');
+      throw new Error('The lead has not messaged in 24 hours, so a free message is not allowed. Choose an approved template in Follow-ups → Setup.');
     }
   } catch (err) {
     err.message = String(err.metaError?.message || err.message);

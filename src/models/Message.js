@@ -58,6 +58,9 @@ const messageSchema = new Schema(
     status: { type: String, enum: ['pending', 'sent', 'delivered', 'read', 'failed'], default: 'sent' },
     errorCode: { type: String, default: null },
     errorMessage: { type: String, default: null },
+    // Where it came from when not sent through our own API: 'phone_app' (staff reply
+    // typed in the WhatsApp Business app) or 'history' (imported old chat).
+    source: { type: String, default: null },
 
     // AI trace fields - populated only for AI-generated outbound messages
     aiPrompt: { type: String, default: null, select: false },

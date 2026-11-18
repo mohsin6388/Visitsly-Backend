@@ -53,7 +53,7 @@ const updateOrg = asyncHandler(async (req, res) => {
   // subscription is running (the Razorpay plan is in the old currency).
   if (req.body.country && String(req.body.country).toUpperCase() !== String(org.country || 'IN').toUpperCase()) {
     if (org.status === 'active' && org.razorpay?.subscriptionId) {
-      throw ApiError.badRequest('Active subscription ke dauran billing country nahi badal sakte. Support se baat karein.');
+      throw ApiError.badRequest('Billing country can’t be changed during an active subscription. Contact support.');
     }
     $set.country = String(req.body.country).toUpperCase();
     $set.currency = require('../config/pricing').currencyForCountry($set.country);
@@ -97,7 +97,7 @@ const whatsappHealth = asyncHandler(async (req, res) => {
 const fixWhatsappWebhook = asyncHandler(async (req, res) => {
   const org = requireOrg(req);
   const health = await whatsappConnect.resubscribeWebhook(org._id);
-  return new ApiResponse(200, { health }, 'Webhook dobara jod diya gaya').send(res);
+  return new ApiResponse(200, { health }, 'Webhook reconnected').send(res);
 });
 
 const connectEmbedded = asyncHandler(async (req, res) => {
@@ -153,6 +153,23 @@ const connectManual = asyncHandler(async (req, res) => {
     .catch((err) => logger.warn('[org] WhatsApp connected but audit log could not be written', { organizationId: String(org._id), error: err.message }));
   const fresh = await orgService.getSnapshot(org._id, { fresh: true });
   return new ApiResponse(200, { whatsapp: whatsappConnect.publicView(fresh) }, 'WhatsApp connected').send(res);
+});
+
+/** POST /api/org/whatsapp/test-message — send a test message to the owner's own number. */
+const sendWhatsappTestMessage = asyncHandler(async (req, res) => {
+  const org = requireOrg(req);
+  const result = await whatsappConnect.sendTestMessage(org._id, req.body);
+  await AuditLog.create({ userId: req.user.actorId, action: 'org.whatsapp.test_message', ip: req.ip }).catch(() => {});
+  const fresh = await orgService.getSnapshot(org._id, { fresh: true });
+  return new ApiResponse(200, { ...result, whatsapp: whatsappConnect.publicView(fresh) }, 'Test message sent').send(res);
+});
+
+/** POST /api/org/whatsapp/coexistence/sync — (re)request contacts + chat history sync (24h window). */
+const retryCoexistenceSync = asyncHandler(async (req, res) => {
+  const org = requireOrg(req);
+  await whatsappConnect.startCoexistenceSync(org._id);
+  const fresh = await orgService.getSnapshot(org._id, { fresh: true });
+  return new ApiResponse(200, { whatsapp: whatsappConnect.publicView(fresh) }, 'Sync requested').send(res);
 });
 
 const disconnectWhatsapp = asyncHandler(async (req, res) => {
@@ -226,7 +243,7 @@ const addNumber = asyncHandler(async (req, res) => {
   const org = requireOrg(req);
   await whatsappConnect.addNumber(org._id, req.body);
   const fresh = await orgService.getSnapshot(org._id, { fresh: true });
-  return new ApiResponse(201, { whatsapp: whatsappConnect.publicView(fresh) }, 'Number add ho gaya').send(res);
+  return new ApiResponse(201, { whatsapp: whatsappConnect.publicView(fresh) }, 'Number added').send(res);
 });
 
 const removeNumber = asyncHandler(async (req, res) => {
@@ -266,13 +283,13 @@ const inviteMember = asyncHandler(async (req, res) => {
   const org = requireOrg(req);
   const email = String(req.body.email).trim().toLowerCase();
   const orgRole = req.body.orgRole || 'agent';
-  if (orgRole === 'owner') throw ApiError.badRequest('Company mein ek hi owner hota hai');
-  if (req.user.orgRole !== 'owner' && orgRole === 'manager') throw ApiError.forbidden('Manager sirf owner bana sakta hai');
+  if (orgRole === 'owner') throw ApiError.badRequest('A company can have only one owner');
+  if (req.user.orgRole !== 'owner' && orgRole === 'manager') throw ApiError.forbidden('Only the owner can add managers');
 
   const activeUsers = await User.countDocuments({ orgId: org._id, isActive: true });
   assertWithinLimit('users', activeUsers, 1);
 
-  if (await User.exists({ email })) throw ApiError.conflict('Is email se pehle se ek PropAI login hai');
+  if (await User.exists({ email })) throw ApiError.conflict('A login already exists for this email');
 
   const password = req.body.password || tempPassword();
   const user = new User({
@@ -294,8 +311,8 @@ const inviteMember = asyncHandler(async (req, res) => {
     const { sendDirectEmail } = require('../services/email/mailer');
     await sendDirectEmail({
       to: email,
-      subject: `${org.name} ne aapko ${env.saas.productName} par add kiya hai`,
-      text: `Namaste ${req.body.name},\n\n${org.name} ne aapko ${env.saas.productName} CRM par add kiya hai.\n\nLogin: ${env.appBaseUrl}/login\nEmail: ${email}\nPassword: ${password}\n\nPehli baar login ke baad password badal lijiye.`,
+      subject: `${org.name} added you to ${env.saas.productName}`,
+      text: `Hi ${req.body.name},\n\n${org.name} added you to ${env.saas.productName} CRM.\n\nLogin: ${env.appBaseUrl}/login\nEmail: ${email}\nPassword: ${password}\n\nPlease change your password after your first login.`,
     });
   } catch (err) {
     logger.info('[team] Invite email not sent', { error: err.message });
@@ -322,9 +339,9 @@ const bulkInvite = asyncHandler(async (req, res) => {
     const email = String(row.email || '').trim().toLowerCase();
     const orgRole = row.orgRole === 'manager' ? 'manager' : 'agent';
     try {
-      if (orgRole === 'manager' && req.user.orgRole !== 'owner') throw ApiError.forbidden('Manager sirf owner bana sakta hai');
+      if (orgRole === 'manager' && req.user.orgRole !== 'owner') throw ApiError.forbidden('Only the owner can add managers');
       assertWithinLimit('users', active, 1);
-      if (await User.exists({ email })) throw ApiError.conflict('Is email se pehle se login bana hua hai');
+      if (await User.exists({ email })) throw ApiError.conflict('A login already exists for this email');
       const password = row.password || tempPassword();
       const user = new User({
         name: String(row.name).trim(),
@@ -343,32 +360,32 @@ const bulkInvite = asyncHandler(async (req, res) => {
         const { sendDirectEmail } = require('../services/email/mailer');
         await sendDirectEmail({
           to: email,
-          subject: `${org.name} ne aapko ${env.saas.productName} par add kiya hai`,
-          text: `Namaste ${row.name},\n\n${org.name} ne aapko ${env.saas.productName} CRM par add kiya hai.\n\nLogin: ${env.appBaseUrl}/login\nEmail: ${email}\nPassword: ${password}\n\nLogin ke baad password badal sakte hain.`,
+          subject: `${org.name} added you to ${env.saas.productName}`,
+          text: `Hi ${row.name},\n\n${org.name} added you to ${env.saas.productName} CRM.\n\nLogin: ${env.appBaseUrl}/login\nEmail: ${email}\nPassword: ${password}\n\nYou can change your password after logging in.`,
         });
       } catch (err) {
         logger.info('[team] Invite email not sent', { error: err.message });
       }
       results.push({ ok: true, email, name: user.name, member: teamRow(user), password });
     } catch (err) {
-      results.push({ ok: false, email, name: row.name, error: err.message || 'Add nahi hua' });
+      results.push({ ok: false, email, name: row.name, error: err.message || 'Could not add' });
     }
   }
   const added = results.filter((r) => r.ok).length;
-  return new ApiResponse(201, { results, loginUrl: `${env.appBaseUrl}/login` }, `${added} teammate add hue${added < results.length ? `, ${results.length - added} nahi hue` : ''}`).send(res);
+  return new ApiResponse(201, { results, loginUrl: `${env.appBaseUrl}/login` }, `${added} teammate(s) added${added < results.length ? `, ${results.length - added} failed` : ''}`).send(res);
 });
 
 /** POST /api/org/team/:id/set-password — owner/manager sets a chosen password. */
 const setMemberPassword = asyncHandler(async (req, res) => {
   const member = await findMember(req);
-  if (member.orgRole === 'owner' && String(member._id) !== req.user.actorId) throw ApiError.forbidden('Owner ka password sirf owner badal sakta hai');
+  if (member.orgRole === 'owner' && String(member._id) !== req.user.actorId) throw ApiError.forbidden('Only the owner can change the owner’s password');
   member.setPassword(req.body.password);
   member.mustChangePassword = false;
   member.tokenVersion += 1;
   member.refreshTokenHash = null;
   await member.save();
   await AuditLog.create({ userId: req.user.actorId, action: 'org.team.set_password', entityType: 'User', entityId: member._id, ip: req.ip });
-  return new ApiResponse(200, {}, 'Password set ho gaya').send(res);
+  return new ApiResponse(200, {}, 'Password set').send(res);
 });
 
 async function findMember(req) {
@@ -380,10 +397,10 @@ async function findMember(req) {
 
 const updateMember = asyncHandler(async (req, res) => {
   const member = await findMember(req);
-  if (member.orgRole === 'owner') throw ApiError.badRequest('Owner ka role ya status yahan se nahi badalta');
+  if (member.orgRole === 'owner') throw ApiError.badRequest('The owner’s role or status can’t be changed here');
   if (req.body.orgRole) {
-    if (req.body.orgRole === 'owner') throw ApiError.badRequest('Ownership transfer ke liye support se baat karein');
-    if (req.user.orgRole !== 'owner' && req.body.orgRole === 'manager') throw ApiError.forbidden('Manager sirf owner bana sakta hai');
+    if (req.body.orgRole === 'owner') throw ApiError.badRequest('Contact support to transfer ownership');
+    if (req.user.orgRole !== 'owner' && req.body.orgRole === 'manager') throw ApiError.forbidden('Only the owner can add managers');
     member.orgRole = req.body.orgRole;
   }
   if (typeof req.body.isActive === 'boolean') {
@@ -405,7 +422,7 @@ const updateMember = asyncHandler(async (req, res) => {
 const resetMemberPassword = asyncHandler(async (req, res) => {
   const member = await findMember(req);
   if (member.orgRole === 'owner' && String(member._id) !== req.user.actorId) {
-    throw ApiError.forbidden('Owner ka password sirf owner badal sakta hai');
+    throw ApiError.forbidden('Only the owner can change the owner’s password');
   }
   const password = tempPassword();
   member.setPassword(password);
@@ -432,6 +449,8 @@ module.exports = {
   completeEmbeddedSignup,
   connectManual,
   disconnectWhatsapp,
+  sendWhatsappTestMessage,
+  retryCoexistenceSync,
   updateOpeningTemplate,
   listOpeningTemplateOptions,
   listTeam,

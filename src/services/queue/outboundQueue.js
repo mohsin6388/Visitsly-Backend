@@ -1,3 +1,4 @@
+const { explainSendError } = require("../../utils/metaErrors");
 const { randomUUID } = require("crypto");
 const EmailMessage = require("../../models/EmailMessage");
 const logger = require("../../utils/logger");
@@ -409,7 +410,7 @@ async function listJobs(
       scheduledFor: j.scheduledFor,
       nextRunAt: j.nextRunAt,
       sentAt: j.sentAt,
-      lastError: j.lastError,
+      ...(() => { const e = explainSendError(j.lastError); return { lastError: e.message, lastErrorRaw: j.lastError || null, errorFix: e.fix, errorCode: e.code || null }; })(),
     })),
     pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
   };

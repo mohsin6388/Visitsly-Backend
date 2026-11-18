@@ -105,7 +105,41 @@ function humanGap(ms) {
 }
 
 /** Extra system-prompt block: today's date, language lock, memory, returning-customer note. */
-function buildContextBlock({ conversation, lead, language, recentMessages }) {
+/** Site-visit guidance for the chat: invite → collect day/time → booked → confirmation. */
+function visitBlock(visit, { callOn }) {
+  const callLine = callOn
+    ? 'After the visit is booked, tell the customer briefly that our team will give them a short call to confirm the visit (e.g. "Hum aapko visit confirm karne ke liye ek chhoti si call karenge").'
+    : "After the visit is booked, tell the customer the team will confirm it on WhatsApp.";
+  if (!visit) {
+    return [
+      "",
+      "SITE VISIT (main goal of this chat):",
+      "- Once the customer's basic need is clear, or they like a property / ask for photos, price or location, warmly invite them for a site visit — e.g. \"Kya aap ek baar site visit karna chahenge? Kaunsa din aur time aapke liye theek rahega?\". Do not push; if they say not now, continue helping and invite again later naturally.",
+      "- The moment they agree, set wantsSiteVisit=true. Fill proposedDate (YYYY-MM-DD) and proposedTime (HH:mm, 24h) if they told a day/time; if not, ask for the day and time in the same reply.",
+      `- ${callLine}`,
+    ].join("\n");
+  }
+  const when = visit.dateTentative ? "day/time NOT fixed yet" : `${visit.preferredDate} at ${visit.preferredTime}`;
+  const conf = visit.confirmation?.status || "none";
+  const lines = ["", `SITE VISIT ALREADY BOOKED: ${when}${visit.propertyName ? ` — ${visit.propertyName}` : ""}. Confirmation: ${conf}.`];
+  if (visit.dateTentative) {
+    lines.push("- Ask which day and time suits them (one question). When they tell it, set wantsSiteVisit=true with proposedDate/proposedTime.");
+  } else if (conf === "declined") {
+    lines.push(
+      "- The customer said they CANNOT come at that time. Politely ask which other day/time works, or when we should get back to them.",
+      "- If they give a new day/time → wantsSiteVisit=true with proposedDate/proposedTime and tell them it is confirmed for the new time.",
+      "- If they want to be contacted later → acknowledge warmly (we'll get in touch then); do NOT set wantsSiteVisit.",
+    );
+  } else {
+    lines.push(
+      "- Do NOT book it again. Only if the customer asks to change the day/time, set wantsSiteVisit=true with the NEW proposedDate/proposedTime.",
+      conf === "confirmed" ? "- It is confirmed — if they ask, reassure them and share location details." : `- ${callLine}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function buildContextBlock({ conversation, lead, language, recentMessages, visit = null, callOn = true }) {
   const now = istNow();
   const inbound = recentMessages.filter((m) => m.direction === "inbound");
   const prevInbound = inbound.length >= 2 ? inbound[inbound.length - 2] : null;
@@ -147,6 +181,7 @@ function buildContextBlock({ conversation, lead, language, recentMessages }) {
       `RETURNING CUSTOMER: their previous message was about ${humanGap(gapMs)} ago. Do NOT restart the conversation, do NOT greet as if new, do NOT ask the language or requirements again. Briefly welcome them back (one short phrase at most) and continue exactly from where the chat left off, answering their latest message.`,
     );
   }
+  lines.push(visitBlock(visit, { callOn }));
   lines.push(
     "",
     "STYLE: Short WhatsApp-style replies (1-4 short lines). Ask at most ONE question per reply. Be warm and human.",
@@ -486,25 +521,33 @@ async function handleInbound({ conversation, lead, message }) {
   )
     return scoreOnly();
 
+  // Record WHY the AI stayed silent so the inbox can tell the client, instead of failing quietly.
+  const skip = (reason) => {
+    Conversation.updateOne({ _id: conversation._id }, { $set: { aiSkipReason: reason, aiSkipAt: new Date() } }).catch(() => {});
+    return scoreOnly();
+  };
+
   const settings = await settingsService.getOrCreateSettings();
-  if (settings.aiPaused || !settings.autoReplyEnabled) return scoreOnly();
-  if (settings.whatsappDisconnected) return scoreOnly(); // broker hit "Disconnect" on the Settings page
+  if (settings.aiPaused) return skip("AI pause hai. Settings mein AI chalu karein.");
+  if (!settings.autoReplyEnabled) return skip("Auto-reply band hai. Settings mein chalu karein.");
+  if (settings.whatsappDisconnected) return skip("WhatsApp disconnect hai. Settings mein dobara connect karein.");
 
   const apiKey = await settingsService.getGeminiKey();
   if (!apiKey) {
     logger.warn(
       `[ai] No Gemini API key configured — skipping AI reply for lead ${lead._id}`,
     );
-    return scoreOnly();
+    return skip("AI key set nahi hai. Visitsly support se baat karein.");
   }
 
   // SaaS: per-contact AI reply cap (e.g. trial = 15 replies per contact).
   // After that the AI stays silent; scoring still happens.
-  if (await aiReplyLimitReached(conversation, lead)) return scoreOnly();
+  if (await aiReplyLimitReached(conversation, lead)) return skip("Is contact ke liye plan ki AI reply limit poori ho gayi. Plan upgrade karein.");
 
   // SaaS: no AI replies when the company's subscription is inactive or its
   // monthly AI-conversation quota is used up (scoring still happens).
-  if (!(await reserveAiConversation(conversation))) return scoreOnly();
+  if (!(await reserveAiConversation(conversation))) return skip("Subscription inactive hai ya is mahine ki AI conversation limit poori ho gayi. Billing page dekhein.");
+  if (conversation.aiSkipReason) Conversation.updateOne({ _id: conversation._id }, { $set: { aiSkipReason: null, aiSkipAt: null } }).catch(() => {});
 
   const recentMessages = await Message.find({
     conversationId: conversation._id,
@@ -569,11 +612,20 @@ async function handleInbound({ conversation, lead, message }) {
     referralPersonName:
       settings.referral?.personName || env.referral.personName,
   });
+  const activeVisit = await Meeting.findOne({ leadId: lead._id, status: { $in: ["scheduled", "rescheduled"] } })
+    .sort({ createdAt: -1 })
+    .populate("propertyId", "projectName")
+    .lean()
+    .catch(() => null);
+  if (activeVisit) activeVisit.propertyName = activeVisit.propertyId?.projectName || "";
+  const callOn = settings?.visitConfirm?.callEnabled !== false && require("../../config/voiceAgents").isConfigured();
   const systemInstruction = `${baseInstruction}\n${buildContextBlock({
     conversation,
     lead,
     language: lockedLanguage,
     recentMessages,
+    visit: activeVisit,
+    callOn,
   })}`;
 
   let result;
@@ -1635,9 +1687,9 @@ function mergeRequirements(existing, incoming = {}) {
  * creates a separate Meeting row, so a lead can have multiple site visits.
  */
 async function createSiteVisit({ lead, conversation, date, time, property }) {
-  const preferredDate =
-    date || new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10); // default: 2 days out if not specified yet
-  const preferredTime = time || "11:00";
+  const today = istNow().date;
+  const givenDate = /^\d{4}-\d{2}-\d{2}$/.test(String(date || "")) && String(date) >= today ? String(date) : null;
+  const givenTime = /^\d{1,2}:\d{2}$/.test(String(time || "")) ? String(time).padStart(5, "0") : null;
 
   const propertyMatch = property?._id
     ? { propertyId: property._id }
@@ -1647,28 +1699,64 @@ async function createSiteVisit({ lead, conversation, date, time, property }) {
     ...propertyMatch,
     status: { $in: ["scheduled", "rescheduled"] },
   }).sort({ createdAt: -1 });
+  // A visit already being confirmed for this lead (any property) is the same visit.
+  if (!meeting && !property?._id) {
+    meeting = await Meeting.findOne({ leadId: lead._id, status: { $in: ["scheduled", "rescheduled"] } }).sort({ createdAt: -1 });
+  }
 
   let isNew = false;
+  let changed = false;
   if (meeting) {
-    meeting.preferredDate = preferredDate;
-    meeting.preferredTime = preferredTime;
+    const prevConf = meeting.confirmation?.toObject?.() || meeting.confirmation || {};
+    const newDate = givenDate || meeting.preferredDate;
+    const newTime = givenTime || (givenDate && meeting.dateTentative ? "11:00" : meeting.preferredTime);
+    changed = newDate !== meeting.preferredDate || newTime !== meeting.preferredTime || (meeting.dateTentative && Boolean(givenDate));
+    const reopened = prevConf.status === "declined" && Boolean(givenDate || givenTime);
+    if (!changed && !reopened) {
+      // Same visit mentioned again ("haan main aa raha hoon") — nothing to change,
+      // and the confirmation already running must NOT start over (no repeat call).
+      if (property?._id && !meeting.propertyId) {
+        meeting.propertyId = property._id;
+        await meeting.save();
+      }
+      conversation.meetingStatus = "scheduled";
+      return meeting;
+    }
+    meeting.preferredDate = newDate;
+    meeting.preferredTime = newTime;
+    if (givenDate) meeting.dateTentative = false;
     if (property?._id) meeting.propertyId = property._id;
-    meeting.status = "scheduled";
-    meeting.confirmation = { status: "none" };
+    const confirmationRan = Boolean(prevConf.calledAt || prevConf.sentAt || ["pending", "declined", "confirmed"].includes(prevConf.status));
+    if (confirmationRan && givenDate) {
+      // The customer picked the new day/time themselves in the chat (after the
+      // call / WhatsApp confirmation) → that IS their confirmation.
+      meeting.status = "rescheduled";
+      meeting.confirmation = { ...prevConf, status: "confirmed", confirmedVia: "whatsapp", repliedAt: new Date(), error: null };
+    } else {
+      meeting.status = "scheduled";
+      meeting.confirmation = { status: "none" };
+    }
+    meeting.markModified("confirmation");
     await meeting.save();
+    if (meeting.confirmation?.status === "confirmed") {
+      require("../visits/visitConfirmation").notifyOwner(meeting.ownerId, lead, meeting, "confirmed", "whatsapp").catch(() => {});
+    }
   } else {
     isNew = true;
     meeting = await Meeting.create({
       leadId: lead._id,
       ownerId: conversation.ownerId,
       propertyId: property?._id || null,
-      preferredDate,
-      preferredTime,
+      preferredDate: givenDate || new Date(Date.now() + 330 * 60000 + 2 * 86400000).toISOString().slice(0, 10), // placeholder until the customer picks a day
+      preferredTime: givenTime || "11:00",
+      dateTentative: !givenDate,
       status: "scheduled",
       source: "whatsapp_ai",
       conversationId: conversation._id,
     });
   }
+  const preferredDate = meeting.preferredDate;
+  const preferredTime = meeting.preferredTime;
 
   // Cached copy on Conversation for quick UI reads — Meeting model remains
   // the source of truth. Keep this in sync any time Meeting.status changes
@@ -1689,7 +1777,7 @@ async function createSiteVisit({ lead, conversation, date, time, property }) {
         meeting.googleEventLink = event.eventLink;
         await meeting.save();
       }
-    } else {
+    } else if (!meeting.dateTentative) {
       const event = await createCalendarEvent({
         summary: `Site Visit — ${lead.name || lead.phone}${property ? ` (${property.projectName})` : ""}`,
         description: [
@@ -1722,7 +1810,7 @@ async function createSiteVisit({ lead, conversation, date, time, property }) {
       userId: conversation.ownerId,
       type: "site_visit_scheduled",
       title: `Site visit scheduled — ${lead.name}`,
-      body: `${preferredDate} at ${preferredTime}${property ? ` for ${property.projectName}` : ""}`,
+      body: `${meeting.dateTentative ? "Din/time abhi tay hona hai" : `${preferredDate} at ${preferredTime}`}${property ? ` for ${property.projectName}` : ""}`,
       link: `/site-visits`,
     });
     // Instant WhatsApp alert to the owner: a booked visit = hot lead.
@@ -1737,7 +1825,7 @@ async function createSiteVisit({ lead, conversation, date, time, property }) {
             `📞 ${lead.phone || "-"}`,
             `🗓 ${preferredDate} · ${preferredTime}`,
             property ? `🏠 ${property.projectName}${property.city ? `, ${property.city}` : ""}` : "",
-            "AI ne WhatsApp par visit book ki hai. Confirmation call/WhatsApp apne aap jayega.",
+            meeting.dateTentative ? "Customer ne visit ke liye haan kaha — din/time AI call par fix hoga." : "AI ne WhatsApp par visit book ki hai. Confirmation call/WhatsApp apne aap jayega.",
           ],
           link: "/site-visits",
           templateValues: [lead.name || "Lead", lead.phone || "-", `${preferredDate} ${preferredTime}`, property?.projectName || "-", "Site visit booked"],
@@ -1748,7 +1836,12 @@ async function createSiteVisit({ lead, conversation, date, time, property }) {
     }
   }
 
-  emitToUser(conversation.ownerId, "meeting:created", { meeting });
+  emitToUser(conversation.ownerId, isNew ? "meeting:created" : "meeting:updated", { meeting });
+
+  // Automatic confirmation call right after booking (client's toggle ON).
+  if ((isNew || changed) && meeting.confirmation?.status === "none") {
+    require("../visits/visitConfirmation").onVisitBooked(meeting);
+  }
 
   return meeting;
 }

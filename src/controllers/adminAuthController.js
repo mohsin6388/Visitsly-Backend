@@ -81,7 +81,7 @@ const me = asyncHandler(async (req, res) => {
 
 const changePassword = asyncHandler(async (req, res) => {
   const user = await User.findById(req.admin.id).select('+passwordHash');
-  if (!(await user.comparePassword(req.body.currentPassword))) throw ApiError.badRequest('Current password galat hai');
+  if (!(await user.comparePassword(req.body.currentPassword))) throw ApiError.badRequest('Current password is incorrect');
   user.setPassword(req.body.newPassword);
   await user.save();
   return new ApiResponse(200, null, 'Password changed').send(res);

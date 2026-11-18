@@ -1,4 +1,5 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const authenticate = require('../middlewares/auth');
 const roleGuard = require('../middlewares/roleGuard');
@@ -39,6 +40,8 @@ router.post('/whatsapp/embedded-signup/prepare', managers, validate(v.embeddedSi
 router.post('/whatsapp/embedded-signup/complete', managers, validate(v.embeddedSignupCompleteSchema), c.completeEmbeddedSignup);
 router.post('/whatsapp/manual', managers, validate(v.manualConnectSchema), c.connectManual);
 router.post('/whatsapp/disconnect', managers, c.disconnectWhatsapp);
+router.post('/whatsapp/test-message', managers, rateLimit({ windowMs: 15 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false, keyGenerator: (req) => String(req.org?._id || req.user?.actorId || 'authenticated'), message: { success: false, message: 'Too many test messages. Try again in 15 minutes.' } }), validate(v.whatsappTestMessageSchema), c.sendWhatsappTestMessage);
+router.post('/whatsapp/coexistence/sync', managers, c.retryCoexistenceSync);
 router.get('/whatsapp/opening-template/options', managers, c.listOpeningTemplateOptions);
 router.patch('/whatsapp/opening-template', managers, validate(v.openingTemplateSchema), c.updateOpeningTemplate);
 

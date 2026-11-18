@@ -5,13 +5,14 @@ const authenticate = require('../middlewares/auth');
 const roleGuard = require('../middlewares/roleGuard');
 const validate = require('../middlewares/validate');
 
-const { listMeetings, createMeeting, updateMeeting, deleteMeeting, sendConfirmation, callConfirmation, confirmationStats, markConfirmation } = require('../controllers/meetingController');
+const { listMeetings, createMeeting, updateMeeting, deleteMeeting, sendConfirmation, callConfirmation, confirmationStats, confirmationCalls, markConfirmation } = require('../controllers/meetingController');
 const { listMeetingsSchema, createMeetingSchema, updateMeetingSchema, idParamSchema } = require('../validators/meetingValidators');
 
 router.use(authenticate, roleGuard('broker', 'admin'));
 
 router.get('/', validate(listMeetingsSchema), listMeetings);
 router.get('/confirmation-stats', confirmationStats);
+router.get('/confirmation-calls', confirmationCalls);
 router.post('/', validate(createMeetingSchema), createMeeting);
 router.patch('/:id', validate(updateMeetingSchema), updateMeeting);
 router.post('/:id/send-confirmation', validate(idParamSchema), sendConfirmation);

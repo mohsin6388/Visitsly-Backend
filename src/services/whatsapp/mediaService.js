@@ -50,7 +50,7 @@ function validateUpload({ mimeType, size, filename }) {
   const limit = LIMITS[kind] || LIMITS.document;
   if (size > limit.max) {
     const mb = Math.round(limit.max / (1024 * 1024));
-    const err = new Error(`File bahut badi hai. WhatsApp par ${kind === 'image' ? 'photo' : kind} ${mb} MB tak hi ja sakta hai.`);
+    const err = new Error(`File too large. WhatsApp allows ${kind === 'image' ? 'photos' : kind} up to ${mb} MB.`);
     err.statusCode = 400;
     throw err;
   }
@@ -105,7 +105,7 @@ async function persistInboundMedia(messageId) {
 /** Uploads a file to Meta and returns its media id. */
 async function uploadToMeta({ buffer, mimeType, filename }) {
   if (!env.metaWhatsapp.accessToken || !env.metaWhatsapp.phoneNumberId) {
-    const err = new Error('WhatsApp number connect nahi hai — pehle WhatsApp connect karein.');
+    const err = new Error('No WhatsApp number connected — connect WhatsApp first.');
     err.code = 'META_NOT_CONFIGURED';
     throw err;
   }
@@ -120,7 +120,7 @@ async function uploadToMeta({ buffer, mimeType, filename }) {
     return data.id;
   } catch (err) {
     const metaError = err.response?.data?.error;
-    const e = new Error(metaError?.error_user_msg || metaError?.message || 'File WhatsApp par upload nahi hui');
+    const e = new Error(metaError?.error_user_msg || metaError?.message || 'File upload to WhatsApp failed');
     e.code = metaError?.code || 'META_MEDIA_UPLOAD_FAILED';
     e.metaError = metaError || null;
     throw e;
@@ -146,11 +146,11 @@ async function sendMedia({ phone, kind, mediaId, link, caption, filename }) {
   } catch (err) {
     const metaError = err.response?.data?.error;
     if (metaError?.code === 131047) {
-      const e = new Error('WHATSAPP_24H_WINDOW_CLOSED: Customer ne 24 ghante se reply nahi kiya, isliye file nahi ja sakti. Pehle template bhejein.');
+      const e = new Error('WHATSAPP_24H_WINDOW_CLOSED: No reply from the customer in 24 hours, so the file can’t be sent. Send a template first.');
       e.code = 'WHATSAPP_24H_WINDOW_CLOSED';
       throw e;
     }
-    const e = new Error(metaError?.error_user_msg || metaError?.message || 'File nahi bheji ja saki');
+    const e = new Error(metaError?.error_user_msg || metaError?.message || 'Could not send the file');
     e.code = metaError?.code || 'META_MEDIA_SEND_FAILED';
     e.metaError = metaError || null;
     throw e;

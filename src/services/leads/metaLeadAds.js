@@ -49,7 +49,7 @@ async function listPages(orgId, userAccessToken) {
     pageCache.set(String(orgId), { at: Date.now(), pages });
     return pages.map(({ id, name }) => ({ id, name }));
   } catch (err) {
-    throw fail(err, 'Pages load nahi hue');
+    throw fail(err, 'Could not load Pages');
   }
 }
 
@@ -59,7 +59,7 @@ async function subscribePage(pageId, pageToken) {
       params: { subscribed_fields: 'leadgen', access_token: pageToken },
     });
   } catch (err) {
-    throw fail(err, 'Page subscribe nahi hua');
+    throw fail(err, 'Could not subscribe the Page');
   }
 }
 
@@ -70,12 +70,12 @@ async function connectPage(orgId, { pageId, pageToken, pageName }) {
   if (!token) {
     const cached = pageCache.get(String(orgId));
     const page = cached?.pages.find((p) => p.id === String(pageId));
-    if (!page) throw ApiError.badRequest('Page list purani ho gayi — dobara Facebook se connect karein');
+    if (!page) throw ApiError.badRequest('Page list is outdated — connect with Facebook again');
     token = page.token;
     name = page.name;
   }
   const other = await Organization.findOne({ 'leadCapture.metaPageId': String(pageId), _id: { $ne: orgId } }).select('_id').lean();
-  if (other) throw ApiError.conflict('Ye Facebook Page kisi aur PropAI account se juda hai');
+  if (other) throw ApiError.conflict('This Facebook Page is connected to another account');
   await subscribePage(pageId, token);
   if (!name) {
     try {
@@ -117,9 +117,28 @@ function mapFieldData(fieldData = []) {
 async function handleLeadgen(change) {
   const value = change?.value || {};
   const pageId = String(value.page_id || '');
-  const org = await Organization.findOne({ 'leadCapture.metaPageId': pageId }).select('_id +leadCapture.metaPageTokenEncrypted').lean();
+  const org = await Organization.findOne({ 'leadCapture.metaPageId': pageId }).select('_id ownerUserId plan status featureOverrides +leadCapture.metaPageTokenEncrypted').lean();
   if (!org) {
     logger.warn(`[meta-leads] leadgen for unknown page ${pageId}`);
+    return;
+  }
+  // Meta Lead Ads Sync is a Builder Pro+ feature. The lead stays in Meta's
+  // Leads Center; tell the owner (once a day) so they can upgrade.
+  if (!require('../saas/subscription').hasFeature(org, 'metaLeadAds')) {
+    logger.info(`[meta-leads] skipped leadgen for org ${org._id}: plan has no Meta Lead Ads Sync`);
+    try {
+      const Notification = require('../../models/Notification');
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      if (!(await Notification.exists({ userId: org.ownerUserId, type: 'plan_limit', title: /Meta Lead Ads/, createdAt: { $gte: since } }))) {
+        await Notification.create({
+          userId: org.ownerUserId,
+          type: 'plan_limit',
+          title: 'Meta Lead Ads lead not synced',
+          body: 'A new Facebook/Instagram lead arrived, but Meta Lead Ads Sync is not on your plan. The lead is still in Meta Leads Center. Upgrade to Builder Pro to sync leads automatically.',
+          link: '/billing',
+        });
+      }
+    } catch { /* best effort */ }
     return;
   }
   const token = decrypt(org.leadCapture.metaPageTokenEncrypted);

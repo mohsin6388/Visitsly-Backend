@@ -21,11 +21,18 @@ const updateSchema = z.object({
 const brochureParams = z.object({ params: z.object({ id: objectId, brochureId: objectId }) });
 const imageSchema = z.object({ params: z.object({ id: objectId }), body: z.object({ url: z.string().url() }) });
 
+const { requireFeature } = require('../services/saas/subscription');
+
+// Multi-Project Bot (Builder Pro+): project sites with brochures, maps and
+// photos the AI answers from. Listing stays open (upgrade prompt in the UI).
+const multiProject = requireFeature('multiProjectBot');
+
 router.use(authenticate);
 
 router.get('/', listSites);
-router.post('/brochure', uploadBrochure.fields([{ name: 'brochure', maxCount: 1 }, { name: 'images', maxCount: 10 }]), uploadSiteBrochure);
-router.patch('/:id', validate(updateSchema), updateSite);
+router.post('/brochure', multiProject, uploadBrochure.fields([{ name: 'brochure', maxCount: 1 }, { name: 'images', maxCount: 10 }]), uploadSiteBrochure);
+router.patch('/:id', multiProject, validate(updateSchema), updateSite);
+// Deleting stays allowed so a downgraded company can still clean up.
 router.delete('/:id/brochures/:brochureId', validate(brochureParams), removeBrochure);
 router.delete('/:id/images', validate(imageSchema), removeImage);
 

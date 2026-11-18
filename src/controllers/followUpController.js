@@ -71,10 +71,10 @@ const sendFollowUp = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const followUp = await FollowUp.findOne({ _id: req.params.id, ownerId });
   if (!followUp) throw ApiError.notFound('Follow-up not found');
-  if (followUp.status !== 'pending') throw ApiError.badRequest('Ye follow-up pending nahi hai');
+  if (followUp.status !== 'pending') throw ApiError.badRequest('This follow-up is not pending');
   try {
     const result = await require('../services/followups/followUpAutomation').sendFollowUpNow(followUp, { text: req.body?.text });
-    return new ApiResponse(200, result, 'Follow-up bhej diya').send(res);
+    return new ApiResponse(200, result, 'Follow-up sent').send(res);
   } catch (err) {
     followUp.lastError = String(err.message).slice(0, 300);
     await followUp.save();
@@ -93,13 +93,13 @@ const createForLead = asyncHandler(async (req, res) => {
   const Lead = require('../models/Lead');
   const lead = await Lead.findOne({ _id: req.params.id, ownerId });
   if (!lead) throw ApiError.notFound('Lead not found');
-  if (lead.optedOut) throw ApiError.badRequest('Customer ne STOP likh kar messages band karwaye hain — unhe message nahi bhej sakte.');
+  if (lead.optedOut) throw ApiError.badRequest('Customer opted out (STOP) — they can’t be messaged.');
   const automation = require('../services/followups/followUpAutomation');
   const settings = await require('../services/settings/settingsService').getOrCreateSettings();
   const cfg = automation.config(settings);
   const text = String(req.body?.text || '').trim() || automation.reengageText(cfg, lead, 1);
   const when = req.body?.date ? new Date(req.body.date) : new Date();
-  if (Number.isNaN(when.getTime())) throw ApiError.badRequest('Date sahi nahi hai');
+  if (Number.isNaN(when.getTime())) throw ApiError.badRequest('Invalid date');
   await FollowUp.updateMany({ leadId: lead._id, status: 'pending', kind: { $in: ['manual', 'reengage'] } }, { $set: { status: 'skipped' } });
   const followUp = await FollowUp.create({
     leadId: lead._id,
@@ -113,14 +113,14 @@ const createForLead = asyncHandler(async (req, res) => {
   if (req.body?.sendNow) {
     try {
       const result = await automation.sendFollowUpNow(followUp, { text });
-      return new ApiResponse(201, { followUp, ...result }, 'Follow-up bhej diya').send(res);
+      return new ApiResponse(201, { followUp, ...result }, 'Follow-up sent').send(res);
     } catch (err) {
       followUp.lastError = String(err.message).slice(0, 300);
       await followUp.save();
       throw ApiError.badRequest(err.message);
     }
   }
-  return new ApiResponse(201, { followUp }, 'Follow-up schedule ho gaya').send(res);
+  return new ApiResponse(201, { followUp }, 'Follow-up scheduled').send(res);
 });
 
 module.exports = { listFollowUps, updateFollowUp, deleteFollowUp, sendFollowUp, createForLead };

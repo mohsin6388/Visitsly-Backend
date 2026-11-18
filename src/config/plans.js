@@ -1,18 +1,21 @@
 /**
- * PropAI SaaS plans — single source of truth for prices and limits.
- * Prices are in INR, GST (18%) extra. Annual billing = 10 months' price.
+ * PropAI / Visitsly SaaS plans — limits, features and copy.
+ *
+ * MONEY IS NOT HERE. Every price (plans, add-ons, tax) comes from
+ * config/pricing.js, which reads PRICE_* environment variables. There is no
+ * setup fee.
  *
  * Razorpay plan ids are NOT hard-coded: create the plans once in the
- * Razorpay dashboard (or let `npm run razorpay:plans` create them) and put
- * the ids in env as RAZORPAY_PLAN_<CODE>_<CYCLE>, e.g. RAZORPAY_PLAN_GROWTH_MONTHLY.
+ * Razorpay dashboard (or let checkout create them) and put the ids in env as
+ * RAZORPAY_PLAN_<CODE>_<CYCLE>[_<CUR>], e.g. RAZORPAY_PLAN_GROWTH_MONTHLY.
  *
  * `null` limit = unlimited.
- */
-/**
- * Limits can be changed from .env without touching code.
+ *
+ * Limits can be changed from .env without touching code:
  *   <PLAN>_MAX_USERS, <PLAN>_MAX_CONTACTS, <PLAN>_MAX_AI_CONVERSATIONS,
  *   <PLAN>_MAX_WHATSAPP_NUMBERS, <PLAN>_MAX_CAMPAIGNS,
- *   <PLAN>_MAX_BULK_MESSAGES, <PLAN>_AI_REPLIES_PER_CONTACT
+ *   <PLAN>_MAX_BULK_MESSAGES, <PLAN>_AI_REPLIES_PER_CONTACT,
+ *   <PLAN>_VOICE_MINUTES_INCLUDED
  * where <PLAN> = TRIAL | STARTER | GROWTH | BUILDER | ENTERPRISE.
  * A number sets the limit; "unlimited" (or "none") removes it; empty/missing
  * keeps the built-in default below.
@@ -42,184 +45,245 @@ function planLimits(code, d) {
       `${P}_AI_REPLIES_PER_CONTACT`,
       d.aiRepliesPerContact,
     ),
+    // AI calling minutes included each month. Minutes beyond this are billed
+    // per minute at the VOICE_MINUTE add-on price. Only meaningful when the
+    // plan has the `aiCalling` feature.
+    voiceMinutesIncluded: envLimit(
+      `${P}_VOICE_MINUTES_INCLUDED`,
+      d.voiceMinutesIncluded,
+    ),
   };
 }
 
 const inNum = (v) => Number(v).toLocaleString("en-IN");
 
+/**
+ * Feature flags. Every flag listed here is enforced server-side through
+ * services/saas/subscription.js (hasFeature / assertFeature / requireFeature),
+ * except the ones marked "info only" (sales / service promises, no code path).
+ */
+const FEATURE_KEYS = [
+  "aiAgent", // AI WhatsApp agent (core, every plan)
+  "leadScoring", // core
+  "siteVisitBooking", // core
+  "leadAlerts", // core
+  "bulkWhatsapp", // WhatsApp campaigns
+  "emailCampaigns", // email setup, email templates, email campaigns
+  "teamRouting", // team lead assignment / round-robin routing
+  "autoFollowUps", // follow-ups sent automatically (else: reminders only)
+  "inventory", // inventory management: property import / export / bulk delete
+  "multiProjectBot", // project sites + brochures the bot answers from
+  "metaLeadAds", // Meta (Facebook / Instagram) Lead Ads sync
+  "weeklyReports", // weekly WhatsApp report to the owner
+  "aiCalling", // AI voice calling (never on the free trial)
+  "metaBilling", // Meta bill dashboard
+  "portalIntegrations", // info only (Enterprise)
+  "customWorkflows", // info only (Enterprise)
+  "dedicatedManager", // info only (Enterprise)
+];
+
+const FEATURE_LABEL = {
+  aiAgent: "AI WhatsApp Agent",
+  leadScoring: "Lead Scoring",
+  siteVisitBooking: "Automatic Site Visit Booking",
+  leadAlerts: "Lead Alerts",
+  bulkWhatsapp: "Bulk WhatsApp campaigns",
+  emailCampaigns: "Email campaigns",
+  teamRouting: "Team Lead Assignment",
+  autoFollowUps: "Automatic Follow-ups",
+  inventory: "Inventory Management",
+  multiProjectBot: "Multi-Project Bot",
+  metaLeadAds: "Meta Lead Ads Sync",
+  weeklyReports: "Weekly Reports",
+  aiCalling: "AI calling",
+  metaBilling: "Meta bill dashboard",
+  portalIntegrations: "Portal Integrations",
+  customWorkflows: "Custom Workflows",
+  dedicatedManager: "Dedicated Account Manager",
+};
+
+function features(on) {
+  return Object.fromEntries(FEATURE_KEYS.map((k) => [k, on.includes(k)]));
+}
+
+const CORE = ["aiAgent", "leadScoring", "siteVisitBooking", "leadAlerts"];
+const STARTER_F = [...CORE, "aiCalling"]; // calling = pay-per-minute add-on (0 included)
+const GROWTH_F = [...STARTER_F, "bulkWhatsapp", "emailCampaigns", "teamRouting", "autoFollowUps", "metaBilling"];
+const BUILDER_F = [...GROWTH_F, "inventory", "multiProjectBot", "metaLeadAds", "weeklyReports"];
+const ENTERPRISE_F = [...FEATURE_KEYS];
+// Free trial: try the product end to end, except email and AI calling.
+const TRIAL_F = FEATURE_KEYS.filter(
+  (k) => !["emailCampaigns", "aiCalling", "portalIntegrations", "customWorkflows", "dedicatedManager"].includes(k),
+);
+
 const TRIAL_LIMITS = planLimits("trial", {
-  users: 2,
-  contacts: 500,
-  aiConversations: 100,
+  users: 1,
+  contacts: 50,
+  aiConversations: 50,
   whatsappNumbers: 1,
-  campaignsPerMonth: 5,
-  bulkMessages: 100,
+  campaignsPerMonth: 1,
+  bulkMessages: 50,
   aiRepliesPerContact: 15,
+  voiceMinutesIncluded: 0,
 });
 
 function trialHighlights(l) {
+  const n = (v, unlimited, text) => (v == null ? unlimited : text(inNum(v)));
   return [
-    "CRM, leads, properties aur conversations",
-    l.contacts == null
-      ? "Unlimited leads / contacts"
-      : `${inNum(l.contacts)} leads / contacts tak`,
-    l.bulkMessages == null
-      ? "Bulk WhatsApp / email messages"
-      : `${inNum(l.bulkMessages)} bulk messages (WhatsApp / email)`,
-    l.aiRepliesPerContact == null
-      ? "AI chatting"
-      : `AI har contact ko ${inNum(l.aiRepliesPerContact)} replies tak karega`,
-    l.aiConversations == null
-      ? "Unlimited AI conversations"
-      : `${inNum(l.aiConversations)} AI conversations`,
-    "1 WhatsApp number connect karein",
-    l.campaignsPerMonth == null
-      ? "Unlimited campaigns"
-      : `${inNum(l.campaignsPerMonth)} WhatsApp/email campaigns`,
-    l.users == null
-      ? "Unlimited team members"
-      : `Maximum ${inNum(l.users)} team members`,
+    "AI WhatsApp Agent, lead scoring, site visit booking",
+    n(l.contacts, "Unlimited contacts", (v) => `Upload up to ${v} contacts`),
+    n(l.bulkMessages, "Bulk WhatsApp messages", (v) => `${v} bulk WhatsApp messages`),
+    n(l.aiConversations, "Unlimited AI conversations", (v) => `${v} AI conversations`),
+    n(l.aiRepliesPerContact, "AI chatting", (v) => `Up to ${v} AI replies per contact`),
+    n(l.campaignsPerMonth, "Unlimited campaigns", (v) => `${v} WhatsApp campaign${l.campaignsPerMonth === 1 ? "" : "s"}`),
+    n(l.users, "Unlimited logins", (v) => `${v} login${l.users === 1 ? "" : "s"}`),
+    "Email campaigns and AI calling on paid plans",
   ];
 }
+
+function limitLine(v, unit, unlimited) {
+  return v == null ? unlimited : `${inNum(v)} ${unit}`;
+}
+
+const STARTER_LIMITS = planLimits("starter", {
+  users: 1,
+  contacts: 5000,
+  aiConversations: 1000,
+  whatsappNumbers: 1,
+  campaignsPerMonth: 30,
+  bulkMessages: null,
+  aiRepliesPerContact: null,
+  voiceMinutesIncluded: 0,
+});
+const GROWTH_LIMITS = planLimits("growth", {
+  users: 5,
+  contacts: 15000,
+  aiConversations: 3000,
+  whatsappNumbers: 1,
+  campaignsPerMonth: null,
+  bulkMessages: null,
+  aiRepliesPerContact: null,
+  voiceMinutesIncluded: 30,
+});
+const BUILDER_LIMITS = planLimits("builder", {
+  users: 10,
+  contacts: 50000,
+  aiConversations: 10000,
+  whatsappNumbers: 2,
+  campaignsPerMonth: null,
+  bulkMessages: null,
+  aiRepliesPerContact: null,
+  voiceMinutesIncluded: 100,
+});
+const ENTERPRISE_LIMITS = planLimits("enterprise", {
+  users: null,
+  contacts: null,
+  aiConversations: null,
+  whatsappNumbers: null,
+  campaignsPerMonth: null,
+  bulkMessages: null,
+  aiRepliesPerContact: null,
+  // Custom: set per company by the platform admin (limitOverrides.voiceMinutesIncluded).
+  voiceMinutesIncluded: 0,
+});
+
+const logins = (l) => limitLine(l.users, l.users === 1 ? "login" : "logins", "Unlimited logins");
+const chats = (l) => limitLine(l.aiConversations, "AI chats / month", "Custom AI chat volume");
 
 const PLANS = {
   trial: {
     code: "trial",
     name: "Free trial",
     public: false,
-    monthly: 0,
-    annual: 0,
-    setupFee: 0,
     limits: TRIAL_LIMITS,
-    features: { metaBilling: true, emailCampaigns: true, bulkWhatsapp: true },
+    features: features(TRIAL_F),
     highlights: trialHighlights(TRIAL_LIMITS),
   },
   starter: {
     code: "starter",
     name: "Starter",
-    tagline: "Akela broker",
+    tagline: "For brokers",
     public: true,
-    monthly: 3999,
-    annual: 39990,
-    setupFee: 4999,
-    limits: planLimits("starter", {
-      users: 3,
-      contacts: 5000,
-      aiConversations: 1500,
-      whatsappNumbers: 1,
-      campaignsPerMonth: 30,
-      bulkMessages: null,
-      aiRepliesPerContact: null,
-    }),
-    features: { metaBilling: false, emailCampaigns: true, bulkWhatsapp: true },
+    businessType: "broker",
+    limits: STARTER_LIMITS,
+    features: features(STARTER_F),
     highlights: [
-      "3 users, 1 WhatsApp number",
-      "5,000 contacts",
-      "1,500 AI conversations / month",
-      "Bulk WhatsApp + email",
-      "Qualified leads, site visits, follow-ups",
+      logins(STARTER_LIMITS),
+      chats(STARTER_LIMITS),
+      "AI WhatsApp Agent",
+      "Lead Scoring",
+      "Automatic Site Visit Booking",
+      "Lead Alerts",
     ],
   },
   growth: {
     code: "growth",
     name: "Growth",
-    tagline: "Broker team / agency",
+    tagline: "For agencies",
     public: true,
     popular: true,
-    monthly: 7999,
-    annual: 79990,
-    setupFee: 9999,
-    limits: planLimits("growth", {
-      users: 8,
-      contacts: 15000,
-      aiConversations: 4000,
-      whatsappNumbers: 1,
-      campaignsPerMonth: null,
-      bulkMessages: null,
-      aiRepliesPerContact: null,
-    }),
-    features: { metaBilling: true, emailCampaigns: true, bulkWhatsapp: true },
+    businessType: "agency",
+    limits: GROWTH_LIMITS,
+    features: features(GROWTH_F),
     highlights: [
-      "8 users",
-      "15,000 contacts",
-      "4,000 AI conversations / month",
-      "Meta billing dashboard",
-      "Unlimited campaigns",
-      "Sites & brochures",
+      logins(GROWTH_LIMITS),
+      chats(GROWTH_LIMITS),
+      "Everything in Starter",
+      "Bulk WhatsApp + Email",
+      "Team Lead Assignment",
+      "Automatic Follow-ups",
     ],
   },
   builder: {
     code: "builder",
-    name: "Builder",
-    tagline: "Builder / developer",
+    name: "Builder Pro",
+    tagline: "For builders & developers",
     public: true,
-    monthly: 17999,
-    annual: 179990,
-    setupFee: 24999,
-    limits: planLimits("builder", {
-      users: 20,
-      contacts: 50000,
-      aiConversations: 10000,
-      whatsappNumbers: 2,
-      campaignsPerMonth: null,
-      bulkMessages: null,
-      aiRepliesPerContact: null,
-    }),
-    features: { metaBilling: true, emailCampaigns: true, bulkWhatsapp: true },
+    businessType: "builder",
+    limits: BUILDER_LIMITS,
+    features: features(BUILDER_F),
     highlights: [
-      "20 users, 2 WhatsApp numbers",
-      "50,000 contacts",
-      "10,000 AI conversations / month",
-      "Inventory in Excel mode",
-      "Priority support",
+      logins(BUILDER_LIMITS),
+      chats(BUILDER_LIMITS),
+      "Everything in Growth",
+      "Inventory Management",
+      "Multi-Project Bot",
+      "Meta Lead Ads Sync",
+      "Weekly Reports",
     ],
   },
   enterprise: {
     code: "enterprise",
     name: "Enterprise",
-    tagline: "Multi-city builder",
+    tagline: "Large / multi-city",
     public: true,
     contactSales: true,
-    monthly: 35000,
-    annual: 350000,
-    setupFee: 50000,
-    limits: planLimits("enterprise", {
-      users: null,
-      contacts: null,
-      aiConversations: null,
-      whatsappNumbers: null,
-      campaignsPerMonth: null,
-      bulkMessages: null,
-      aiRepliesPerContact: null,
-    }),
-    features: { metaBilling: true, emailCampaigns: true, bulkWhatsapp: true },
+    customPricing: true,
+    limits: ENTERPRISE_LIMITS,
+    features: features(ENTERPRISE_F),
     highlights: [
-      "Unlimited users and contacts",
-      "Multiple WhatsApp numbers",
-      "White-label on your domain",
-      "Custom integrations",
-      "Dedicated account manager",
+      "Unlimited logins",
+      "Custom AI chat volume",
+      "All features",
+      "Portal Integrations",
+      "Custom Workflows",
+      "Dedicated Account Manager",
     ],
   },
 };
 
+/** Names and units only — prices live in config/pricing.js (PRICE_<CUR>_ADDON_*). */
 const ADDONS = {
-  extraUser: { name: "Extra user", price: 699, unit: "month" },
-  extraNumber: { name: "Extra WhatsApp number", price: 1499, unit: "month" },
-  extraAiConversations: {
-    name: "1,000 extra AI conversations",
-    price: 750,
-    unit: "pack",
-  },
-  voiceMinute: { name: "AI voice calling", price: 7, unit: "minute" },
-  leadRevival: {
-    name: "Purani leads revive campaign",
-    price: 9999,
-    unit: "once",
-  },
+  extraUser: { name: "Extra user", unit: "month" },
+  extraNumber: { name: "Extra WhatsApp number", unit: "month" },
+  extraAiConversations: { name: "1,000 extra AI conversations", unit: "pack" },
+  voiceMinute: { name: "AI voice calling", unit: "minute" },
+  leadRevival: { name: "Old leads revival campaign", unit: "once" },
 };
 
-const GST_RATE = 0.18;
+/** Business type chosen in onboarding → the plan we recommend. */
+const RECOMMENDED_PLAN = { broker: "starter", agency: "growth", builder: "builder" };
+
 const configuredTrialDays = Number.parseInt(process.env.TRIAL_DAYS || "7", 10);
 const TRIAL_DAYS =
   Number.isInteger(configuredTrialDays) &&
@@ -256,42 +320,53 @@ function limitsFor(org) {
   return out;
 }
 
+/**
+ * Feature flags for a company: plan features, then per-org overrides
+ * (`featureOverrides`, set by the platform admin or the grandfathering
+ * migration). Only booleans in the override count.
+ */
+function featuresFor(org) {
+  const out = { ...getPlan(org?.plan).features };
+  const overrides = org?.featureOverrides || {};
+  for (const [key, value] of Object.entries(overrides)) {
+    if (typeof value === "boolean" && key in out) out[key] = value;
+  }
+  return out;
+}
+
+/** The cheapest public plan that includes a feature (for upgrade messages). */
+function cheapestPlanWith(feature) {
+  return ["starter", "growth", "builder", "enterprise"].map((c) => PLANS[c]).find((p) => p.features[feature]) || null;
+}
+
+/** Plan data without money — pricing.plansIn() adds prices per currency. */
 function publicPlans() {
   return Object.values(PLANS)
     .filter((p) => p.public)
-    .map(
-      ({
-        code,
-        name,
-        tagline,
-        popular,
-        contactSales,
-        monthly,
-        annual,
-        setupFee,
-        limits,
-        highlights,
-      }) => ({
-        code,
-        name,
-        tagline,
-        popular: !!popular,
-        contactSales: !!contactSales,
-        monthly,
-        annual,
-        setupFee,
-        limits,
-        highlights,
-      }),
-    );
+    .map(({ code, name, tagline, popular, contactSales, customPricing, businessType, limits, features: f, highlights }) => ({
+      code,
+      name,
+      tagline,
+      popular: !!popular,
+      contactSales: !!contactSales,
+      customPricing: !!customPricing,
+      businessType: businessType || null,
+      limits,
+      features: f,
+      highlights,
+    }));
 }
 
 module.exports = {
   PLANS,
   ADDONS,
-  GST_RATE,
+  FEATURE_KEYS,
+  FEATURE_LABEL,
+  RECOMMENDED_PLAN,
   TRIAL_DAYS,
   getPlan,
   limitsFor,
+  featuresFor,
+  cheapestPlanWith,
   publicPlans,
 };

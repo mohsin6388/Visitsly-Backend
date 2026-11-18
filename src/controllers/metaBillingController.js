@@ -20,7 +20,7 @@ const getMetaBilling = asyncHandler(async (req, res) => {
         configured: false,
         locked: true,
         period: { range, label: '', start: null, end: null },
-        error: 'Meta billing dashboard Growth plan aur upar mein milta hai. Plan & Billing se upgrade karein.',
+        error: 'Meta billing is available on Growth and above. Upgrade in Plan & Billing.',
         campaigns: [],
       }).send(res);
     }

@@ -1,3 +1,4 @@
+const { explainSendError } = require("../../utils/metaErrors");
 const { randomUUID } = require("crypto");
 const EmailMessage = require("../../models/EmailMessage");
 const logger = require("../../utils/logger");
@@ -152,9 +153,16 @@ async function enqueueLeads({ ownerId, leadIds, batchId }) {
   const activeSet = new Set(activeLeadIds.map(String));
 
   const now = new Date();
+  const Lead = require("../../models/Lead");
+  const snapshot = new Map(
+    (await Lead.find({ _id: { $in: leadIds } }).select("name phone email").lean()).map((l) => [String(l._id), l]),
+  );
   const docs = leadIds
     .filter((leadId) => !activeSet.has(String(leadId)))
     .map((leadId, i) => ({
+      contactName: snapshot.get(String(leadId))?.name || "",
+      contactPhone: snapshot.get(String(leadId))?.phone || "",
+      contactEmail: snapshot.get(String(leadId))?.email || "",
       batchId: id,
       ownerId,
       leadId,
@@ -223,6 +231,9 @@ async function scheduleCampaignJobs({ campaign, leads }) {
       status: "pending",
       scheduledFor: runAt,
       nextRunAt: runAt,
+      contactName: lead.name || "",
+      contactPhone: lead.phone || "",
+      contactEmail: lead.email || "",
     };
 
     if (wantWa && lead.hasPhone) {
@@ -364,6 +375,13 @@ async function listCampaigns(ownerId, { limit = 20, channel, status, search, bef
  * statusFilter: sent | failed | processing | paused | cancelled
  *               | pending (abhi due) | scheduled (future)
  */
+/** Older jobs stored a few errors in Hinglish; show them in English. */
+function legacyError(text) {
+  if (!text) return text;
+  if (/delete ho chuka|ya conversation delete/i.test(text)) return "Contact or chat was deleted before this message was sent";
+  return text;
+}
+
 async function listJobs(
   ownerId,
   { channel, campaignId, status, page = 1, limit = 50 } = {},
@@ -397,9 +415,11 @@ async function listJobs(
     jobs: jobs.map((j) => ({
       id: String(j._id),
       leadId: j.leadId?._id ? String(j.leadId._id) : null,
-      name: j.leadId?.name || "(deleted lead)",
-      phone: j.leadId?.phone || "",
-      email: j.leadId?.email || "",
+      // Deleted contacts keep showing with the name saved on the job.
+      leadDeleted: !j.leadId?._id,
+      name: j.leadId?.name || j.contactName || "Deleted contact",
+      phone: j.leadId?.phone || j.contactPhone || "",
+      email: j.leadId?.email || j.contactEmail || "",
       channel: j.channel || "whatsapp",
       campaignId: j.campaignId ? String(j.campaignId) : null,
       status: j.status,
@@ -409,7 +429,7 @@ async function listJobs(
       scheduledFor: j.scheduledFor,
       nextRunAt: j.nextRunAt,
       sentAt: j.sentAt,
-      lastError: j.lastError,
+      ...(() => { const e = explainSendError(legacyError(j.lastError)); return { lastError: e.message, lastErrorRaw: j.lastError || null, errorFix: e.fix, errorCode: e.code || null }; })(),
     })),
     pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
   };
@@ -467,7 +487,25 @@ async function cancelCampaign(ownerId, campaignId) {
   return { campaign, modified: res.modifiedCount };
 }
 
-/** Failed jobs ko dobara pending banata hai (optional: sirf ek channel) */
+/**
+ * Deletes a finished or cancelled campaign and its send history. A campaign
+ * that is still running or paused must be cancelled first, so nothing is
+ * deleted while the worker may be sending. Contacts and chats are kept.
+ */
+async function deleteCampaign(ownerId, campaignId) {
+  const campaign = await findCampaign(ownerId, campaignId);
+  if (!campaign) return null;
+  const open = await OutboundJob.exists({ campaignId: campaign._id, status: { $in: ["pending", "processing", "paused"] } });
+  if (["active", "paused"].includes(campaign.status) || open) {
+    const ApiError = require("../../utils/ApiError");
+    throw ApiError.badRequest("Cancel this campaign first. Running or paused campaigns can't be deleted.");
+  }
+  const res = await OutboundJob.deleteMany({ ownerId, campaignId: campaign._id });
+  await Campaign.deleteOne({ _id: campaign._id, ownerId });
+  return { campaign, modified: res.deletedCount };
+}
+
+/** Puts failed jobs back in the queue (optionally only one channel). */
 async function retryFailed(ownerId, campaignId, channel) {
   const campaign = await findCampaign(ownerId, campaignId);
   if (!campaign) return null;
@@ -521,6 +559,7 @@ module.exports = {
   pauseCampaign,
   resumeCampaign,
   cancelCampaign,
+  deleteCampaign,
   retryFailed,
   recoverStuckJobs,
 };

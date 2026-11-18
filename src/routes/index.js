@@ -32,6 +32,12 @@ router.use('/voice', require('./voiceRoutes'));
 router.use('/platform', require('./platformRoutes'));
 router.get('/public/plans', require('../controllers/billingController').listPlans);
 router.get('/public/branding', require('../controllers/billingController').branding);
+// Visitor country (IP-based) for signup / onboarding / pricing defaults. Never fails.
+router.get('/public/geo', async (req, res) => {
+  const country = await require('../services/geo/geoLookup').countryForRequest(req);
+  res.set('Cache-Control', 'private, max-age=3600');
+  res.json({ success: true, country, data: { country } });
+});
 
 router.get('/health', (req, res) => {
   const db = require('mongoose').connection.readyState === 1;

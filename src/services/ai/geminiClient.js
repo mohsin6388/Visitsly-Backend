@@ -1,5 +1,6 @@
 const logger = require("../../utils/logger");
 const ApiError = require("../../utils/ApiError");
+const groq = require("./groqClient");
 
 const API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
@@ -122,14 +123,20 @@ function buildBody({
   responseSchema,
   temperature,
   includeTemperature,
+  maxOutputTokens,
+  thinkingLevel,
+  model = "",
 }) {
+  // thinkingLevel is a Gemini 3.x option; 2.5 models reject it.
+  const wanted = thinkingLevel === undefined ? THINKING_LEVEL : thinkingLevel;
+  const level = wanted && !/^gemini-2\./.test(model) ? wanted : null;
   const generationConfig = {
-    maxOutputTokens: MAX_OUTPUT_TOKENS,
+    maxOutputTokens: maxOutputTokens || MAX_OUTPUT_TOKENS,
     ...(includeTemperature && typeof temperature === "number"
       ? { temperature }
       : {}),
-    ...(THINKING_LEVEL
-      ? { thinkingConfig: { thinkingLevel: THINKING_LEVEL } }
+    ...(level
+      ? { thinkingConfig: { thinkingLevel: level } }
       : {}),
     ...(responseSchema
       ? {
@@ -152,7 +159,7 @@ function buildBody({
  *   { ok: false, action, status, reason }
  * action = "retry_same" | "next_model" | "fatal" | "drop_temperature"
  */
-async function callModel({ model, apiKey, body, validateText }) {
+async function callModel({ model, apiKey, body, validateText, timeoutMs = REQUEST_TIMEOUT_MS }) {
   const url = `${API_BASE}/${model}:generateContent`;
   const startedAt = Date.now();
 
@@ -165,7 +172,7 @@ async function callModel({ model, apiKey, body, validateText }) {
         "x-goog-api-key": apiKey, // key URL me nahi — logs me leak nahi hoti
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
     const timedOut = err?.name === "TimeoutError" || err?.name === "AbortError";
@@ -337,8 +344,36 @@ async function generateContent({
   responseSchema,
   temperature = 0.8,
   validateText,
+  // Fast mode (voice calls): short timeout, fewer models / attempts.
+  timeoutMs = REQUEST_TIMEOUT_MS,
+  attemptsPerModel = ATTEMPTS_PER_MODEL,
+  maxModels = Infinity,
+  models = null,
+  maxOutputTokens,
+  thinkingLevel,
+  groqFallback = true,
 }) {
+  const useGroq = groqFallback && groq.isConfigured();
+  const viaGroq = async (why) => {
+    logger.warn("[gemini] Falling back to Groq", { reason: why });
+    const schemaHint = responseSchema
+      ? `\n\nReply with ONLY one valid JSON object (no markdown) that follows this JSON schema:\n${JSON.stringify(responseSchema)}`
+      : "";
+    const { text, model } = await groq.chat({
+      systemInstruction: `${systemInstruction || ""}${schemaHint}`,
+      history,
+      json: Boolean(responseSchema),
+      temperature: typeof temperature === "number" ? Math.min(temperature, 1) : 0.6,
+      maxTokens: Math.min(maxOutputTokens || MAX_OUTPUT_TOKENS, 4096),
+      timeoutMs: Math.min(timeoutMs, 20000),
+      maxModels: Number.isFinite(maxModels) ? Math.max(1, maxModels) : 3,
+      validateText,
+    });
+    return { text, raw: null, model };
+  };
+
   if (!apiKey) {
+    if (useGroq) return viaGroq("no gemini key");
     throw ApiError.badRequest(
       "No Gemini API key configured — add one in Settings before enabling AI conversations",
     );
@@ -347,20 +382,24 @@ async function generateContent({
   const contents = normalizeHistory(history);
   let includeTemperature = true;
   const failures = [];
+  const chain = (models && models.length ? models : orderedModels()).slice(0, maxModels);
 
-  for (const model of orderedModels()) {
-    for (let attempt = 1; attempt <= ATTEMPTS_PER_MODEL; attempt++) {
+  for (const model of chain) {
+    for (let attempt = 1; attempt <= attemptsPerModel; attempt++) {
       const body = buildBody({
         systemInstruction,
         contents,
         responseSchema,
         temperature,
         includeTemperature,
+        maxOutputTokens,
+        thinkingLevel,
+        model,
       });
 
       logger.info("[gemini] Sending request", { model, attempt });
 
-      let result = await callModel({ model, apiKey, body, validateText });
+      let result = await callModel({ model, apiKey, body, validateText, timeoutMs });
 
       // Temperature support nahi -> bina temperature ke ek baar aur
       if (!result.ok && result.action === "drop_temperature") {
@@ -374,8 +413,12 @@ async function generateContent({
             responseSchema,
             temperature,
             includeTemperature,
+            maxOutputTokens,
+            thinkingLevel,
+            model,
           }),
           validateText,
+          timeoutMs,
         });
       }
 
@@ -386,12 +429,19 @@ async function generateContent({
       failures.push(`${model}:${result.status}`);
 
       if (result.action === "fatal") {
+        if (useGroq) {
+          try {
+            return await viaGroq(`gemini fatal ${result.status}`);
+          } catch (groqErr) {
+            logger.error("[groq] Fallback failed too", { error: groqErr.message });
+          }
+        }
         throw ApiError.internal(
           `Gemini API error (${result.status}) — ${result.reason}`,
         );
       }
 
-      if (result.action === "retry_same" && attempt < ATTEMPTS_PER_MODEL) {
+      if (result.action === "retry_same" && attempt < attemptsPerModel) {
         await sleep(SAME_MODEL_RETRY_DELAY_MS * attempt);
         continue;
       }
@@ -410,6 +460,14 @@ async function generateContent({
   }
 
   logger.error("[gemini] All models failed", { failures });
+  if (useGroq) {
+    try {
+      return await viaGroq("all gemini models failed");
+    } catch (groqErr) {
+      logger.error("[groq] Fallback failed too", { error: groqErr.message });
+      failures.push(`groq:${groqErr.message}`);
+    }
+  }
   const err = ApiError.internal(
     `Gemini unavailable on all models (${failures.join(", ")})`,
   );
@@ -427,6 +485,7 @@ async function generateStructured({
   history,
   responseSchema,
   temperature,
+  ...fast
 }) {
   const { text, raw, model } = await generateContent({
     apiKey,
@@ -434,10 +493,11 @@ async function generateStructured({
     history,
     responseSchema,
     temperature,
-    validateText: (t) => JSON.parse(t),
+    validateText: (t) => groq.extractJson(t),
+    ...fast,
   });
 
-  return { parsed: JSON.parse(text), raw, model };
+  return { parsed: groq.extractJson(text), raw, model };
 }
 
 module.exports = {

@@ -29,7 +29,7 @@ roleGuard.org = (...orgRoles) => (req, res, next) => {
   if (!req.user) return next(ApiError.unauthorized('Authentication required'));
   if (!req.user.tenant) return next(); // legacy single-client mode: no team roles
   if (orgRoles.includes(req.user.orgRole)) return next();
-  return next(ApiError.forbidden('Ye kaam sirf company owner/manager kar sakte hain'));
+  return next(ApiError.forbidden('Only the company owner or a manager can do this'));
 };
 
 /** Reads allowed for every teammate; writes only for these company roles. */

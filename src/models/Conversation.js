@@ -23,6 +23,9 @@ const conversationSchema = new Schema(
     // via `templateSent` below, which is what actually matters for the 24h
     // customer-service-window rule.
     templateSent: { type: Boolean, default: false },
+    // Created from WhatsApp Business app history sync (coexistence). Kept paused
+    // (no auto follow-ups / AI) until the customer writes again.
+    coexistenceImported: { type: Boolean, default: false },
     templateSentAt: { type: Date, default: null },
 
     status: {
@@ -45,6 +48,9 @@ const conversationSchema = new Schema(
     aiReplyCount: { type: Number, default: 0 },
     // Set when the per-contact cap was hit (used to notify the owner only once).
     aiLimitReachedAt: { type: Date, default: null },
+    // Why the AI did not answer the last customer message (null when it did).
+    aiSkipReason: { type: String, default: null },
+    aiSkipAt: { type: Date, default: null },
     // Which of the company's WhatsApp numbers this buyer talks to (multi-number plans).
     phoneNumberId: { type: String, default: null },
     assignedTo: {

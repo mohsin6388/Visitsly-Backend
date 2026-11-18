@@ -49,7 +49,7 @@ async function listPages(orgId, userAccessToken) {
     pageCache.set(String(orgId), { at: Date.now(), pages });
     return pages.map(({ id, name }) => ({ id, name }));
   } catch (err) {
-    throw fail(err, 'Pages load nahi hue');
+    throw fail(err, 'Could not load Pages');
   }
 }
 
@@ -59,7 +59,7 @@ async function subscribePage(pageId, pageToken) {
       params: { subscribed_fields: 'leadgen', access_token: pageToken },
     });
   } catch (err) {
-    throw fail(err, 'Page subscribe nahi hua');
+    throw fail(err, 'Could not subscribe the Page');
   }
 }
 
@@ -70,12 +70,12 @@ async function connectPage(orgId, { pageId, pageToken, pageName }) {
   if (!token) {
     const cached = pageCache.get(String(orgId));
     const page = cached?.pages.find((p) => p.id === String(pageId));
-    if (!page) throw ApiError.badRequest('Page list purani ho gayi — dobara Facebook se connect karein');
+    if (!page) throw ApiError.badRequest('Page list is outdated — connect with Facebook again');
     token = page.token;
     name = page.name;
   }
   const other = await Organization.findOne({ 'leadCapture.metaPageId': String(pageId), _id: { $ne: orgId } }).select('_id').lean();
-  if (other) throw ApiError.conflict('Ye Facebook Page kisi aur PropAI account se juda hai');
+  if (other) throw ApiError.conflict('This Facebook Page is connected to another account');
   await subscribePage(pageId, token);
   if (!name) {
     try {

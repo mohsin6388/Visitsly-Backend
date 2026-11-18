@@ -8,10 +8,6 @@ const c = require('../controllers/voiceController');
 
 const settingsSchema = z.object({
   body: z.object({
-    enabled: z.boolean().optional(),
-    apiKey: z.string().trim().min(10).max(300).optional(),
-    agentId: z.string().trim().max(100).optional(),
-    fromNumber: z.string().trim().max(20).optional(),
     autoCallNewLeads: z.boolean().optional(),
     autoCallAfterMinutes: z.number().int().min(5).max(720).optional(),
   }),

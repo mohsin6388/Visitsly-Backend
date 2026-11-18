@@ -13,6 +13,7 @@ const {
 } = require('../utils/tokens');
 const { sendPasswordResetEmail, sendEmailVerificationEmail } = require('../services/email/mailer');
 const { isDisposableEmail } = require('../services/auth/emailAddress');
+const { normalizePhone, phoneVariants } = require('../utils/phone');
 const Organization = require('../models/Organization');
 const Settings = require('../models/Settings');
 const orgService = require('../services/saas/orgService');
@@ -77,14 +78,14 @@ const login = asyncHandler(async (req, res) => {
     throw ApiError.unauthorized('Invalid email or password');
   }
   if (user.emailVerified === false) {
-    throw ApiError.forbidden('Login se pehle apna email verify karein. Verification link dobara bhejne ke liye signup page par email use karein.');
+    throw ApiError.forbidden('Verify your email before logging in. To get a new link, sign up again with the same email.');
   }
   if (!user.isActive) {
     throw ApiError.forbidden('This account has been deactivated');
   }
   if (env.saas.enabled && !user.orgId) {
     // PropAI staff use the separate admin panel, not the customer app.
-    throw ApiError.forbidden(isSuperAdminUser(user) ? 'PropAI admin login admin panel se karein' : 'This login is not linked to any company');
+    throw ApiError.forbidden(isSuperAdminUser(user) ? 'Platform admins must log in from the admin panel' : 'This login is not linked to any company');
   }
 
   const accessToken = await issueTokens(res, user);
@@ -230,23 +231,45 @@ const getMe = asyncHandler(async (req, res) => {
 });
 
 /**
+ * One account per mobile number: true when a verified user already uses this
+ * number (stored in any older format) — optionally ignoring one user id.
+ */
+async function phoneInUse(phone, ignoreUserId = null) {
+  const variants = [...new Set(phoneVariants(phone))];
+  const query = {
+    emailVerified: { $ne: false },
+    $or: [{ phone: { $in: variants } }, { 'pendingSignup.phone': { $in: variants } }],
+  };
+  if (ignoreUserId) query._id = { $ne: ignoreUserId };
+  return Boolean(await User.exists(query));
+}
+
+/**
  * POST /api/auth/signup — create a pending account. Workspace creation and
  * the seven-day trial only begin after the person proves they own the email.
  */
 const signup = asyncHandler(async (req, res) => {
   if (!env.saas.enabled || !env.saas.signupEnabled) throw ApiError.forbidden('Signup is disabled');
-  const { companyName, name, email, phone, password, city, businessType, plan, country } = req.body;
+  const { companyName, name, email, password, city, businessType, plan, country } = req.body;
   const normalizedEmail = String(email || '').trim().toLowerCase();
 
+  // Normalise the mobile number so the same number can't be registered twice.
+  const parsedPhone = normalizePhone(req.body.phone, { defaultCountry: String(country || 'IN').toUpperCase() });
+  if (!parsedPhone.ok) throw ApiError.badRequest('Enter a valid mobile number.');
+  const phone = parsedPhone.phone;
+
   if (isDisposableEmail(normalizedEmail)) {
-    throw ApiError.badRequest('Temporary/disposable email addresses allowed nahi hain. Apna email address use karein jahan aap verification link receive kar sakein.');
+    throw ApiError.badRequest('Temporary email addresses are not allowed. Use an email you can verify.');
   }
   const existingUser = await User.findOne({ email: normalizedEmail });
   if (existingUser) {
     if (existingUser.emailVerified === false) {
-      throw ApiError.conflict('Is email ka verification pending hai. Verification link resend karein.');
+      throw ApiError.conflict('Email verification pending. Resend the verification link.');
     }
-    throw ApiError.conflict('Is email se pehle se account hai — login karein.');
+    throw ApiError.conflict('This email is already registered. Log in instead.');
+  }
+  if (await phoneInUse(phone)) {
+    throw ApiError.conflict('This mobile number is already registered. Log in instead.');
   }
 
   const rawToken = generateRawToken();
@@ -282,7 +305,7 @@ const signup = asyncHandler(async (req, res) => {
     // the request. Duplicate-key races are still surfaced by the API handler.
     await User.deleteOne({ _id: user._id }).catch(() => {});
     if (err?.code === 'BREVO_NOT_CONFIGURED' || String(err?.code || '').startsWith('BREVO_')) {
-      throw new ApiError(503, 'Email verification abhi send nahi ho paayi. Please kuch der baad dobara try karein.');
+      throw new ApiError(503, 'We could not send the verification email. Please try again shortly.');
     }
     throw err;
   }
@@ -290,7 +313,7 @@ const signup = asyncHandler(async (req, res) => {
   return new ApiResponse(
     201,
     { email: normalizedEmail, verificationRequired: true, expiresInHours: env.emailVerificationExpiresHours },
-    `Verification email bhej di gayi hai. Email verify karne ke baad aapka ${TRIAL_DAYS}-day free trial shuru hoga.`
+    `Verification email sent. Your ${TRIAL_DAYS}-day free trial starts once you verify.`
   ).send(res);
 });
 
@@ -301,7 +324,7 @@ const signup = asyncHandler(async (req, res) => {
  */
 const verifyEmail = asyncHandler(async (req, res) => {
   const rawToken = String(req.body.token || '').trim();
-  if (!rawToken) throw ApiError.badRequest('Verification token missing hai');
+  if (!rawToken) throw ApiError.badRequest('Verification token is missing');
 
   const user = await User.findOneAndUpdate(
     {
@@ -317,10 +340,14 @@ const verifyEmail = asyncHandler(async (req, res) => {
   ).select('+emailVerificationTokenHash +emailVerificationExpires');
 
   if (!user) {
-    throw ApiError.badRequest('Verification link invalid ya expire ho gayi hai. Naya link mangwayein.');
+    throw ApiError.badRequest('This verification link is invalid or expired. Request a new one.');
   }
 
   const pending = user.pendingSignup;
+  if (pending?.phone && (await phoneInUse(pending.phone, user._id))) {
+    await User.deleteOne({ _id: user._id }).catch(() => {});
+    throw ApiError.conflict('This mobile number is already registered. Log in instead.');
+  }
   let org = null;
   try {
     let slug = pending.slug || Organization.slugify(pending.companyName);
@@ -346,7 +373,7 @@ const verifyEmail = asyncHandler(async (req, res) => {
     await Settings.create({
       orgId: org._id,
       companyName: pending.companyName,
-      openingText: `Namaste! Thank you for your interest in ${pending.companyName}. Main aapki property search mein help kar sakta/sakti hoon. Aap kis type ki property dekh rahe hain?`,
+      openingText: `Hi! Thank you for your interest in ${pending.companyName}. I can help with your property search. What kind of property are you looking for?`,
       referral: { enabled: false },
     });
 
@@ -384,14 +411,14 @@ const verifyEmail = asyncHandler(async (req, res) => {
   return new ApiResponse(
     200,
     { email: user.email, verified: true, trialDays: TRIAL_DAYS },
-    `Email verify ho gaya! Aapka ${TRIAL_DAYS} din ka free trial ab shuru hai. Login karke shuru karein.`
+    `Email verified. Your ${TRIAL_DAYS}-day free trial has started. Log in to continue.`
   ).send(res);
 });
 
 /** POST /api/auth/resend-verification — generic response prevents email enumeration. */
 const resendVerification = asyncHandler(async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
-  const genericMessage = 'Agar is email par verification pending hai, to naya link bhej diya jayega.';
+  const genericMessage = 'If verification is pending for this email, a new link has been sent.';
   const user = await User.findOne({ email, emailVerified: false, 'pendingSignup.companyName': { $exists: true, $ne: '' } })
     .select('+emailVerificationTokenHash +emailVerificationExpires');
 
@@ -411,7 +438,7 @@ const resendVerification = asyncHandler(async (req, res) => {
 const changePassword = asyncHandler(async (req, res) => {
   const user = await User.findById(req.user.actorId || req.user.id).select('+passwordHash');
   if (!user || !(await user.comparePassword(req.body.currentPassword))) {
-    throw ApiError.badRequest('Current password galat hai');
+    throw ApiError.badRequest('Current password is incorrect');
   }
   user.setPassword(req.body.newPassword);
   user.mustChangePassword = false;
@@ -435,11 +462,18 @@ const updateProfile = asyncHandler(async (req, res) => {
   }
 
   if (email && email.toLowerCase() !== user.email) {
-    throw ApiError.badRequest('Login email change ke liye naya verification flow zaroori hai. Abhi support team se contact karein.');
+    throw ApiError.badRequest('Changing the login email needs verification. Please contact support.');
   }
 
   if (name !== undefined) user.name = name;
-  if (phone !== undefined) user.phone = phone;
+  if (phone !== undefined) {
+    const parsed = normalizePhone(phone, { defaultCountry: req.org?.country || 'IN' });
+    if (!parsed.ok) throw ApiError.badRequest('Enter a valid mobile number.');
+    if (parsed.phone !== user.phone && (await phoneInUse(parsed.phone, user._id))) {
+      throw ApiError.conflict('This mobile number is already registered.');
+    }
+    user.phone = parsed.phone;
+  }
 
   await user.save();
 

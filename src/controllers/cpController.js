@@ -61,9 +61,9 @@ const info = asyncHandler(async (req, res) => {
 const register = asyncHandler(async (req, res) => {
   const org = await orgBySlug(req.params.slug);
   const phone = normalizePhone(req.body.phone);
-  if (!phone) throw ApiError.badRequest('Valid mobile number chahiye');
+  if (!phone) throw ApiError.badRequest('A valid mobile number is required');
   const email = String(req.body.email).trim().toLowerCase();
-  if (await ChannelPartner.exists({ orgId: org._id, $or: [{ email }, { phone }] })) throw ApiError.conflict('Is email/phone se pehle se registration hai — login karein');
+  if (await ChannelPartner.exists({ orgId: org._id, $or: [{ email }, { phone }] })) throw ApiError.conflict('Already registered with this email/phone — please log in');
   const cp = new ChannelPartner({
     orgId: org._id,
     ownerId: org.ownerUserId,
@@ -77,17 +77,17 @@ const register = asyncHandler(async (req, res) => {
   });
   await cp.setPassword(req.body.password);
   await cp.save();
-  await Notification.create({ userId: org.ownerUserId, type: 'cp_registered', title: `Naya channel partner: ${cp.name}`, body: `${cp.firmName || ''} ${cp.city || ''} — ${cp.status === 'approved' ? 'auto-approved' : 'approval pending'}`.trim(), link: '/channel-partners' }).catch(() => {});
-  return new ApiResponse(201, { partner: cpView(cp, org) }, cp.status === 'approved' ? 'Registration ho gaya — login karein' : 'Registration ho gaya — builder ke approve karte hi login kar payenge').send(res);
+  await Notification.create({ userId: org.ownerUserId, type: 'cp_registered', title: `New channel partner: ${cp.name}`, body: `${cp.firmName || ''} ${cp.city || ''} — ${cp.status === 'approved' ? 'auto-approved' : 'approval pending'}`.trim(), link: '/channel-partners' }).catch(() => {});
+  return new ApiResponse(201, { partner: cpView(cp, org) }, cp.status === 'approved' ? 'Registered — please log in' : 'Registered — you can log in once the builder approves').send(res);
 });
 
 const login = asyncHandler(async (req, res) => {
   const org = await orgBySlug(req.params.slug);
   const id = String(req.body.email || '').trim().toLowerCase();
   const cp = await ChannelPartner.findOne({ orgId: org._id, $or: [{ email: id }, { phone: normalizePhone(id) || '__' }] }).select('+passwordHash');
-  if (!cp || !(await cp.comparePassword(req.body.password))) throw ApiError.unauthorized('Email/phone ya password galat hai');
-  if (cp.status === 'pending') throw ApiError.forbidden('Aapka registration abhi approve nahi hua');
-  if (cp.status !== 'approved') throw ApiError.forbidden('Aapka account active nahi hai — builder se baat karein');
+  if (!cp || !(await cp.comparePassword(req.body.password))) throw ApiError.unauthorized('Wrong email/phone or password');
+  if (cp.status === 'pending') throw ApiError.forbidden('Your registration is not approved yet');
+  if (cp.status !== 'approved') throw ApiError.forbidden('Your account is inactive — contact the builder');
   cp.lastLoginAt = new Date();
   await cp.save();
   const token = jwt.sign({ sub: String(cp._id), org: String(org._id), v: cp.tokenVersion, aud: CP_AUD }, env.jwt.accessSecret, { expiresIn: '12h' });
@@ -104,12 +104,12 @@ async function cpAuth(req, res, next) {
     try {
       p = jwt.verify(token, env.jwt.accessSecret, { audience: CP_AUD });
     } catch {
-      throw ApiError.unauthorized('Session expired — dobara login karein');
+      throw ApiError.unauthorized('Session expired — please log in again');
     }
     const cp = await ChannelPartner.findById(p.sub);
     if (!cp || cp.status !== 'approved' || cp.tokenVersion !== p.v) throw ApiError.unauthorized('Account not active');
     const org = await orgService.getSnapshot(cp.orgId);
-    if (!org || !org.channelPartners?.enabled) throw ApiError.forbidden('Programme band hai');
+    if (!org || !org.channelPartners?.enabled) throw ApiError.forbidden('The programme is closed');
     req.cp = cp;
     req.cpOrg = org;
     tenantContext.run(org, () => next());
@@ -169,12 +169,12 @@ const myLeads = asyncHandler(async (req, res) => {
 const submitLead = asyncHandler(async (req, res) => {
   const org = req.cpOrg;
   const phone = normalizePhone(req.body.phone);
-  if (!phone) throw ApiError.badRequest('Customer ka valid mobile number chahiye');
+  if (!phone) throw ApiError.badRequest('A valid customer mobile number is required');
   // Lead protection: a buyer already in the builder's CRM can't be claimed.
   const existing = await Lead.findOne({ ownerId: org.ownerUserId, phone: { $in: [phone, `+${phone}`] } }).select('channelPartnerId cpProtectedUntil').lean();
   if (existing) {
     const mine = existing.channelPartnerId && String(existing.channelPartnerId) === String(req.cp._id);
-    throw ApiError.conflict(mine ? 'Ye customer aap pehle hi register kar chuke hain' : 'Ye customer pehle se builder ke paas registered hai — is par claim nahi ho sakta');
+    throw ApiError.conflict(mine ? 'You already registered this customer' : 'This customer is already registered with the builder and can’t be claimed');
   }
   const protectedUntil = new Date(Date.now() + (org.channelPartners.leadProtectionDays || 60) * DAY);
   const result = await captureLead({
@@ -189,7 +189,7 @@ const submitLead = asyncHandler(async (req, res) => {
     channelPartnerId: req.cp._id,
     cpProtectedUntil: protectedUntil,
   });
-  return new ApiResponse(201, { id: String(result.lead._id), protectedUntil }, `Customer register ho gaya — ${org.channelPartners.leadProtectionDays} din tak aapke naam protected`).send(res);
+  return new ApiResponse(201, { id: String(result.lead._id), protectedUntil }, `Customer registered — protected under your name for ${org.channelPartners.leadProtectionDays} days`).send(res);
 });
 
 const inventory = asyncHandler(async (req, res) => {
@@ -272,7 +272,7 @@ const markBooked = asyncHandler(async (req, res) => {
     lead.status = 'closed';
   }
   await lead.save();
-  return new ApiResponse(200, { lead }, req.body.undo ? 'Booking hata di' : 'Booking mark ho gayi 🎉').send(res);
+  return new ApiResponse(200, { lead }, req.body.undo ? 'Booking hata di' : 'Booking marked 🎉').send(res);
 });
 
 module.exports = { info, register, login, cpAuth, me, myLeads, submitLead, inventory, listPartners, updatePartner, updateSettings, markBooked };

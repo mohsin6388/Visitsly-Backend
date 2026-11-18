@@ -8,6 +8,32 @@ const { withLock } = require("../utils/distributedLock");
  */
 const MIGRATIONS = [
   {
+    id: "2026-11-visit-confirm-simple-flow",
+    // One simple flow: AI call first (platform voice) with WhatsApp fallback.
+    // WhatsApp confirmation is always on; clients can switch AI calling off.
+    async run() {
+      const Settings = require("../models/Settings");
+      const res = await Settings.updateMany({}, { $set: { "visitConfirm.enabled": true, "visitConfirm.callEnabled": true, "visitConfirm.mode": "call_first" } });
+      return { modified: res.modifiedCount };
+    },
+  },
+  {
+    id: "2026-11-voice-plivo-instant-call",
+    // AI calling moved from Bolna to Plivo + ElevenLabs, and the confirmation
+    // call now goes out right after booking (old default was 30 min).
+    async run() {
+      const Settings = require("../models/Settings");
+      const Organization = require("../models/Organization");
+      const a = await Settings.updateMany({ "visitConfirm.callDelayMinutes": 30 }, { $set: { "visitConfirm.callDelayMinutes": 1 } });
+      const b = await Settings.updateMany({ "visitConfirm.callEnabled": { $exists: false } }, { $set: { "visitConfirm.callEnabled": true } });
+      const c = await Organization.collection.updateMany(
+        { "voice.provider": { $ne: "plivo" } },
+        { $set: { "voice.provider": "plivo" }, $unset: { "voice.apiKeyEncrypted": "", "voice.agentId": "", "voice.fromNumber": "" } },
+      );
+      return { delay: a.modifiedCount, toggle: b.modifiedCount, orgs: c.modifiedCount };
+    },
+  },
+  {
     id: "2026-11-razorpay-plan-currency-index",
     // Plans are now unique per currency; drop the old INR-only unique index.
     async run() {

@@ -107,21 +107,21 @@ function money(n, currency = "INR") {
   }
 }
 
-const CATEGORY_LABEL = { MARKETING: "WhatsApp marketing", UTILITY: "WhatsApp utility", AUTHENTICATION: "WhatsApp OTP", SERVICE: "WhatsApp chat (service)", REFERRAL_CONVERSION: "Ad se aaye chats" };
+const CATEGORY_LABEL = { MARKETING: "WhatsApp marketing", UTILITY: "WhatsApp utility", AUTHENTICATION: "WhatsApp OTP", SERVICE: "WhatsApp chat (service)", REFERRAL_CONVERSION: "Chats from ads" };
 
 function reportLines(spend) {
   const c = spend.currency;
   const lines = [
     `Budget: ${money(spend.amount, c)} (${spend.period.label})`,
-    `Kharcha ab tak: ${money(spend.total, c)} (${spend.percent}%)`,
-    `Bacha hua: ${money(spend.remaining, c)}`,
+    `Spent so far: ${money(spend.total, c)} (${spend.percent}%)`,
+    `Remaining: ${money(spend.remaining, c)}`,
   ];
   for (const l of spend.whatsapp.lines.filter((x) => x.cost > 0 || x.volume > 0).slice(0, 5)) {
     lines.push(`• ${CATEGORY_LABEL[l.category] || l.category}: ${l.volume} msgs ≈ ${money(l.cost, c)}`);
   }
   if (spend.voice.minutes) lines.push(`• AI calling: ${spend.voice.minutes} min ≈ ${money(spend.voice.cost, c)}`);
-  if (spend.projected > spend.total) lines.push(`Isi speed se period ke end tak ≈ ${money(spend.projected, c)}`);
-  if (spend.whatsapp.estimated) lines.push("(WhatsApp kharcha andaazan hai — final bill Meta ke invoice par)");
+  if (spend.projected > spend.total) lines.push(`Projected by period end ≈ ${money(spend.projected, c)}`);
+  if (spend.whatsapp.estimated) lines.push("(WhatsApp cost is an estimate — final bill is on the Meta invoice)");
   return lines;
 }
 
@@ -130,11 +130,11 @@ async function sendReport(orgDoc, spend, { level = null } = {}) {
   const { sendOwnerAlert } = require("../alerts/ownerAlerts");
   const title = level
     ? level >= 100
-      ? `🚨 BUDGET POORA HO GAYA (${spend.percent}%)`
-      : `💰 Budget ${level}% tak pahunch gaya (${spend.percent}%)`
+      ? `🚨 BUDGET REACHED (${spend.percent}%)`
+      : `💰 Budget at ${level}% (${spend.percent}%)`
     : "💰 Kharcha report";
   const extra = [];
-  if (level >= 100 && orgDoc.budget?.pauseCampaignsAtLimit) extra.push("Naye bulk campaigns pause kar diye gaye hain. Budget badha kar Resume karein.");
+  if (level >= 100 && orgDoc.budget?.pauseCampaignsAtLimit) extra.push("New bulk campaigns are paused. Increase the budget and resume.");
   // Budget alerts may go to a dedicated number.
   const alertPhone = orgDoc.budget?.alertPhone;
   if (alertPhone) {

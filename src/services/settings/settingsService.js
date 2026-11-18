@@ -19,7 +19,7 @@ function defaultsFor(orgId) {
     ...(orgId ? { orgId } : {}),
     companyName: name || '',
     openingText: name
-      ? `Namaste! Thank you for your interest in ${name}. Main aapki property search mein help kar sakta/sakti hoon. Aap kis type ki property dekh rahe hain?`
+      ? `Hi! Thank you for your interest in ${name}. I can help with your property search. What kind of property are you looking for?`
       : '',
   };
 }

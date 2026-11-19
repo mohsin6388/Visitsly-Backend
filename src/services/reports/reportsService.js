@@ -21,10 +21,10 @@ function rangeFor(range = '30d', now = new Date()) {
     const m = range === 'this_month' ? x.getUTCMonth() : x.getUTCMonth() - 1;
     const start = new Date(Date.UTC(x.getUTCFullYear(), m, 1) - 330 * 60000);
     const end = range === 'this_month' ? now : new Date(Date.UTC(x.getUTCFullYear(), m + 1, 1) - 330 * 60000);
-    return { start, end, label: range === 'this_month' ? 'Is mahine' : 'Pichhla mahina' };
+    return { start, end, label: range === 'this_month' ? 'This month' : 'Last month' };
   }
   const days = { '7d': 7, '30d': 30, '90d': 90 }[range] || 30;
-  return { start: startOfISTDay(new Date(now.getTime() - (days - 1) * DAY)), end: now, label: `Pichhle ${days} din` };
+  return { start: startOfISTDay(new Date(now.getTime() - (days - 1) * DAY)), end: now, label: `Last ${days} days` };
 }
 
 const pct = (a, b) => (b ? Math.round((a / b) * 1000) / 10 : 0);
@@ -57,13 +57,13 @@ async function buildReport(ownerId, orgId, range = '30d') {
   const hot = [...repliedSet].filter((id) => (leadInfo.get(id)?.leadScore || 0) > HOT_SCORE).length;
 
   const funnel = [
-    { key: 'new', label: 'Nayi leads / contacts', value: newLeads.length },
-    { key: 'contacted', label: 'Message bheja', value: outboundLeadIds.length },
-    { key: 'replied', label: 'Reply aaya', value: repliedSet.size },
+    { key: 'new', label: 'New leads', value: newLeads.length },
+    { key: 'contacted', label: 'Messaged', value: outboundLeadIds.length },
+    { key: 'replied', label: 'Replied', value: repliedSet.size },
     { key: 'qualified', label: `Lead (score > ${LEAD_SCORE})`, value: qualified },
     { key: 'hot', label: `Hot (score > ${HOT_SCORE})`, value: hot },
-    { key: 'visits', label: 'Site visit book', value: visitSet.size },
-    { key: 'visited', label: 'Visit hua', value: visitedSet.size },
+    { key: 'visits', label: 'Visit booked', value: visitSet.size },
+    { key: 'visited', label: 'Visited', value: visitedSet.size },
     { key: 'booked', label: 'Booking', value: booked.length },
   ];
 
@@ -145,11 +145,11 @@ function reportText(companyName, r) {
   const lines = [
     `*${companyName} — Weekly report (${r.label})*`,
     '',
-    `Nayi leads: *${f.new}*`,
-    `Reply aaya: *${f.replied}* (${r.totals.replyRate}%)`,
+    `New leads: *${f.new}*`,
+    `Replied: *${f.replied}* (${r.totals.replyRate}%)`,
     `Hot leads: *${f.hot}*`,
-    `Site visits book: *${f.visits}* (AI ne ${r.totals.aiVisits})`,
-    `Visit hue: *${f.visited}*`,
+    `Visits booked: *${f.visits}* (by AI ${r.totals.aiVisits})`,
+    `Visited: *${f.visited}*`,
     `Bookings: *${f.booked}*`,
   ];
   if (r.bySource.length) {
@@ -161,7 +161,7 @@ function reportText(companyName, r) {
     lines.push('', '*Team:*');
     agents.forEach((a) => lines.push(`• ${a.name}: ${a.assigned} leads, ${a.visits} visits, ${a.booked} bookings`));
   }
-  lines.push('', 'Poori report PropAI → Reports mein.');
+  lines.push('', 'Full report in Reports.');
   return lines.join('\n');
 }
 

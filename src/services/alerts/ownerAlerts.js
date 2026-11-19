@@ -109,7 +109,7 @@ async function sendOwnerAlert({ kind, title, lines = [], link = "/dashboard", te
         await sendDirectEmail({
           to: targets.email,
           subject: title.replace(/[\u{1F300}-\u{1FAFF}]/gu, "").trim().slice(0, 150),
-          text: `${text}\n\n${base ? `Dashboard: ${base}${link}` : ""}\n\nTip: WhatsApp par alert paane ke liye apne number se business WhatsApp number par "Hi" bhej dijiye, ya Settings mein alert template chunein.`,
+          text: `${text}\n\n${base ? `Dashboard: ${base}${link}` : ""}\n\nTip: to get alerts on WhatsApp, send "Hi" from your number to the business WhatsApp, or choose an alert template in Settings.`,
         });
         result.email = { ok: true, to: targets.email };
       }

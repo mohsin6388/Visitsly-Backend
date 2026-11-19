@@ -31,6 +31,11 @@ const campaignSchema = new Schema(
     dailyLimit: { type: Number, default: 100, min: 1, max: 5000 },
     // HH:mm, Asia/Kolkata. Har din is time par us din ka batch shuru hota hai.
     sendTime: { type: String, default: "10:00" },
+    // How many days the campaign runs (null = until every contact is sent).
+    // dailyLimit × durationDays is the most contacts it will ever message.
+    durationDays: { type: Number, default: null, min: 1, max: 365 },
+    // Selected contacts left out because they didn't fit in dailyLimit × durationDays.
+    notScheduled: { type: Number, default: 0 },
     // YYYY-MM-DD (Asia/Kolkata) — pehla batch is din
     startDate: { type: String, required: true },
 

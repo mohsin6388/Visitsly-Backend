@@ -29,7 +29,7 @@ const http = axios.create({ timeout: 20_000 });
 // missing permission) mean EVERY send for this company will fail. Flag the
 // company's WhatsApp status so the dashboard shows a clear "Reconnect" banner
 // instead of silent failures. Throttled per company.
-const CONNECTION_ERROR_CODES = new Set([190, 102, 10, 200, 131031, 131005, 133010, 368]);
+const CONNECTION_ERROR_CODES = new Set([190, 102, 10, 200, 131031, 131005, 133010, 368, 131042]);
 const lastFlagAt = new Map();
 http.interceptors.response.use(undefined, (error) => {
   try {
@@ -56,7 +56,7 @@ function assertConfigured() {
   if (!env.metaWhatsapp.accessToken || !env.metaWhatsapp.phoneNumberId) {
     const err = new Error(
       env.saas.enabled
-        ? "WhatsApp number connect nahi hai — WhatsApp → Connect se apna number jodiye"
+        ? "No WhatsApp number connected — connect one in WhatsApp → Connect number"
         : "Meta WhatsApp Cloud API is not configured — set META_WHATSAPP_ACCESS_TOKEN and META_WHATSAPP_PHONE_NUMBER_ID in the environment",
     );
     err.code = "META_NOT_CONFIGURED";
@@ -236,6 +236,45 @@ async function sendTextMessage({ phone, text }) {
     apiError.response = err.response;
 
     throw apiError;
+  }
+}
+
+/**
+ * Reply-button message (max 3 buttons, title ≤ 20 chars). Only valid inside
+ * the 24h window. The customer's tap arrives as an "interactive" message
+ * whose text is the button title. Falls back to plain text if Meta rejects
+ * the interactive payload for any reason other than the 24h window.
+ */
+async function sendButtonsMessage({ phone, text, buttons = [] }) {
+  assertConfigured();
+  const list = buttons.slice(0, 3).map((b, i) => ({
+    type: "reply",
+    reply: { id: String(b.id || `btn_${i + 1}`).slice(0, 256), title: String(b.title || "").slice(0, 20) },
+  }));
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: toWhatsAppNumber(phone),
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: String(text).slice(0, 1024) },
+      action: { buttons: list },
+    },
+  };
+  try {
+    const { data } = await http.post(`${baseUrl()}/messages`, payload, { headers: headers() });
+    return { messageId: extractMessageId(data), raw: data, interactive: true };
+  } catch (err) {
+    const metaError = err.response?.data?.error;
+    if (metaError?.code === 131047) {
+      const windowErr = new Error("WHATSAPP_24H_WINDOW_CLOSED: " + (metaError.message || "Re-engagement message"));
+      windowErr.code = "WHATSAPP_24H_WINDOW_CLOSED";
+      windowErr.metaError = metaError;
+      throw windowErr;
+    }
+    // Interactive not accepted → same message as plain text.
+    return sendTextMessage({ phone, text });
   }
 }
 
@@ -555,6 +594,7 @@ async function verifyConfiguration() {
 module.exports = {
   sendTemplateMessage,
   sendTextMessage,
+  sendButtonsMessage,
   sendDocumentMessage,
   sendImageMessage,
   sendToLead,

@@ -63,6 +63,9 @@ const getDashboardSummary = asyncHandler(async (req, res) => {
     pendingFollowUps,
     recentUploads,
     latestConversations,
+    whatsappFailed,
+    emailFailed,
+    emailOpened,
   ] = await Promise.all([
     Lead.countDocuments(filter),
     Lead.countDocuments({ ...filter, createdAt: { $gte: today } }),
@@ -85,6 +88,9 @@ const getDashboardSummary = asyncHandler(async (req, res) => {
       .limit(8)
       .populate('leadId', 'name phone')
       .select('leadId status lastMessageAt currentLeadScore aiSummary'),
+    Message.countDocuments({ ...leadIdFilter, direction: 'outbound', status: 'failed' }),
+    EmailMessage.countDocuments({ ...filter, direction: 'outbound', status: { $in: ['failed', 'bounced'] } }),
+    EmailMessage.countDocuments({ ...filter, direction: 'outbound', openedAt: { $ne: null } }),
   ]);
 
   const closedOrLost = dealsClosed + lostLeads;
@@ -107,6 +113,10 @@ const getDashboardSummary = asyncHandler(async (req, res) => {
       dealsClosed,
       pendingFollowUps,
       conversionRate,
+    },
+    channels: {
+      whatsapp: { sent: messagesSent, replies: repliesReceived, failed: whatsappFailed },
+      email: { sent: emailMessagesSent, replies: emailRepliesReceived, failed: emailFailed, opened: emailOpened },
     },
     recentActivity: {
       recentUploads,

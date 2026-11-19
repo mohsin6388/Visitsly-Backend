@@ -16,6 +16,37 @@ const updateOrgSchema = z.object({
   }),
 });
 
+const countryCode = z
+  .string()
+  .trim()
+  .toUpperCase()
+  .refine((c) => require("../config/countries").isCountryCode(c), "Choose a valid country");
+
+// Onboarding wizard — final submit (PATCH /api/org/profile).
+const orgProfileSchema = z.object({
+  body: z.object({
+    ownerName: z.string().trim().min(2, "Enter your name").max(100),
+    companyName: z.string().trim().min(2, "Enter your company name").max(120),
+    country: countryCode,
+    city: z.string().trim().min(2, "Enter your city").max(80),
+    businessType: z.enum(["broker", "agency", "builder"], {
+      errorMap: () => ({ message: "Choose Broker, Agency or Builder" }),
+    }),
+  }),
+});
+
+// Onboarding wizard — answers saved after each step (PATCH /api/org/profile/draft).
+const orgProfileDraftSchema = z.object({
+  body: z.object({
+    ownerName: z.string().trim().max(100).optional(),
+    companyName: z.string().trim().max(120).optional(),
+    country: z.string().trim().toUpperCase().max(8).optional(),
+    city: z.string().trim().max(80).optional(),
+    businessType: z.enum(["broker", "agency", "builder", ""]).optional(),
+    step: z.number().int().min(0).max(10).optional(),
+  }),
+});
+
 const onboardingSchema = z.object({
   // Completion flags are server-owned and set from actual connection/data events.
   // The client may only choose whether to hide the compact checklist.
@@ -47,9 +78,18 @@ const embeddedSignupCompleteSchema = z.object({
       .string()
       .regex(/^[a-f\d]{24}$/i, "Invalid or expired connection attempt"),
     phoneNumberId: z.string().trim().regex(/^\d+$/, "Invalid Phone Number ID"),
+    // Required for a NEW number; not used for coexistence (existing Business app number).
     pin: z
       .string()
-      .regex(/^\d{6}$/, "Registration PIN must be exactly 6 digits"),
+      .regex(/^\d{6}$/, "Registration PIN must be exactly 6 digits")
+      .optional(),
+  }),
+});
+
+const whatsappTestMessageSchema = z.object({
+  body: z.object({
+    phone: z.string().trim().min(8).max(20),
+    text: z.string().trim().max(500).optional(),
   }),
 });
 
@@ -68,17 +108,17 @@ const manualConnectSchema = z.object({
   body: z.object({
     // Lenient on input (people paste with spaces / "Bearer " / quotes); the
     // service cleans and validates properly with friendly messages.
-    accessToken: z.string().trim().min(20, "Access token adhoora lag raha hai — poora copy karke paste karein").max(2000),
+    accessToken: z.string().trim().min(20, "The access token looks incomplete — paste the full token").max(2000),
     phoneNumberId: z
       .string()
       .trim()
       .transform((v) => v.replace(/\D/g, ""))
-      .refine((v) => v.length >= 8, "Phone Number ID sahi nahi hai (sirf numbers, WhatsApp Manager → API Setup se copy karein)"),
+      .refine((v) => v.length >= 8, "Invalid Phone Number ID (digits only, from WhatsApp Manager → API Setup)"),
     businessAccountId: z
       .string()
       .trim()
       .transform((v) => v.replace(/\D/g, ""))
-      .refine((v) => v.length >= 8, "WhatsApp Business Account ID sahi nahi hai (sirf numbers)"),
+      .refine((v) => v.length >= 8, "Invalid WhatsApp Business Account ID (digits only)"),
   }),
 });
 
@@ -118,25 +158,25 @@ const inviteSchema = z.object({
 
 const strongPassword = z
   .string()
-  .min(8, "Password kam se kam 8 characters ka ho")
+  .min(8, "Password must be at least 8 characters")
   .max(128)
-  .regex(/[A-Z]/, "Password mein ek capital letter (A-Z) hona chahiye")
-  .regex(/[0-9]/, "Password mein ek number (0-9) hona chahiye");
+  .regex(/[A-Z]/, "Password needs one capital letter (A-Z)")
+  .regex(/[0-9]/, "Password needs one number (0-9)");
 
 const bulkInviteSchema = z.object({
   body: z.object({
     members: z
       .array(
         z.object({
-          name: z.string().trim().min(2, "Naam likhein").max(100),
-          email: z.string().trim().email("Email sahi nahi hai"),
+          name: z.string().trim().min(2, "Enter a name").max(100),
+          email: z.string().trim().email("Invalid email"),
           phone: z.string().trim().max(20).optional().or(z.literal("")),
           orgRole: z.enum(["manager", "agent"]).default("agent"),
           password: strongPassword.optional().or(z.literal("").transform(() => undefined)),
         }),
       )
-      .min(1, "Kam se kam ek teammate add karein")
-      .max(50, "Ek baar mein 50 tak teammates add karein"),
+      .min(1, "Add at least one teammate")
+      .max(50, "Add up to 50 teammates at a time"),
   }),
 });
 
@@ -198,10 +238,18 @@ const platformUpdateSchema = z.object({
         campaignsPerMonth: limitValue,
         bulkMessages: limitValue,
         aiRepliesPerContact: limitValue,
+        voiceMinutesIncluded: limitValue,
       })
       .nullable()
       .optional(),
     priceOverride: z.number().int().min(0).nullable().optional(),
+    // Billing country (sets the currency). Customers can't change it after
+    // onboarding; only the platform admin can.
+    country: countryCode.optional(),
+    featureOverrides: z
+      .record(z.string().max(40), z.boolean().nullable())
+      .nullable()
+      .optional(),
     notes: z.string().max(5000).optional(),
     addons: z
       .object({
@@ -237,7 +285,7 @@ const adminCreateSchema = z.object({
     email: z.string().email(),
     password: z
       .string()
-      .min(10, "Admin password kam se kam 10 characters")
+      .min(10, "Admin password must be at least 10 characters")
       .regex(/[A-Z]/)
       .regex(/[0-9]/),
   }),
@@ -310,10 +358,13 @@ module.exports = {
   requestUpdateSchema,
   customerRequestSchema,
   updateOrgSchema,
+  orgProfileSchema,
+  orgProfileDraftSchema,
   onboardingSchema,
   embeddedSignupSchema,
   embeddedSignupPrepareSchema,
   embeddedSignupCompleteSchema,
+  whatsappTestMessageSchema,
   manualConnectSchema,
   openingTemplateSchema,
   inviteSchema,

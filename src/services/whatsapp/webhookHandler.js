@@ -256,14 +256,14 @@ function parseInbound(msg) {
         type: 'location',
         text: `[Location] ${where || `${l.latitude}, ${l.longitude}`}`,
         media: { latitude: l.latitude ?? null, longitude: l.longitude ?? null, address: where || null },
-        aiText: `(Customer ne apni location bheji: ${where || `${l.latitude}, ${l.longitude}`})`,
+        aiText: `(The customer shared their location: ${where || `${l.latitude}, ${l.longitude}`})`,
       };
     }
     case 'contacts': {
       const c = (msg.contacts || [])[0] || {};
       const name = c.name?.formatted_name || 'Contact';
       const phone = c.phones?.[0]?.phone || '';
-      return { type: 'contacts', text: `[Contact] ${name} ${phone}`.trim(), media: null, aiText: `(Customer ne ek contact share kiya: ${name} ${phone})` };
+      return { type: 'contacts', text: `[Contact] ${name} ${phone}`.trim(), media: null, aiText: `(The customer shared a contact: ${name} ${phone})` };
     }
     case 'reaction':
       return { type: 'reaction', text: `[Reaction] ${msg.reaction?.emoji || ''}`.trim(), media: null, aiText: '', skipAi: true };
@@ -360,6 +360,11 @@ async function handleInboundMessage(waMessage, contact) {
   // Once the lead has messaged us for real, the opening template's job is
   // done — every reply from here on is free-text within the 24h window.
   conversation.templateSent = true;
+  // Old chat imported from the Business app: the customer wrote again, so wake it up.
+  if (conversation.coexistenceImported) {
+    conversation.coexistenceImported = false;
+    if (conversation.status === "paused" && !conversation.optedOut) conversation.status = "ai_active";
+  }
 
   // Opt-out / decline handling (see followUpAutomation.js for re-follow-ups).
   const body = String(parsed.type === "text" || parsed.type === "interactive" ? parsed.text : "");
@@ -400,7 +405,7 @@ async function handleInboundMessage(waMessage, contact) {
   // Customer asked us to stop — acknowledge once, then stay silent.
   if (conversation.optedOut) {
     try {
-      const ack = "Theek hai, ab aapko hum message nahi karenge. Kabhi bhi zarurat ho to yahan \"Hi\" likh dijiye 🙏";
+      const ack = "Okay, we won’t message you again. Send \"Hi\" here anytime you need us 🙏";
       const { messageId } = await require("./metaWhatsappClient").sendTextMessage({ phone: lead.phone, text: ack });
       await require("./messageStore").recordOutboundMessage({ conversationId: conversation._id, leadId: lead._id, text: ack, sender: "ai", whatsappMessageId: messageId, ownerId: conversation.ownerId });
     } catch (err) {
@@ -453,7 +458,14 @@ async function handleWebhook(payload) {
     for (const entry of entries) {
       const changes = Array.isArray(entry.changes) ? entry.changes : [];
       for (const change of changes) {
-        if (change.field !== "messages") continue; // ignore non-message webhook fields
+        const COEX_FIELDS = ["smb_message_echoes", "history", "smb_app_state_sync"];
+        if (change.field === "account_update") {
+          await require("./coexistenceService")
+            .handleAccountUpdate(entry.id, change.value || {})
+            .catch((err) => logger.error("[whatsapp] account_update failed", { error: err.message }));
+          continue;
+        }
+        if (change.field !== "messages" && !COEX_FIELDS.includes(change.field)) continue; // ignore other webhook fields
         const value = change.value || {};
 
         // SaaS: one Meta app webhook serves every company. Route each change
@@ -465,10 +477,10 @@ async function handleWebhook(payload) {
             logger.warn(`[whatsapp] Webhook for unknown phone_number_id=${phoneNumberId} — no company has this number, ignoring`);
             continue;
           }
-          await tenantContext.run(org, () => tenantContext.runWithNumber(phoneNumberId, () => processChange(value)));
+          await tenantContext.run(org, () => tenantContext.runWithNumber(phoneNumberId, () => processChange(value, change.field)));
           continue;
         }
-        await processChange(value);
+        await processChange(value, change.field);
       }
     }
   } catch (err) {
@@ -478,10 +490,105 @@ async function handleWebhook(payload) {
   }
 }
 
-async function processChange(value) {
+const STATUS_RANK = { pending: 0, sent: 1, delivered: 2, read: 3 };
+
+/**
+ * Meta accepts a send first and reports the real outcome later via `statuses`.
+ * Payment problems (131042), blocked numbers etc. arrive HERE as "failed" —
+ * so this is where the campaign job must flip from "sent" to "failed", and where
+ * we learn that the Meta card is missing (or that it works again).
+ */
+async function applyDeliveryStatus(s, mappedStatus) {
+  const firstError = Array.isArray(s.errors) ? s.errors[0] : null;
+  const code = firstError?.code ? String(firstError.code) : null;
+  const text = firstError?.error_data?.details || firstError?.message || firstError?.title || null;
+
+  const msg = await Message.findOne({ whatsappMessageId: s.id });
+  if (!msg) return;
+
+  // Never downgrade (e.g. a late "sent" after "delivered"); "failed" always wins.
+  const current = STATUS_RANK[msg.status] ?? 0;
+  if (mappedStatus !== "failed" && (STATUS_RANK[mappedStatus] ?? 0) < current) return;
+  if (msg.status === "failed" && mappedStatus !== "failed") return;
+
+  await Message.updateOne(
+    { _id: msg._id },
+    { $set: { status: mappedStatus, errorCode: code, errorMessage: text } },
+  );
+
+  const Organization = require("../../models/Organization");
+  const conversation = await Conversation.findById(msg.conversationId).select("ownerId").lean();
+  const ownerId = conversation?.ownerId || null;
+
+  if (mappedStatus === "failed") {
+    if (code === "131042" && ownerId) {
+      await Organization.updateOne(
+        { ownerUserId: ownerId },
+        { $set: { "whatsapp.paymentIssueAt": new Date() } },
+      );
+    }
+    if (msg.outboundJobId) {
+      const OutboundJob = require("../../models/OutboundJob");
+      const job = await OutboundJob.findByIdAndUpdate(
+        msg.outboundJobId,
+        {
+          $set: {
+            status: "failed",
+            lockedAt: null,
+            lastError: `(#${code || "failed"}) ${text || "WhatsApp delivery failed"}`.slice(0, 500),
+            lastErrorCode: code,
+          },
+        },
+        { new: true },
+      );
+      if (job) {
+        emitToUser(job.ownerId, "outreach:job", {
+          jobId: String(job._id),
+          campaignId: job.campaignId ? String(job.campaignId) : null,
+          leadId: String(job.leadId),
+          channel: job.channel || "whatsapp",
+          status: job.status,
+          attempts: job.attempts,
+          sentAt: job.sentAt || null,
+          nextRunAt: job.nextRunAt,
+          lastError: job.lastError || null,
+        });
+        if (job.campaignId) {
+          const { getCampaignStats } = require("../queue/outboundQueue");
+          const stats = await getCampaignStats(job.campaignId).catch(() => null);
+          if (stats) {
+            emitToUser(job.ownerId, "outreach:progress", {
+              campaignId: String(job.campaignId),
+              stats,
+            });
+          }
+        }
+      }
+    }
+    return;
+  }
+
+  // A message really reached the customer: the Meta payment problem is gone.
+  if ((mappedStatus === "delivered" || mappedStatus === "read") && ownerId) {
+    await Organization.updateOne(
+      { ownerUserId: ownerId, "whatsapp.paymentIssueAt": { $ne: null } },
+      { $set: { "whatsapp.paymentIssueAt": null } },
+    );
+  }
+}
+
+async function processChange(value, field = "messages") {
   {
     {
       {
+        if (field !== "messages") {
+          const coex = require("./coexistenceService");
+          const run = { smb_message_echoes: coex.handleEchoes, history: coex.handleHistory, smb_app_state_sync: coex.handleStateSync }[field];
+          if (run) {
+            await run(value).catch((err) => logger.error(`[whatsapp] ${field} handler failed`, { error: err.message }));
+          }
+          return;
+        }
 
         // Status callbacks (sent/delivered/read/failed for OUR outbound
         // messages) land here too, under `statuses` instead of `messages` —
@@ -497,19 +604,11 @@ async function processChange(value) {
               ? s.status
               : null;
             if (mappedStatus && s.id) {
-              const firstError = Array.isArray(s.errors) ? s.errors[0] : null;
-              await Message.updateOne(
-                { whatsappMessageId: s.id },
-                {
-                  $set: {
-                    status: mappedStatus,
-                    errorCode: firstError?.code
-                      ? String(firstError.code)
-                      : null,
-                    errorMessage:
-                      firstError?.title || firstError?.message || null,
-                  },
-                },
+              await applyDeliveryStatus(s, mappedStatus).catch((err) =>
+                logger.error("[whatsapp] Could not apply delivery status", {
+                  error: err.message,
+                  messageId: s.id,
+                }),
               );
             }
             if (s.status === "failed") {

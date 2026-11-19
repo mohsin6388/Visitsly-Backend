@@ -1,4 +1,5 @@
 const { Parser: CsvParser } = require("json2csv");
+const mongoose = require("mongoose");
 const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const ApiResponse = require("../utils/ApiResponse");
@@ -16,7 +17,9 @@ const {
   analyzeRows,
 } = require("../services/csv/leadImporter");
 const { importLeadRows } = require("../services/leads/leadImportService");
-const { toWhatsAppNumber } = require("../services/whatsapp/metaWhatsappClient");
+const { normalizePhone, isValidEmail, phoneVariants } = require("../utils/phone");
+// Company's country decides how ambiguous local numbers are read (IN default; UAE 05x / 5x numbers are always detected).
+const phoneOpts = (req) => ({ defaultCountry: String(req.org?.country || "IN").toUpperCase() });
 const { enqueueLeads } = require("../services/queue/outboundQueue");
 
 /**
@@ -59,15 +62,19 @@ async function getQualificationSets(req, replyChannel = "") {
     emailReplyIds.filter(Boolean).forEach((id) => { if (owned.has(String(id))) repliedIds.add(String(id)); });
   }
   if (replyChannel !== "email") {
-    const inbound = await Message.find({ leadId: { $in: ownedIds }, direction: "inbound", sender: "customer" }).select("leadId text").lean();
-    const grouped = new Map();
-    for (const message of inbound) {
-      const key = String(message.leadId);
-      if (!grouped.has(key)) grouped.set(key, { human: 0, auto: 0 });
-      const item = grouped.get(key);
-      if (AUTO_REPLY_PATTERN.test(message.text || "")) item.auto += 1; else item.human += 1;
+    // One grouped query instead of loading every inbound message into memory.
+    const grouped = await Message.aggregate([
+      { $match: { leadId: { $in: ownedIds }, direction: "inbound", sender: "customer" } },
+      { $group: {
+        _id: "$leadId",
+        auto: { $sum: { $cond: [{ $regexMatch: { input: { $ifNull: ["$text", ""] }, regex: AUTO_REPLY_PATTERN.source, options: "i" } }, 1, 0] } },
+        total: { $sum: 1 },
+      } },
+    ]);
+    for (const item of grouped) {
+      const human = item.total - item.auto;
+      if (human >= 1 || item.auto >= 3) repliedIds.add(String(item._id));
     }
-    for (const [id, item] of grouped) if (item.human >= 1 || item.auto >= 3) repliedIds.add(id);
   }
 
   const meetingOwner = ownerFilter.ownerId;
@@ -95,15 +102,21 @@ const previewImport = asyncHandler(async (req, res) => {
   if (!req.file)
     throw ApiError.badRequest('CSV file is required (field name: "file")');
 
+  const opts = phoneOpts(req);
   let rows;
   try {
     const filename = String(req.file.originalname || "").toLowerCase();
-    rows = filename.endsWith(".xlsx") ? parseExcelBuffer(req.file.buffer) : parseCsvBuffer(req.file.buffer);
+    const buf = req.file.buffer;
+    // Detect by content too: a real .xlsx is a ZIP ("PK"), an old .xls starts with D0 CF 11 E0.
+    const isZip = buf.length > 3 && buf[0] === 0x50 && buf[1] === 0x4b;
+    const isOldXls = buf.length > 3 && buf.readUInt32BE(0) === 0xd0cf11e0;
+    rows = filename.endsWith(".xlsx") || filename.endsWith(".xlsm") || isZip || isOldXls ? parseExcelBuffer(buf, opts) : parseCsvBuffer(buf, opts);
   } catch (err) {
     throw ApiError.badRequest(err.message);
   }
 
-  const { rows: analyzed, summary } = await analyzeRows(req.user.id, rows);
+  const channel = ["whatsapp", "email"].includes(String(req.query.channel || "")) ? String(req.query.channel) : "both";
+  const { rows: analyzed, summary } = await analyzeRows(req.user.id, rows, channel, opts);
 
   return new ApiResponse(200, { rows: analyzed, summary }, "CSV parsed").send(
     res,
@@ -116,10 +129,11 @@ const previewImport = asyncHandler(async (req, res) => {
  * Response CSV preview jaisa hi hai (valid / invalid / duplicate per row).
  */
 const previewText = asyncHandler(async (req, res) => {
-  const rows = parseLeadText(req.body.text);
+  const opts = phoneOpts(req);
+  const rows = parseLeadText(req.body.text, opts);
   if (!rows.length) throw ApiError.badRequest("No leads found in the pasted text");
 
-  const { rows: analyzed, summary } = await analyzeRows(req.user.id, rows);
+  const { rows: analyzed, summary } = await analyzeRows(req.user.id, rows, "both", opts);
   return new ApiResponse(200, { rows: analyzed, summary }, "Text parsed").send(
     res,
   );
@@ -135,7 +149,7 @@ const confirmImport = asyncHandler(async (req, res) => {
   const { rows } = req.body;
   const ownerId = req.user.id;
 
-  const { inserted, skipped, existingIds = [], skippedByLimit = 0 } = await importLeadRows(ownerId, rows);
+  const { inserted, skipped, existingIds = [], skippedByLimit = 0 } = await importLeadRows(ownerId, rows, phoneOpts(req));
 
   await AuditLog.create({
     userId: req.user.id,
@@ -150,7 +164,7 @@ const confirmImport = asyncHandler(async (req, res) => {
   return new ApiResponse(
     201,
     { insertedCount: inserted.length, skipped, skippedByLimit, leadIds: inserted.map((lead) => lead._id), existingLeadIds: existingIds },
-    `Imported ${inserted.length} leads${skipped - skippedByLimit ? `, skipped ${skipped - skippedByLimit} duplicates` : ""}${skippedByLimit ? `. ${skippedByLimit} contacts plan limit ki wajah se nahi jude — plan upgrade karein` : ""}. No messages were sent.`,
+    `Imported ${inserted.length} leads${skipped - skippedByLimit ? `, skipped ${skipped - skippedByLimit} duplicates` : ""}${skippedByLimit ? `. ${skippedByLimit} contacts not added due to your plan limit — upgrade your plan` : ""}. No messages were sent.`,
   ).send(res);
 });
 
@@ -170,6 +184,10 @@ const startConversations = asyncHandler(async (req, res) => {
   if (!Array.isArray(leadIds) || !leadIds.length) {
     throw ApiError.badRequest("leadIds is required");
   }
+
+  // Messaging a batch of contacts is bulk WhatsApp (a paid-plan feature);
+  // starting one conversation is part of the core AI agent.
+  if (leadIds.length > 1) require("../services/saas/subscription").assertFeature("bulkWhatsapp");
 
   const ownerId = req.user.id;
 
@@ -243,19 +261,22 @@ const startConversations = asyncHandler(async (req, res) => {
 
 const createLead = asyncHandler(async (req, res) => {
   let phone = null;
-  try {
-    if (req.body.phone && String(req.body.phone).trim()) phone = toWhatsAppNumber(req.body.phone);
-  } catch (err) {
-    throw ApiError.badRequest(err.message || "Enter a valid phone number");
+  const rawPhone = String(req.body.phone || "").trim();
+  if (rawPhone) {
+    const result = normalizePhone(rawPhone, phoneOpts(req));
+    if (!result.ok) throw ApiError.badRequest(result.error || "Enter a valid mobile number");
+    phone = result.phone;
   }
   const email = String(req.body.email || "").trim().toLowerCase() || undefined;
-  if (!phone && !email) throw ApiError.badRequest("Phone or email is required");
+  if (email && !isValidEmail(email)) throw ApiError.badRequest("Invalid email format");
+  if (!phone && !email) throw ApiError.badRequest("A mobile number or email is required");
 
-  if (phone && await Lead.findOne({ ownerId: req.user.id, phone })) {
-    throw ApiError.conflict("A lead with this phone number already exists");
+  if (phone) {
+    const existing = await Lead.findOne({ ownerId: req.user.id, phone: { $in: phoneVariants(phone) } }).select("name").lean();
+    if (existing) throw ApiError.conflict(`This number is already saved${existing.name ? ` (${existing.name})` : ""}`);
   }
   if (email && await Lead.findOne({ ownerId: req.user.id, email })) {
-    throw ApiError.conflict("A lead with this email address already exists");
+    throw ApiError.conflict("This email is already saved");
   }
 
   require("../services/saas/subscription").assertWithinLimit("contacts", await Lead.countDocuments({ ownerId: req.user.id }), 1);
@@ -353,41 +374,52 @@ const listLeads = asyncHandler(async (req, res) => {
   }
 
   const ownerFilter = scopeToOwner(req);
-  const hasPhone = { phone: { $type: 'string', $ne: '' } };
-  const hasEmail = { email: { $type: 'string', $ne: '' } };
-  const noPhone = { $or: [{ phone: { $exists: false } }, { phone: null }, { phone: '' }] };
-  const noEmail = { $or: [{ email: { $exists: false } }, { email: null }, { email: '' }] };
-  const [leads, total, allLeads, whatsappAvailable, emailAvailable, bothAvailable, whatsappOnly, emailOnly, siteVisits] = await Promise.all([
-    Lead.find(filter)
-      .sort(sort)
-      .skip((page - 1) * limit)
-      .limit(limit)
-      .lean(),
-    Lead.countDocuments(filter),
-    Lead.countDocuments(ownerFilter),
-    Lead.countDocuments({ ...ownerFilter, ...hasPhone }),
-    Lead.countDocuments({ ...ownerFilter, ...hasEmail }),
-    Lead.countDocuments({ ...ownerFilter, ...hasPhone, ...hasEmail }),
-    Lead.countDocuments({ ...ownerFilter, ...hasPhone, ...noEmail }),
-    Lead.countDocuments({ ...ownerFilter, ...hasEmail, ...noPhone }),
-    Lead.countDocuments({ ...ownerFilter, status: 'site_visit' }),
-  ]);
+  const nonEmpty = (field) => ({ $gt: [{ $strLenCP: { $ifNull: [`$${field}`, ""] } }, 0] });
+  const count = (cond) => ({ $sum: { $cond: [cond, 1, 0] } });
+  const ownerMatch = { ...ownerFilter };
+  if (ownerMatch.ownerId) ownerMatch.ownerId = new mongoose.Types.ObjectId(String(ownerMatch.ownerId));
+  if (ownerMatch.assignedTo) ownerMatch.assignedTo = new mongoose.Types.ObjectId(String(ownerMatch.assignedTo));
 
-  const allOwnedLeadIds = await Lead.find(ownerFilter).distinct('_id');
-  const [whatsappReplies, emailReplies] = await Promise.all([
-    Message.distinct('leadId', { leadId: { $in: allOwnedLeadIds }, direction: 'inbound', sender: 'customer' }),
-    EmailMessage.distinct('leadId', { ...ownerFilter, leadId: { $ne: null }, direction: 'inbound', kind: 'received' }),
+  // One grouped query for every stat card instead of nine separate counts.
+  const [leads, total, [counts = {}], sources] = await Promise.all([
+    Lead.find(filter).sort(sort).skip((page - 1) * limit).limit(limit).lean(),
+    Lead.countDocuments(filter),
+    Lead.aggregate([
+      { $match: ownerMatch },
+      { $group: {
+        _id: null,
+        allLeads: { $sum: 1 },
+        whatsappAvailable: count(nonEmpty("phone")),
+        emailAvailable: count(nonEmpty("email")),
+        bothAvailable: count({ $and: [nonEmpty("phone"), nonEmpty("email")] }),
+        whatsappOnly: count({ $and: [nonEmpty("phone"), { $not: [nonEmpty("email")] }] }),
+        emailOnly: count({ $and: [nonEmpty("email"), { $not: [nonEmpty("phone")] }] }),
+        siteVisits: count({ $eq: ["$status", "site_visit"] }),
+      } },
+    ]),
+    Lead.distinct("source", ownerFilter),
   ]);
+  const { allLeads = 0, whatsappAvailable = 0, emailAvailable = 0, bothAvailable = 0, whatsappOnly = 0, emailOnly = 0, siteVisits = 0 } = counts;
 
   // conversationStarted lets the frontend show a "Start" button for any lead
   // that's been imported/created but whose opening WhatsApp message hasn't
   // gone out yet (see POST /leads/start-conversations).
   const pageLeadIds = leads.map((lead) => lead._id);
-  const [conversations, outboundJobs, emailEvents, whatsappMessages, visits] = await Promise.all([
+  const messageTime = { $ifNull: ["$timestamp", "$createdAt"] };
+  const [conversations, outboundJobs, emailEvents, lastOutbound, inboundStats, visits] = await Promise.all([
     Conversation.find({ ownerId: req.user.id, leadId: { $in: pageLeadIds } }, "leadId lastMessageAt").lean(),
-    OutboundJob.find({ ownerId: req.user.id, leadId: { $in: pageLeadIds } }).sort({ updatedAt: -1 }).lean(),
-    EmailMessage.find({ ownerId: req.user.id, leadId: { $in: pageLeadIds } }).sort({ createdAt: -1 }).lean(),
-    Message.find({ leadId: { $in: pageLeadIds } }).sort({ timestamp: -1 }).lean(),
+    OutboundJob.find({ ownerId: req.user.id, leadId: { $in: pageLeadIds } }).select("leadId channel status attempts campaignId sentAt").sort({ updatedAt: -1 }).lean(),
+    EmailMessage.find({ ownerId: req.user.id, leadId: { $in: pageLeadIds } }).select("leadId direction kind status sentAt subject receivedAt createdAt").sort({ createdAt: -1 }).lean(),
+    // Per-lead summaries computed in the database; the old code pulled every message into memory.
+    Message.aggregate([
+      { $match: { leadId: { $in: pageLeadIds }, direction: "outbound" } },
+      { $sort: { timestamp: -1 } },
+      { $group: { _id: "$leadId", sentAt: { $first: messageTime }, status: { $first: "$status" } } },
+    ]),
+    Message.aggregate([
+      { $match: { leadId: { $in: pageLeadIds }, direction: "inbound", sender: "customer" } },
+      { $group: { _id: "$leadId", replyCount: { $sum: 1 }, replyAt: { $max: messageTime } } },
+    ]),
     Meeting.aggregate([
       { $match: { ownerId: req.user._id || req.user.id, leadId: { $in: pageLeadIds } } },
       { $sort: { preferredDate: -1, preferredTime: -1, updatedAt: -1 } },
@@ -395,9 +427,7 @@ const listLeads = asyncHandler(async (req, res) => {
     ]),
   ]);
   const lastMessageByLead = new Map(conversations.map((c) => [String(c.leadId), c.lastMessageAt]));
-  const outboundMessageLeadIds = new Set(
-    whatsappMessages.filter((message) => message.direction === 'outbound').map((message) => String(message.leadId)),
-  );
+  const outboundMessageLeadIds = new Set(lastOutbound.map((row) => String(row._id)));
   const channelStatus = new Map();
   for (const job of outboundJobs) {
     // A pre-created/no-attempt queue row is not a real send result. Legacy
@@ -425,17 +455,11 @@ const listLeads = asyncHandler(async (req, res) => {
     }
   }
   const whatsappState = new Map();
-  for (const message of whatsappMessages) {
-    const key = String(message.leadId);
-    if (!whatsappState.has(key)) whatsappState.set(key, { sentAt: null, sentStatus: "not_sent", replyAt: null, replyCount: 0 });
-    const state = whatsappState.get(key);
-    if (message.direction === "inbound" && message.sender === "customer") {
-      state.replyCount += 1;
-      if (!state.replyAt) state.replyAt = message.timestamp || message.createdAt;
-    } else if (message.direction === "outbound" && !state.sentAt) {
-      state.sentAt = message.timestamp || message.createdAt;
-      state.sentStatus = message.status || "sent";
-    }
+  for (const row of lastOutbound) whatsappState.set(String(row._id), { sentAt: row.sentAt || null, sentStatus: row.status || "sent", replyAt: null, replyCount: 0 });
+  for (const row of inboundStats) {
+    const key = String(row._id);
+    const state = whatsappState.get(key) || { sentAt: null, sentStatus: "not_sent" };
+    whatsappState.set(key, { ...state, replyAt: row.replyAt || null, replyCount: row.replyCount || 0 });
   }
   const visitState = new Map(visits.map((row) => [String(row._id), row]));
   const leadsWithStatus = leads.map((lead) => {
@@ -471,8 +495,8 @@ const listLeads = asyncHandler(async (req, res) => {
 
   return new ApiResponse(200, {
     leads: leadsWithStatus,
-    sources: (await Lead.distinct('source', scopeToOwner(req))).filter(Boolean).sort(),
-    summary: { total: allLeads, whatsappAvailable, emailAvailable, bothAvailable, whatsappOnly, emailOnly, siteVisits, whatsappReplies: whatsappReplies.length, emailReplies: emailReplies.length, repliedContacts: new Set([...whatsappReplies, ...emailReplies].map(String)).size, qualified: qualifiedCounts },
+    sources: (sources || []).filter(Boolean).sort(),
+    summary: { total: allLeads, whatsappAvailable, emailAvailable, bothAvailable, whatsappOnly, emailOnly, siteVisits, qualified: qualifiedCounts },
     pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
   }).send(res);
 });
@@ -520,26 +544,28 @@ const updateLead = asyncHandler(async (req, res) => {
   if (!currentLead) throw ApiError.notFound("Lead not found");
   if (Object.prototype.hasOwnProperty.call(updates, "phone")) {
     if (updates.phone && String(updates.phone).trim()) {
-      try { updates.phone = toWhatsAppNumber(updates.phone); }
-      catch (err) { throw ApiError.badRequest(err.message || "Enter a valid phone number"); }
+      const result = normalizePhone(updates.phone, phoneOpts(req));
+      if (!result.ok) throw ApiError.badRequest(result.error || "Enter a valid mobile number");
+      updates.phone = result.phone;
     } else updates.phone = null;
     if (updates.phone) {
-      const dupe = await Lead.findOne({ ownerId: req.user.id, phone: updates.phone, _id: { $ne: req.params.id } });
-      if (dupe) throw ApiError.conflict("Another lead already uses this phone number");
+      const dupe = await Lead.findOne({ ownerId: req.user.id, phone: { $in: phoneVariants(updates.phone) }, _id: { $ne: req.params.id } });
+      if (dupe) throw ApiError.conflict("Another contact already has this number");
     }
   }
   if (Object.prototype.hasOwnProperty.call(updates, "email")) {
     updates.email = String(updates.email || "").trim().toLowerCase() || null;
+    if (updates.email && !isValidEmail(updates.email)) throw ApiError.badRequest("Invalid email format");
     if (updates.email) {
       const duplicateEmail = await Lead.findOne({ ownerId: req.user.id, email: updates.email, _id: { $ne: req.params.id } });
-      if (duplicateEmail) throw ApiError.conflict("Another lead already uses this email address");
+      if (duplicateEmail) throw ApiError.conflict("Another contact already has this email");
     }
   }
 
   const finalPhone = Object.prototype.hasOwnProperty.call(updates, "phone") ? updates.phone : currentLead.phone;
   const finalEmail = Object.prototype.hasOwnProperty.call(updates, "email") ? updates.email : currentLead.email;
   if (!String(finalPhone || '').trim() && !String(finalEmail || '').trim()) {
-    throw ApiError.badRequest("Lead ke paas kam se kam phone ya email rehna chahiye");
+    throw ApiError.badRequest("A lead needs at least a phone or email");
   }
   if (Object.prototype.hasOwnProperty.call(updates, "name") && !String(updates.name || '').trim()) {
     updates.name = (finalEmail ? String(finalEmail).split('@')[0].replace(/[._+-]+/g, ' ').trim() : `Lead ${String(finalPhone || '').replace(/\D/g, '').slice(-4)}`) || 'New lead';
@@ -577,6 +603,12 @@ const deleteLead = asyncHandler(async (req, res) => {
   if (!lead) throw ApiError.notFound("Lead not found");
 
   await Conversation.deleteOne({ leadId: lead._id });
+  // Unsent campaign messages for this contact are cancelled; the campaign
+  // history keeps the contact's name (saved on each job).
+  await OutboundJob.updateMany(
+    { ownerId: lead.ownerId, leadId: lead._id, status: { $in: ["pending", "paused"] } },
+    { $set: { status: "cancelled", lastError: "Contact was deleted" } },
+  );
 
   return new ApiResponse(200, null, "Lead deleted").send(res);
 });
@@ -588,8 +620,13 @@ const bulkDeleteLeads = asyncHandler(async (req, res) => {
   const { ids } = req.body;
   const filter = { _id: { $in: ids }, ...scopeToOwner(req) };
 
-  const result = await Lead.deleteMany(filter);
-  await Conversation.deleteMany({ leadId: { $in: ids } });
+  const owned = await Lead.find(filter).distinct("_id");
+  const result = await Lead.deleteMany({ _id: { $in: owned } });
+  await Conversation.deleteMany({ leadId: { $in: owned } });
+  await OutboundJob.updateMany(
+    { leadId: { $in: owned }, status: { $in: ["pending", "paused"] } },
+    { $set: { status: "cancelled", lastError: "Contact was deleted" } },
+  );
 
   return new ApiResponse(
     200,

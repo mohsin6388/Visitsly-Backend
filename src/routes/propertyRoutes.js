@@ -28,7 +28,14 @@ const {
   importConfirmSchema,
 } = require("../validators/propertyValidators");
 
+const { requireFeature } = require("../services/saas/subscription");
+
 router.use(authenticate);
+
+// Inventory Management (Builder Pro+): bulk import / export / bulk delete.
+// Adding and editing single properties stays on every plan — the AI agent
+// needs them to answer buyers.
+const inventoryFeature = requireFeature("inventory");
 
 router.post(
   "/brochure",
@@ -53,19 +60,22 @@ router.post(
 router.post(
   "/import/preview",
   // roleGuard('builder', 'admin'),
+  inventoryFeature,
   uploadCsv.single("file"),
   previewImport,
 );
 router.post(
   "/import/confirm",
   // roleGuard('builder', 'admin'),
+  inventoryFeature,
   validate(importConfirmSchema),
   confirmImport,
 );
-router.get("/export", roleGuard("builder", "admin"), exportProperties);
+router.get("/export", roleGuard("builder", "admin"), inventoryFeature, exportProperties);
 router.post(
   "/bulk-delete",
   // roleGuard('builder', 'admin'),
+  inventoryFeature,
   validate(bulkDeleteSchema),
   bulkDeleteProperties,
 );

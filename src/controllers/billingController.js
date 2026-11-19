@@ -6,24 +6,32 @@ const AuditLog = require('../models/AuditLog');
 const billing = require('../services/saas/billingService');
 const orgService = require('../services/saas/orgService');
 const { orgSummary } = require('../services/saas/orgSummary');
-const { publicPlans, ADDONS, GST_RATE, TRIAL_DAYS, PLANS } = require('../config/plans');
+const { publicPlans, TRIAL_DAYS, PLANS, RECOMMENDED_PLAN, FEATURE_LABEL } = require('../config/plans');
 const logger = require('../utils/logger');
 
 /** GET /api/public/plans — pricing page (no login). */
 const listPlans = asyncHandler(async (req, res) => {
   const env = require('../config/env');
   const pricing = require('../config/pricing');
-  // ?country=AE (signup) or ?currency=AED → prices in that currency.
-  const currency = String(req.query.currency || pricing.currencyForCountry(req.query.country) || 'INR').toUpperCase();
-  const cur = pricing.supported(currency) ? currency : 'INR';
+  // ?country=AE (signup / pricing page) or ?currency=AED → prices in that currency.
+  // IN → INR, AE → AED, every other country → USD.
+  const country = String(req.query.country || '').trim().toUpperCase().slice(0, 8);
+  const requested = String(req.query.currency || '').trim().toUpperCase();
+  let cur = pricing.supported(requested) ? requested : null;
+  if (!cur) cur = country ? pricing.currencyForCountry(country) : 'INR';
   return new ApiResponse(200, {
     currency: cur,
+    country: country || null,
+    supportedCurrencies: pricing.SUPPORTED_CURRENCIES,
     countries: pricing.COUNTRIES,
     taxRate: pricing.taxRate(cur),
+    annualMonthsCharged: pricing.ANNUAL_MONTHS_CHARGED,
     plans: pricing.plansIn(cur, publicPlans()),
     trial: { limits: PLANS.trial.limits, features: PLANS.trial.features, highlights: PLANS.trial.highlights },
     addons: pricing.addonsIn(cur),
-    gstRate: cur === 'INR' ? GST_RATE : 0,
+    gstRate: cur === 'INR' ? pricing.GST_RATE : 0,
+    recommendedPlan: RECOMMENDED_PLAN,
+    featureLabels: FEATURE_LABEL,
     trialDays: TRIAL_DAYS,
     sales: { phone: env.saas.salesPhone, email: env.saas.salesEmail },
   }).send(res);
@@ -54,7 +62,10 @@ const getBilling = asyncHandler(async (req, res) => {
     plans: pricing.plansIn(currency, publicPlans()),
     addons: pricing.addonsIn(currency),
     activeAddons,
-    gstRate: currency === 'INR' ? GST_RATE : 0,
+    gstRate: currency === 'INR' ? pricing.GST_RATE : 0,
+    annualMonthsCharged: pricing.ANNUAL_MONTHS_CHARGED,
+    recommendedPlan: RECOMMENDED_PLAN[req.org.businessType] || null,
+    featureLabels: FEATURE_LABEL,
     invoices,
   }).send(res);
 });
@@ -76,6 +87,13 @@ const verify = asyncHandler(async (req, res) => {
   await billing.verifyCheckout(req.org._id, req.body);
   await AuditLog.create({ userId: req.user.actorId, action: 'billing.paid', meta: { paymentId: req.body.razorpay_payment_id }, ip: req.ip });
   return new ApiResponse(200, { org: await orgSummary(await orgService.getSnapshot(req.org._id, { fresh: true })) }, 'Payment successful — plan active').send(res);
+});
+
+/** POST /api/billing/verify-order — Razorpay Checkout success for a one-time plan payment. */
+const verifyOrder = asyncHandler(async (req, res) => {
+  const invoice = await billing.verifyPlanOrder(req.org._id, req.body);
+  await AuditLog.create({ userId: req.user.actorId, action: 'billing.paid', meta: { paymentId: req.body.razorpay_payment_id, plan: invoice?.plan, mode: 'order' }, ip: req.ip });
+  return new ApiResponse(200, { invoice, org: await orgSummary(await orgService.getSnapshot(req.org._id, { fresh: true })) }, 'Payment successful — plan active').send(res);
 });
 
 /** POST /api/billing/cancel — cancels at the end of the current period. */
@@ -111,7 +129,7 @@ const addonCheckout = asyncHandler(async (req, res) => {
 const addonVerify = asyncHandler(async (req, res) => {
   const invoice = await billing.verifyAddonPayment(req.org._id, req.body);
   await AuditLog.create({ userId: req.user.actorId, action: 'billing.addon_paid', meta: { paymentId: req.body.razorpay_payment_id, addon: invoice?.addon?.key }, ip: req.ip });
-  return new ApiResponse(200, { invoice, org: await orgSummary(await orgService.getSnapshot(req.org._id, { fresh: true })) }, 'Payment successful — add-on chalu ho gaya').send(res);
+  return new ApiResponse(200, { invoice, org: await orgSummary(await orgService.getSnapshot(req.org._id, { fresh: true })) }, 'Payment successful — add-on activated').send(res);
 });
 
-module.exports = { branding, listPlans, getBilling, getQuote, checkout, verify, cancel, razorpayWebhook, addonCheckout, addonVerify };
+module.exports = { branding, listPlans, getBilling, getQuote, checkout, verify, verifyOrder, cancel, razorpayWebhook, addonCheckout, addonVerify };

@@ -19,6 +19,7 @@ const schema = new Schema({
     qualityRating: { type: String, default: null },
   }],
   selectedPhoneNumberId: { type: String, default: null },
+  isCoexistence: { type: Boolean, default: false },
   status: { type: String, enum: ['pending', 'completing'], default: 'pending', index: true },
   expiresAt: { type: Date, required: true },
 }, { timestamps: true });

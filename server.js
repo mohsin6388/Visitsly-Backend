@@ -15,6 +15,9 @@ const {
 } = require("./src/services/queue/bulkWorker");
 
 (async () => {
+  // Prices come from PRICE_* env vars; log any invalid value (falls back to defaults).
+  require("./src/config/pricing").logPricingWarnings();
+
   await connectDB();
 
   const server = http.createServer(app);

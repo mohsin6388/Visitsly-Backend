@@ -31,17 +31,17 @@ function errorHandler(err, req, res, next) {
   // Upload errors (multer)
   if (err.name === 'MulterError') {
     statusCode = 400;
-    message = err.code === 'LIMIT_FILE_SIZE' ? 'File bahut badi hai. Chhoti file chunein.' : 'File upload nahi hui. Dobara try karein.';
+    message = err.code === 'LIMIT_FILE_SIZE' ? 'File is too large. Choose a smaller file.' : 'File upload failed. Please try again.';
   }
 
   // Malformed JSON body
   if (err.type === 'entity.parse.failed') {
     statusCode = 400;
-    message = 'Request ka data sahi format mein nahi hai.';
+    message = 'The request data is not in the right format.';
   }
   if (err.type === 'entity.too.large') {
     statusCode = 413;
-    message = 'Data bahut bada hai. Chhote hisson mein bhejein.';
+    message = 'Data is too large. Send it in smaller parts.';
   }
 
   // Mongo duplicate key
@@ -59,7 +59,7 @@ function errorHandler(err, req, res, next) {
 
   // Never leak internal error text to users in production.
   if (statusCode >= 500 && !(err instanceof ApiError) && env.nodeEnv === 'production') {
-    message = 'Server par kuch gadbad ho gayi. Thodi der baad dobara try karein.';
+    message = 'Something went wrong on the server. Please try again shortly.';
   }
 
   res.status(statusCode).json({

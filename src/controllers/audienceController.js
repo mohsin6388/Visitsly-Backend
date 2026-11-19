@@ -54,8 +54,8 @@ const createAudience = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const { name, description, tags, source, leadIds } = req.body;
   const ids = await ownedLeadIds(ownerId, [...new Set(leadIds)]);
-  if (!ids.length) throw ApiError.badRequest('Selected contacts nahi mile. List refresh karke dobara chunein.');
-  if (await Audience.exists({ ownerId, name })) throw ApiError.conflict('Is naam ka audience pehle se hai. Doosra naam rakhein.');
+  if (!ids.length) throw ApiError.badRequest('Selected contacts not found. Refresh and choose again.');
+  if (await Audience.exists({ ownerId, name })) throw ApiError.conflict('An audience with this name exists. Use another name.');
   const audience = await Audience.create({ ownerId, name, description, tags, source, leadIds: ids });
   const [result] = await withCounts(ownerId, [audience.toObject()]);
   return new ApiResponse(201, { audience: result }, `Audience saved with ${ids.length} contacts`).send(res);
@@ -108,7 +108,7 @@ const updateAudience = asyncHandler(async (req, res) => {
   if (!audience) throw ApiError.notFound('Audience not found');
   const { name, description, tags, addLeadIds = [], removeLeadIds = [] } = req.body;
   if (name && name !== audience.name) {
-    if (await Audience.exists({ ownerId, name, _id: { $ne: audience._id } })) throw ApiError.conflict('Is naam ka audience pehle se hai.');
+    if (await Audience.exists({ ownerId, name, _id: { $ne: audience._id } })) throw ApiError.conflict('An audience with this name already exists.');
     audience.name = name;
   }
   if (description !== undefined) audience.description = description;

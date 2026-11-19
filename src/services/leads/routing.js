@@ -28,7 +28,7 @@ async function assignLead(lead, user, { notify = true } = {}) {
       userId: lead.ownerId,
       type: 'lead_assigned',
       title: `${lead.name} → ${user.name}`,
-      body: `Nayi lead ${user.name} ko assign hui${lead.source ? ` (${lead.source})` : ''}.`,
+      body: `New lead assigned to ${user.name}${lead.source ? ` (${lead.source})` : ''}.`,
       link: `/whatsapp/conversations?lead=${lead._id}`,
     }).catch(() => {});
   }
@@ -37,6 +37,8 @@ async function assignLead(lead, user, { notify = true } = {}) {
 /** Assigns using the company's routing rule. Returns the user or null. */
 async function autoAssign(orgSnap, lead) {
   if (!orgSnap || orgSnap.routing?.mode !== 'round_robin' || lead.assignedTo) return null;
+  // Team Lead Assignment is a Growth+ feature (enforced server-side).
+  if (!require('../saas/subscription').hasFeature(orgSnap, 'teamRouting')) return null;
   const users = await eligibleUsers(orgSnap);
   if (!users.length) return null;
   await Organization.updateOne({ _id: orgSnap._id }, { $inc: { 'routing.lastIndex': 1 } });

@@ -52,7 +52,7 @@ const create = asyncHandler(async (req, res) => {
     notes: b.notes || '',
     createdBy: req.user.actorId,
   });
-  return new ApiResponse(201, { quote: view(req, quote) }, `Cost sheet ${quote.number} ban gaya`).send(res);
+  return new ApiResponse(201, { quote: view(req, quote) }, `Cost sheet ${quote.number} created`).send(res);
 });
 
 /** POST /api/quotes/preview — live totals while typing (nothing saved). */
@@ -92,10 +92,10 @@ const sendWhatsapp = asyncHandler(async (req, res) => {
   const quote = await Quote.findOne({ _id: req.params.id, ownerId: req.user.id });
   if (!quote) throw ApiError.notFound('Quote not found');
   const phone = quote.customer?.phone;
-  if (!phone) throw ApiError.badRequest('Customer ka phone number nahi hai');
+  if (!phone) throw ApiError.badRequest('Customer has no phone number');
   const conversation = quote.leadId ? await Conversation.findOne({ leadId: quote.leadId }) : null;
   if (conversation && !metaWhatsappClient.isWithin24HourWindow(conversation.lastInboundAt)) {
-    throw ApiError.badRequest('Customer ne pichhle 24 ghante mein reply nahi kiya — WhatsApp rule ke hisaab se pehle template bhejein, ya PDF link copy karke share karein.');
+    throw ApiError.badRequest('No reply from the customer in 24 hours — send a template first, or copy and share the PDF link.');
   }
   const caption = `${quote.project} — cost sheet ${quote.number}. All-inclusive Rs. ${Number(quote.totals.grandTotal).toLocaleString('en-IN')}`;
   const sent = await tenantContext.runWithNumber(conversation?.phoneNumberId, () =>
@@ -105,7 +105,7 @@ const sendWhatsapp = asyncHandler(async (req, res) => {
   if (conversation) {
     await recordOutboundMessage({ conversationId: conversation._id, leadId: quote.leadId, text: `📄 ${caption}`, sender: 'broker', whatsappMessageId: sent.messageId }).catch(() => {});
   }
-  return new ApiResponse(200, { quote: view(req, quote) }, 'Cost sheet WhatsApp par bhej di').send(res);
+  return new ApiResponse(200, { quote: view(req, quote) }, 'Cost sheet sent on WhatsApp').send(res);
 });
 
 module.exports = { list, create, preview, remove, publicPdf, sendWhatsapp };

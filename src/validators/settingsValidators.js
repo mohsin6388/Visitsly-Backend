@@ -58,6 +58,7 @@ const updateSettingsSchema = z.object({
         callStartHour: z.number().int().min(0).max(23).optional(),
         callEndHour: z.number().int().min(1).max(24).optional(),
         callRetries: z.number().int().min(0).max(2).optional(),
+        reminderCall: z.boolean().optional(),
       })
       .optional(),
     followUp: z

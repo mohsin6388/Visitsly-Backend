@@ -63,9 +63,20 @@ const organizationSchema = new Schema(
       // subscription isn't overwritten by an abandoned upgrade attempt).
       pendingSubscriptionId: { type: String, default: null, index: true },
       setupFeePaid: { type: Boolean, default: false },
+      // 'subscription' = auto-renewing; 'order' = paid per period (renew on the Billing page).
+      mode: { type: String, enum: ["subscription", "order", null], default: null },
     },
     // Platform admin can give a customer custom limits (null = unlimited).
     limitOverrides: { type: Schema.Types.Mixed, default: {} },
+    // Platform admin (or the grandfathering migration) can switch individual
+    // plan features on/off for one company: { emailCampaigns: true, … }.
+    featureOverrides: { type: Schema.Types.Mixed, default: {} },
+    // Lifetime counters (not reset monthly) — the free trial's limits are a
+    // total for the whole trial, even when the trial crosses a month end.
+    usageTotals: {
+      aiConversations: { type: Number, default: 0 },
+      campaigns: { type: Number, default: 0 },
+    },
     // Platform admin can mark special deals (e.g. founding client discount).
     notes: { type: String, default: "" },
     priceOverride: { type: Number, default: null }, // custom monthly price (INR) for this org
@@ -87,6 +98,8 @@ const organizationSchema = new Schema(
       displayPhoneNumber: { type: String, default: null },
       verifiedName: { type: String, default: null },
       qualityRating: { type: String, default: null },
+      // Set when Meta rejects a send with 131042 (no payment method); cleared by a later successful send.
+      paymentIssueAt: { type: Date, default: null },
       accessTokenEncrypted: { type: String, default: null, select: false },
       // Opening template chosen by THIS organization (approved in its own WABA).
       openingTemplateName: { type: String, default: null },
@@ -118,6 +131,23 @@ const organizationSchema = new Schema(
       // Last verified delivery activity observed by PropAI's Meta webhook.
       webhookLastReceivedAt: { type: Date, default: null },
       webhookLastMessageAt: { type: Date, default: null },
+      // ---- Coexistence (number also runs in the WhatsApp Business phone app) ----
+      isCoexistence: { type: Boolean, default: false },
+      coexistence: {
+        onboardedAt: { type: Date, default: null }, // start of Meta's 24h sync window
+        contactsSyncRequestId: { type: String, default: null },
+        historySyncRequestId: { type: String, default: null },
+        // pending | requested | done | failed | declined
+        contactsSyncStatus: { type: String, default: null },
+        historySyncStatus: { type: String, default: null },
+        historySyncProgress: { type: Number, default: 0 }, // 0-100 from history webhooks
+        syncError: { type: String, default: null },
+        lastEchoAt: { type: Date, default: null },
+        disconnectedFromPhoneAt: { type: Date, default: null },
+      },
+      // Last "send test message" from the dashboard.
+      testMessageSentAt: { type: Date, default: null },
+      testMessageTo: { type: String, default: null },
     },
 
     // ---- Usage (reset each calendar month, Asia/Kolkata) ----
@@ -134,6 +164,22 @@ const organizationSchema = new Schema(
     bulkMessagesTotal: { type: Number, default: 0 },
 
     onboarding: {
+      // Onboarding wizard (name → company → country → city → business type).
+      // false = new workspace that must finish the wizard; true = done.
+      // No default on purpose: companies created before the wizard existed
+      // have no value and are treated as done (and the startup migration
+      // writes true for them).
+      profileDone: { type: Boolean },
+      profileCompletedAt: { type: Date, default: null },
+      // Wizard answers saved per step so the owner can close the tab and resume.
+      profileDraft: {
+        ownerName: { type: String, default: "" },
+        companyName: { type: String, default: "" },
+        country: { type: String, default: "" },
+        city: { type: String, default: "" },
+        businessType: { type: String, default: "" },
+        step: { type: Number, default: 0 },
+      },
       companyDone: { type: Boolean, default: false },
       whatsappDone: { type: Boolean, default: false },
       contactsDone: { type: Boolean, default: false },
@@ -177,15 +223,15 @@ const organizationSchema = new Schema(
       agentsSeeOnlyAssigned: { type: Boolean, default: false },
     },
 
-    // ---- AI voice calling (Bolna) ----
+    // ---- AI voice calling (platform-managed: Plivo + ElevenLabs) ----
     voice: {
       enabled: { type: Boolean, default: false },
-      provider: { type: String, enum: ["bolna"], default: "bolna" },
-      apiKeyEncrypted: { type: String, default: null, select: false },
-      agentId: { type: String, default: null },
-      fromNumber: { type: String, default: null },
+      provider: { type: String, default: "plivo" },
       autoCallNewLeads: { type: Boolean, default: false }, // call when a new lead doesn't reply on WhatsApp
       autoCallAfterMinutes: { type: Number, default: 30 },
+      // Optional calling script for lead calls (what to say / ask, in order).
+      // Empty = default script: talk like the WhatsApp AI assistant.
+      script: { type: String, default: "", maxlength: 4000 },
     },
 
     // ---- Extra WhatsApp numbers (Builder 2, Enterprise many) ----
@@ -236,7 +282,10 @@ const organizationSchema = new Schema(
       lastReportAt: { type: Date, default: null },
     },
 
-    // ---- Billing region (set at signup from the chosen country) ----
+    // ---- Billing region ----
+    // Provisional at signup (detected country), fixed when the onboarding
+    // wizard is completed. After that only a platform admin can change it,
+    // because the currency decides what Razorpay charges.
     country: { type: String, default: "IN" },
     currency: { type: String, default: "INR" },
 

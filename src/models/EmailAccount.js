@@ -17,6 +17,8 @@ const emailAccountSchema = new Schema(
     secure: { type: Boolean, default: false }, // true = SSL (465), false = STARTTLS (587)
     username: { type: String, required: true, trim: true },
     passwordEncrypted: { type: String, required: true, select: false },
+    // Max campaign emails per day (IST) for this account. 0 = use the provider's safe default (see emailAccountService.PRESETS).
+    dailyLimit: { type: Number, default: 0, min: 0, max: 100000 },
     status: { type: String, enum: ["connected", "error"], default: "connected" },
     lastError: { type: String, default: null },
     verifiedAt: { type: Date, default: null },

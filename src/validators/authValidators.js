@@ -45,14 +45,21 @@ const strongPassword = z
 
 const signupSchema = z.object({
   body: z.object({
-    companyName: z.string().trim().min(2, 'Company name is required').max(120),
-    name: z.string().trim().min(2, 'Your name is required').max(100),
+    // Only mobile, email and password are asked at signup. Company, name,
+    // city, country and business type are collected by the onboarding wizard;
+    // the fields stay optional here so older clients keep working.
     email: z.string().email('Invalid email address'),
-    phone: z.string().trim().min(10, 'Enter a valid mobile number').max(20),
+    // Full international format ("+971501234567"). A number without "+" is
+    // read using `country` (the detected country) as its default region.
+    phone: z.string().trim().min(6, 'Enter a valid mobile number').max(24),
     password: strongPassword,
+    companyName: z.string().trim().max(120).optional().or(z.literal('')),
+    name: z.string().trim().max(100).optional().or(z.literal('')),
     city: z.string().trim().max(80).optional(),
     businessType: z.enum(['broker', 'agency', 'builder', 'other']).optional(),
     plan: z.string().max(30).optional(),
+    // Detected country (IP / browser). Used as the default region for the
+    // phone number and the provisional company country.
     country: z.string().trim().toUpperCase().max(8).optional(),
   }),
 });

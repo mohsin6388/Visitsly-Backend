@@ -15,6 +15,9 @@ const {
 } = require("./src/services/queue/bulkWorker");
 
 (async () => {
+  // Prices come from PRICE_* env vars; log any invalid value (falls back to defaults).
+  require("./src/config/pricing").logPricingWarnings();
+
   await connectDB();
 
   const server = http.createServer(app);
@@ -22,6 +25,8 @@ const {
   server.keepAliveTimeout = 65 * 1000;
   server.headersTimeout = 66 * 1000;
   initSocket(server);
+  // Live AI phone calls: Plivo streams call audio to /api/voice/stream/… on this server.
+  require("./src/services/voice/realtime/streamServer").attach(server);
 
   require("./src/scripts/startupMigrations")
     .runStartupMigrations()

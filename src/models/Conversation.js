@@ -23,6 +23,9 @@ const conversationSchema = new Schema(
     // via `templateSent` below, which is what actually matters for the 24h
     // customer-service-window rule.
     templateSent: { type: Boolean, default: false },
+    // Created from WhatsApp Business app history sync (coexistence). Kept paused
+    // (no auto follow-ups / AI) until the customer writes again.
+    coexistenceImported: { type: Boolean, default: false },
     templateSentAt: { type: Date, default: null },
 
     status: {
@@ -45,6 +48,9 @@ const conversationSchema = new Schema(
     aiReplyCount: { type: Number, default: 0 },
     // Set when the per-contact cap was hit (used to notify the owner only once).
     aiLimitReachedAt: { type: Date, default: null },
+    // Why the AI did not answer the last customer message (null when it did).
+    aiSkipReason: { type: String, default: null },
+    aiSkipAt: { type: Date, default: null },
     // Which of the company's WhatsApp numbers this buyer talks to (multi-number plans).
     phoneNumberId: { type: String, default: null },
     assignedTo: {
@@ -120,6 +126,31 @@ const conversationSchema = new Schema(
     // Customer said "not interested / abhi nahi" → gentle re-follow-up later.
     declinedAt: { type: Date, default: null },
     declineCount: { type: Number, default: 0 },
+
+    // ---- Reply guard (see services/ai/replyGuard.js) ----
+    // Junk messages in a row (emoji-only, gibberish, abuse, repeats). From 3
+    // the AI stays quiet; a real message resets it to 0 and the AI replies again.
+    junkStreak: { type: Number, default: 0 },
+    // The other side looked like a bot / was flooding → AI paused (status
+    // 'manual') so two bots never reply to each other in a loop.
+    botGuardPausedAt: { type: Date, default: null },
+    botGuardReason: { type: String, default: null },
+
+    // ---- Property the chat is currently about (photos / brochure "haan") ----
+    currentPropertyId: { type: Schema.Types.ObjectId, ref: "Property", default: null },
+    // Media the AI offered for currentProperty ('both' | 'images' | 'brochure');
+    // a plain "haan / ok / bhejo" next sends exactly that.
+    mediaOffer: {
+      propertyId: { type: Schema.Types.ObjectId, ref: "Property", default: null },
+      kind: { type: String, default: null },
+      at: { type: Date, default: null },
+    },
+
+    // ---- AI call → WhatsApp context ----
+    // Short summary of the last AI phone call, shown to the WhatsApp AI so it
+    // does not ask the same questions again.
+    lastCallSummary: { type: String, default: "" },
+    lastCallAt: { type: Date, default: null },
   },
   { timestamps: true },
 );

@@ -10,7 +10,7 @@ const invoiceSchema = new Schema(
     amount: { type: Number, required: true }, // in `currency`, incl. tax, as charged
     currency: { type: String, default: 'INR' },
     status: { type: String, enum: ['pending', 'paid', 'failed', 'refunded'], default: 'paid' },
-    kind: { type: String, enum: ['subscription', 'addon', 'offline'], default: 'subscription' },
+    kind: { type: String, enum: ['subscription', 'plan', 'addon', 'offline'], default: 'subscription' },
     addon: { key: { type: String, default: null }, quantity: { type: Number, default: null } },
     razorpayOrderId: { type: String, default: null, index: true, sparse: true },
     description: { type: String, default: '' },

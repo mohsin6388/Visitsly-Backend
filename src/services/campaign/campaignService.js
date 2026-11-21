@@ -15,7 +15,15 @@ const { emitToUser } = require("../../sockets");
 async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
   const selectedChannels = config.channels || {};
   if (!selectedChannels.whatsapp && !selectedChannels.email) {
-    throw ApiError.badRequest("Kam se kam ek channel chuno.");
+    throw ApiError.badRequest("Choose at least one channel.");
+  }
+
+  // Plan features (server-side): WhatsApp campaigns need `bulkWhatsapp`,
+  // email campaigns need `emailCampaigns` (not on the free trial).
+  {
+    const { assertFeature } = require("../saas/subscription");
+    if (selectedChannels.whatsapp) assertFeature("bulkWhatsapp");
+    if (selectedChannels.email) assertFeature("emailCampaigns");
   }
 
   let selectedEmailTemplate = null;
@@ -26,7 +34,7 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
     });
     if (!selectedEmailTemplate)
       throw ApiError.badRequest(
-        "Selected email template nahi mila. Template list refresh karein.",
+        "Selected email template not found. Refresh the template list.",
       );
     // Use saved server-side content rather than trusting a modified client payload.
     config.emailSubject = selectedEmailTemplate.subject;
@@ -50,14 +58,14 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
   let invalid = 0;
   if (Array.isArray(leadIds) && leadIds.length) {
     if (new Set(leadIds.map(String)).size !== leadIds.length) {
-      throw ApiError.badRequest("Selected list mein duplicate lead IDs hain.");
+      throw ApiError.badRequest("The selection has duplicate lead IDs.");
     }
     leads = await Lead.find({ ownerId, _id: { $in: leadIds } }).sort({
       createdAt: 1,
     });
     if (!leads.length)
       throw ApiError.badRequest(
-        "Selected leads nahi mili. List refresh karke dobara choose karein.",
+        "Selected leads not found. Refresh and choose again.",
       );
     skipped = leadIds.length - leads.length;
   } else {
@@ -68,7 +76,7 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
     );
     if (!eligible)
       throw ApiError.badRequest(
-        "Selected channel ke liye koi phone/email contact nahi mila.",
+        "No phone/email contacts for the selected channel.",
       );
     const result = await importLeadRows(ownerId, rows || []);
     leads = result.inserted;
@@ -76,7 +84,7 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
     invalid = result.invalid;
     if (!leads.length) {
       throw ApiError.badRequest(
-        "Koi nayi lead insert nahi hui — saari rows duplicate ya invalid thi.",
+        "No new leads added — all rows were duplicates or invalid.",
       );
     }
   }
@@ -89,7 +97,7 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
   );
   if (selectedChannels.whatsapp && !config.whatsappTemplateName) {
     throw ApiError.badRequest(
-      "Bulk WhatsApp ke liye Meta ka approved template select karein.",
+      "Select an approved template for bulk WhatsApp.",
     );
   }
   if (
@@ -98,7 +106,7 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
     !selectedChannels.email
   ) {
     throw ApiError.badRequest(
-      "Selected leads mein valid WhatsApp numbers nahi hain.",
+      "Selected leads have no valid WhatsApp numbers.",
     );
   }
   if (
@@ -107,7 +115,7 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
     !selectedChannels.whatsapp
   ) {
     throw ApiError.badRequest(
-      "Selected leads mein valid email addresses nahi hain.",
+      "Selected leads have no valid email addresses.",
     );
   }
   if (selectedChannels.email && !config.emailSubject?.trim()) {
@@ -118,30 +126,37 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
   }
   if (selectedChannels.email) {
     const emailAccount = await require("../email/emailAccountService").getAccount(ownerId);
-    if (!emailAccount || emailAccount.status !== "connected") {
+    const brevoFallback = process.env.BREVO_CAMPAIGN_FALLBACK === "true" && require("../email/mailer").isBrevoConfigured();
+    if ((!emailAccount || emailAccount.status !== "connected") && !(brevoFallback && !emailAccount)) {
       throw ApiError.badRequest(
-        "Email campaign ke liye pehle Email → Setup me apna official email connect karein.",
+        "Connect your email in Email → Setup before sending email campaigns.",
       );
     }
   }
 
   // Only queue contacts that match the selected channel; contact rows themselves remain in CRM.
-  const eligibleLeads = leads.filter(
+  const matchingLeads = leads.filter(
     (lead) =>
       (selectedChannels.whatsapp && Boolean(lead.phone)) ||
       (selectedChannels.email && Boolean(lead.email)),
   );
-  if (!eligibleLeads.length) {
+  if (!matchingLeads.length) {
     throw ApiError.badRequest(
-      "Selected channel ke liye matching contact fields nahi hain.",
+      "No matching contact fields for the selected channel.",
     );
   }
+  // Never message more contacts than "per day × days" allows. With fewer
+  // contacts the campaign simply ends earlier (no empty days are created).
+  const durationDays = Number(config.durationDays) > 0 ? Math.floor(Number(config.durationDays)) : null;
+  const capacity = durationDays ? Math.max(1, Number(config.dailyLimit) || 1) * durationDays : Infinity;
+  const eligibleLeads = matchingLeads.slice(0, capacity);
+  const notScheduled = matchingLeads.length - eligibleLeads.length;
 
   // SaaS plan limit: total bulk messages (trial total / paid per month).
   if (tenantOrg) {
     const planned =
-      (selectedChannels.whatsapp ? whatsappLeads.length : 0) +
-      (selectedChannels.email ? emailLeads.length : 0);
+      (selectedChannels.whatsapp ? eligibleLeads.filter((l) => Boolean(l.phone)).length : 0) +
+      (selectedChannels.email ? eligibleLeads.filter((l) => Boolean(l.email)).length : 0);
     require("../saas/subscription").assertBulkMessagesAllowed(planned);
   }
 
@@ -169,6 +184,8 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
     phoneNumberId: config.phoneNumberId || null,
     channels: selectedChannels,
     dailyLimit: config.dailyLimit,
+    durationDays,
+    notScheduled,
     sendTime: config.sendTime,
     startDate,
     whatsappTemplate: selectedChannels.whatsapp
@@ -205,6 +222,7 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
       hasPhone: Boolean(lead.phone),
       hasEmail: Boolean(lead.email),
       email: lead.email || "",
+      phone: lead.phone || "",
       name: lead.name || "",
     })),
   });
@@ -258,6 +276,7 @@ async function launchCampaign({ ownerId, userId, ip, rows, leadIds, config }) {
       .length,
     emailAvailable: eligibleLeads.filter((lead) => Boolean(lead.email)).length,
     totalDays: plan.totalDays,
+    notScheduled,
     firstRunAt: plan.firstRunAt,
     lastRunAt: plan.lastRunAt,
   };

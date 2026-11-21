@@ -6,7 +6,7 @@ const validate = require('../middlewares/validate');
 const c = require('../controllers/cpController');
 
 const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false });
-const password = z.string().min(8, 'Password kam se kam 8 characters').regex(/[0-9]/, 'Password mein ek number chahiye');
+const password = z.string().min(8, 'Password must be at least 8 characters').regex(/[0-9]/, 'Password needs a number');
 
 const registerSchema = z.object({
   body: z.object({

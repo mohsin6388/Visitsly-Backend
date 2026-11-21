@@ -16,7 +16,7 @@ const uploadChatFile = multer({
   limits: { fileSize: 100 * 1024 * 1024, files: 1 },
   fileFilter: (req, file, cb) => {
     const blocked = /\.(exe|bat|cmd|sh|js|msi|apk|dll|scr)$/i.test(file.originalname || '');
-    if (blocked) return cb(ApiError.badRequest('Ye file type WhatsApp par nahi bhej sakte'));
+    if (blocked) return cb(ApiError.badRequest('This file type can’t be sent on WhatsApp'));
     cb(null, true);
   },
 });

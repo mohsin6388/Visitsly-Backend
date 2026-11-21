@@ -21,7 +21,7 @@ const validate = (schema) => (req, res, next) => {
     const first = result.error.issues[0];
     const field = String(first?.path?.slice(-1)[0] || '').replace(/([A-Z])/g, ' $1').toLowerCase();
     const generic = /^(required|invalid input|expected .* received .*)$/i.test(first?.message || '');
-    const message = !first ? 'Validation failed' : generic ? `${field || 'Field'} sahi se bharein` : first.message;
+    const message = !first ? 'Validation failed' : generic ? `Please check ${field || 'this field'}` : first.message;
     return next(ApiError.badRequest(message, details));
   }
 

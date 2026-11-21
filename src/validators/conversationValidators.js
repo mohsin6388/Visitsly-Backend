@@ -39,7 +39,7 @@ const mediaParamSchema = z.object({
 
 const sendManualReplySchema = z.object({
   params: z.object({ id: objectId }),
-  body: z.object({ text: z.string().trim().min(1, 'Message likhein').max(4096, 'Message bahut lamba hai (4096 characters tak)') }),
+  body: z.object({ text: z.string().trim().min(1, 'Type a message').max(4096, 'Message is too long (max 4096 characters)') }),
 });
 
 const propertyMediaSchema = z.object({

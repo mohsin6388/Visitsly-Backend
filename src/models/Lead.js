@@ -37,7 +37,34 @@ const leadSchema = new Schema(
     // Customer asked us to stop messaging (STOP / unsubscribe). Campaigns,
     // follow-ups and AI must skip this lead until they message us again.
     optedOut: { type: Boolean, default: false, index: true },
+    // Clicked "unsubscribe" in a bulk email. Only stops EMAIL campaigns (WhatsApp is unaffected).
+    emailOptedOut: { type: Boolean, default: false },
+    emailOptedOutAt: { type: Date, default: null },
     warmAlertSentAt: { type: Date, default: null },
+
+    // ---- AI calling queue (AI calling → Leads) ----
+    aiCall: {
+      // queued → calling → done (answered) / missed / failed; cancelled = removed from the queue
+      status: { type: String, enum: ['queued', 'calling', 'done', 'missed', 'failed', 'cancelled', null], default: null, index: true },
+      queuedAt: { type: Date, default: null },
+      lastCallAt: { type: Date, default: null },
+      lastCallId: { type: Schema.Types.ObjectId, ref: 'CallLog', default: null },
+      calls: { type: Number, default: 0 },
+      outcome: { type: String, default: null },
+      rating: { type: String, enum: ['hot', 'warm', 'cold', 'not_interested', null], default: null }, // AI's read of the customer after the call
+      error: { type: String, default: null },
+      // Planned call-back / retry: a queued lead is only called once this time has passed.
+      nextCallAt: { type: Date, default: null },
+      // Why this call is queued: 'callback' (customer asked to call later) | 'retry' (not reached).
+      reason: { type: String, default: null },
+      // Unanswered-call retries already made for the current attempt (max 1).
+      retries: { type: Number, default: 0 },
+    },
+    // India DND (TRAI) check result, cached for 7 days (see voice/callPolicy.js).
+    dnd: {
+      status: { type: Boolean, default: null },
+      checkedAt: { type: Date, default: null },
+    },
 
     duplicateOf: { type: Schema.Types.ObjectId, ref: 'Lead', default: null },
     assignedTo: { type: Schema.Types.ObjectId, ref: 'User', default: null },

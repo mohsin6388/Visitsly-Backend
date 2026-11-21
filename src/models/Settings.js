@@ -113,24 +113,30 @@ const settingsSchema = new Schema(
     // Site visit se pehle WhatsApp par "kya aap aa rahe hain?" confirmation.
     // Lead ne 24 ghante me message nahi kiya ho to approved template chahiye.
     visitConfirm: {
-      enabled: { type: Boolean, default: false },
+      // WhatsApp confirmation is always on (it is the fallback for AI calls and the
+      // only channel when AI calling is switched off), so this stays true.
+      enabled: { type: Boolean, default: true },
       hoursBefore: { type: Number, min: 1, max: 72, default: 24 },
       templateName: { type: String, default: '', trim: true },
       templateLanguage: { type: String, default: '', trim: true },
       templateVariableCount: { type: Number, min: 0, max: 4, default: 0 },
-      // WhatsApp par jawab na aaye to AI call se confirm karo
-      callEnabled: { type: Boolean, default: false },
+      // MAIN TOGGLE — automatic AI confirmation call (Plivo + ElevenLabs, platform-managed).
+      // ON (default): call right after the visit is booked, WhatsApp if not answered.
+      // OFF: no calls at all, visits are confirmed on WhatsApp only.
+      callEnabled: { type: Boolean, default: true },
       callAfterHours: { type: Number, min: 1, max: 24, default: 3 },
       // call_first = visit book hote hi AI call; call na uthe to WhatsApp par confirm
       // whatsapp_first = pehle WhatsApp; jawab na aaye to AI call
       mode: { type: String, enum: ['call_first', 'whatsapp_first'], default: 'call_first' },
-      // Minutes to wait after a visit is booked before the confirmation call.
-      callDelayMinutes: { type: Number, min: 0, max: 1440, default: 30 },
+      // Minutes to wait after a visit is booked before the confirmation call (1 = turant).
+      callDelayMinutes: { type: Number, min: 0, max: 1440, default: 1 },
       // Polite calling hours (India time).
       callStartHour: { type: Number, min: 0, max: 23, default: 10 },
       callEndHour: { type: Number, min: 1, max: 24, default: 19 },
       // How many times to retry an unanswered call before falling back to WhatsApp.
       callRetries: { type: Number, min: 0, max: 2, default: 0 },
+      // On the visit day, call confirmed customers as a reminder.
+      reminderCall: { type: Boolean, default: true },
     },
 
     // Follow-up automation: client khud chunta hai kab kab lead ko follow-up jaye.
@@ -164,6 +170,29 @@ const settingsSchema = new Schema(
     openingTemplate: {
       name: { type: String, default: null, trim: true },
       language: { type: String, default: null, trim: true },
+    },
+
+    // AI calling extras (per company).
+    calling: {
+      // India DND (TRAI) check before every AI call. apiUrl contains {phone}
+      // (10-digit number); the key is sent in apiKeyHeader (default Authorization).
+      dnd: {
+        enabled: { type: Boolean, default: false },
+        apiUrl: { type: String, default: '', trim: true },
+        apiKey: { type: String, default: '', trim: true },
+        apiKeyHeader: { type: String, default: 'Authorization', trim: true },
+      },
+    },
+
+    // The company's own WhatsApp AI assistant (AI & business settings).
+    // name '' = "Monica" (default). gender decides Hindi verbs ("kar rahi / kar raha").
+    // instructions = the company's own prompt (tone, default language, USPs,
+    // offers). It is added on top of the locked core prompt; the core rules win.
+    assistant: {
+      name: { type: String, default: '', trim: true, maxlength: 40 },
+      gender: { type: String, enum: ['female', 'male'], default: 'female' },
+      defaultLanguage: { type: String, default: '', trim: true, maxlength: 30 },
+      instructions: { type: String, default: '', maxlength: 1500 },
     },
   },
   { timestamps: true }

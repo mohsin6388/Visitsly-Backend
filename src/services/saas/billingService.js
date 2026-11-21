@@ -8,8 +8,10 @@ const OutboundJob = require('../../models/OutboundJob');
 const ApiError = require('../../utils/ApiError');
 const logger = require('../../utils/logger');
 const orgService = require('./orgService');
-const { getPlan, GST_RATE, ADDONS } = require('../../config/plans');
+const { getPlan, ADDONS } = require('../../config/plans');
 const pricing = require('../../config/pricing');
+
+const { GST_RATE } = pricing;
 
 /**
  * Razorpay Subscriptions billing for PropAI.
@@ -38,18 +40,19 @@ function rzpFail(err, fallback) {
   return ApiError.badRequest(e?.description || err.message || fallback, { code: 'RAZORPAY_ERROR' });
 }
 
-const withGst = (inr) => Math.round(inr * (1 + GST_RATE));
-
 /** The currency this company is billed in (from its signup country). */
 function currencyOf(org) {
-  const cur = String(org?.currency || pricing.currencyForCountry(org?.country) || 'INR').toUpperCase();
-  return pricing.supported(cur) ? cur : 'INR';
+  const cur = String(org?.currency || '').toUpperCase();
+  if (pricing.supported(cur)) return cur;
+  // Older companies may still carry a retired currency (SAR, GBP, EUR …):
+  // bill them in their country's currency (IN → INR, AE → AED, else USD).
+  return pricing.currencyForCountry(org?.country || 'IN');
 }
 
 /** Monthly / annual price (before tax) for this org, honouring a custom INR price. */
 function priceFor(org, planCode, cycle, currency = currencyOf(org)) {
   if (currency === 'INR' && org?.priceOverride && planCode === org.plan) {
-    return cycle === 'annual' ? org.priceOverride * 10 : org.priceOverride;
+    return cycle === 'annual' ? org.priceOverride * pricing.ANNUAL_MONTHS_CHARGED : org.priceOverride;
   }
   const p = pricing.planPrice(planCode, currency);
   return cycle === 'annual' ? p.annual : p.monthly;
@@ -59,10 +62,8 @@ function quote(org, planCode, cycle, currencyOverride) {
   const plan = getPlan(planCode);
   const currency = currencyOverride || currencyOf(org);
   const base = priceFor(org, planCode, cycle, currency);
-  const setupFee = org?.razorpay?.setupFeePaid ? 0 : pricing.planPrice(plan.code, currency).setupFee || 0;
   const taxRate = pricing.taxRate(currency);
   const priceWithTax = pricing.withTax(base, currency);
-  const setupWithTax = pricing.withTax(setupFee, currency);
   return {
     plan: plan.code,
     planName: plan.name,
@@ -70,14 +71,15 @@ function quote(org, planCode, cycle, currencyOverride) {
     currency,
     price: base,
     priceWithTax,
-    setupFee,
-    setupFeeWithTax: setupWithTax,
+    // No setup fee any more; the fields stay (always 0) for older clients.
+    setupFee: 0,
+    setupFeeWithTax: 0,
     taxRate,
     taxLabel: currency === 'INR' ? 'GST' : taxRate ? 'Tax' : null,
-    firstPayment: Math.round((priceWithTax + setupWithTax) * 100) / 100,
+    firstPayment: priceWithTax,
     // Back-compat field names used by older clients.
     priceWithGst: priceWithTax,
-    setupFeeWithGst: setupWithTax,
+    setupFeeWithGst: 0,
     gstRate: currency === 'INR' ? GST_RATE : 0,
   };
 }
@@ -124,43 +126,52 @@ async function ensurePlanId(planCode, cycle, amount, currency = 'INR') {
 
 async function createCheckout(orgId, { plan: planCode, cycle = 'monthly' }, user) {
   const plan = getPlan(planCode);
-  if (!plan.public || plan.code === 'trial') throw ApiError.badRequest('Ye plan online nahi kharida ja sakta');
-  if (plan.contactSales) throw ApiError.badRequest('Enterprise ke liye sales team se baat karein');
+  if (!plan.public || plan.code === 'trial') throw ApiError.badRequest('This plan can’t be bought online');
+  if (plan.contactSales) throw ApiError.badRequest('Contact sales for Enterprise');
   if (!configured()) {
-    throw ApiError.badRequest('Online payment abhi set nahi hai. Team se UPI/bank transfer se payment karke activate karwayein.', { code: 'BILLING_NOT_CONFIGURED' });
+    throw ApiError.badRequest('Online payment is not set up yet. Pay via UPI/bank transfer and our team will activate it.', { code: 'BILLING_NOT_CONFIGURED' });
   }
 
   const org = await Organization.findById(orgId).lean();
+  const prefill = { name: user?.name || '', email: org.billingEmail || user?.email || '', contact: org.phone || '' };
+  if (paymentMode() === 'order') return createPlanOrder(orgId, org, plan, cycle, prefill);
+
   let q = quote(org, plan.code, cycle);
   let planId;
   let currencyNote = null;
-  try {
-    planId = await ensurePlanId(plan.code, cycle, q.price, q.currency);
-  } catch (err) {
-    if (err.code !== 'CURRENCY_NOT_ENABLED') throw err;
-    // International payments not enabled on the Razorpay account yet → bill in INR.
-    logger.warn(`[billing] ${q.currency} not enabled on Razorpay — falling back to INR for org ${orgId}`);
-    currencyNote = `${q.currency} payment abhi available nahi hai, isliye payment INR mein hoga.`;
-    q = quote(org, plan.code, cycle, 'INR');
-    planId = await ensurePlanId(plan.code, cycle, q.price, 'INR');
-  }
-
-  const body = {
-    plan_id: planId,
-    total_count: cycle === 'annual' ? 10 : 120,
-    quantity: 1,
-    customer_notify: 1,
-    notes: { orgId: String(orgId), plan: plan.code, cycle, currency: q.currency },
-  };
-  if (q.setupFee) {
-    body.addons = [{ item: { name: 'One-time setup & onboarding', amount: pricing.toMinor(q.setupFeeWithTax, q.currency), currency: q.currency } }];
-  }
-
   let sub;
   try {
+    try {
+      planId = await ensurePlanId(plan.code, cycle, q.price, q.currency);
+    } catch (err) {
+      if (err.code !== 'CURRENCY_NOT_ENABLED') throw err;
+      // International payments not enabled on the Razorpay account yet → bill in INR.
+      logger.warn(
+        `[billing] FALLBACK TO INR: ${q.currency} checkout for org ${orgId} (${plan.code}/${cycle}) is being charged in INR because ` +
+          'International Payments / this currency is not enabled on the Razorpay account. Enable it in Razorpay Dashboard → Account & Settings → International payments.',
+      );
+      currencyNote = `${q.currency} payments are not available yet, so you will be charged in INR.`;
+      q = quote(org, plan.code, cycle, 'INR');
+      planId = await ensurePlanId(plan.code, cycle, q.price, 'INR');
+    }
+    const body = {
+      plan_id: planId,
+      total_count: cycle === 'annual' ? 10 : 120,
+      quantity: 1,
+      customer_notify: 1,
+      notes: { orgId: String(orgId), plan: plan.code, cycle, currency: q.currency },
+    };
     ({ data: sub } = await rzp.post('/subscriptions', body, { auth: auth() }));
   } catch (err) {
-    throw rzpFail(err, 'Razorpay subscription create failed');
+    // Auth problems must surface; anything else (Subscriptions not enabled on
+    // the account, plan API errors …) falls back to a one-time payment for
+    // the period, so the customer can still pay and upgrade.
+    if (err.response?.status === 401) throw rzpFail(err, 'Razorpay keys are invalid');
+    logger.warn('[billing] Subscription checkout failed — using a one-time payment for this period instead', {
+      orgId: String(orgId),
+      error: err.response?.data?.error?.description || err.message,
+    });
+    return createPlanOrder(orgId, org, plan, cycle, prefill);
   }
 
   await Organization.updateOne(
@@ -170,13 +181,102 @@ async function createCheckout(orgId, { plan: planCode, cycle = 'monthly' }, user
   orgService.invalidate(orgId);
 
   return {
+    mode: 'subscription',
     keyId: env.razorpay.keyId,
     subscriptionId: sub.id,
     quote: q,
     currencyNote,
-    prefill: { name: user?.name || '', email: org.billingEmail || user?.email || '', contact: org.phone || '' },
+    prefill,
     productName: env.saas.productName,
   };
+}
+
+/**
+ * RAZORPAY_PAYMENT_MODE=subscription (default): auto-renewing Razorpay
+ * subscription, falling back to a one-time payment if subscriptions fail.
+ * RAZORPAY_PAYMENT_MODE=order: always a one-time payment per period (the
+ * customer renews from the Billing page).
+ */
+function paymentMode() {
+  return String(process.env.RAZORPAY_PAYMENT_MODE || 'subscription').trim().toLowerCase() === 'order' ? 'order' : 'subscription';
+}
+
+/** One-time Razorpay order for one plan period (monthly / annual). */
+async function createPlanOrder(orgId, org, plan, cycle, prefill) {
+  let q = quote(org, plan.code, cycle);
+  let currencyNote = null;
+  const create = (qq) => rzp.post('/orders', {
+    amount: pricing.toMinor(qq.priceWithTax, qq.currency),
+    currency: qq.currency,
+    receipt: `plan_${String(orgId).slice(-8)}_${Date.now()}`,
+    notes: { orgId: String(orgId), plan: plan.code, cycle, kind: 'plan' },
+  }, { auth: auth() });
+  let order;
+  try {
+    ({ data: order } = await create(q));
+  } catch (err) {
+    const desc = String(err.response?.data?.error?.description || '');
+    if (q.currency === 'INR' || !/currency/i.test(desc)) throw rzpFail(err, 'Razorpay order create failed');
+    logger.warn(`[billing] FALLBACK TO INR: ${q.currency} plan payment for org ${orgId} is being charged in INR because International Payments / this currency is not enabled on the Razorpay account.`);
+    currencyNote = `${q.currency} payments are not available yet, so you will be charged in INR.`;
+    q = quote(org, plan.code, cycle, 'INR');
+    ({ data: order } = await create(q).catch((e) => { throw rzpFail(e, 'Razorpay order create failed'); }));
+  }
+  await Invoice.create({
+    orgId,
+    kind: 'plan',
+    status: 'pending',
+    plan: plan.code,
+    billingCycle: cycle,
+    amount: q.priceWithTax,
+    currency: q.currency,
+    description: `${q.planName} (${cycle === 'annual' ? 'yearly' : 'monthly'})`,
+    razorpayOrderId: order.id,
+    paidAt: null,
+  });
+  await Organization.updateOne({ _id: orgId }, { $set: { pendingPlan: plan.code, pendingCycle: cycle } });
+  orgService.invalidate(orgId);
+  return {
+    mode: 'order',
+    keyId: env.razorpay.keyId,
+    orderId: order.id,
+    amount: order.amount,
+    currency: order.currency,
+    quote: q,
+    currencyNote,
+    prefill,
+    productName: env.saas.productName,
+  };
+}
+
+/** Activates a paid plan order (idempotent: webhook + browser may both report it). */
+async function applyPlanOrder(orgId, invoice, paymentId) {
+  const claimed = await Invoice.findOneAndUpdate(
+    { _id: invoice._id, status: 'pending' },
+    { $set: { status: 'paid', razorpayPaymentId: paymentId, paidAt: new Date() } },
+    { new: true },
+  );
+  if (!claimed) return false;
+  const org = await Organization.findById(orgId).lean();
+  const cycle = invoice.billingCycle === 'annual' ? 'annual' : 'monthly';
+  // Renewing the same plan early extends from the current period end.
+  const from = org?.status === 'active' && org.plan === invoice.plan && org.currentPeriodEnd && new Date(org.currentPeriodEnd) > new Date()
+    ? new Date(org.currentPeriodEnd)
+    : new Date();
+  const periodEnd = periodEndFrom(cycle, from);
+  await activate(orgId, { plan: invoice.plan, cycle, periodEnd });
+  await Organization.updateOne({ _id: orgId }, { $set: { 'razorpay.mode': 'order' } });
+  await Invoice.updateOne({ _id: invoice._id }, { $set: { periodStart: from, periodEnd } });
+  orgService.invalidate(orgId);
+  return true;
+}
+
+async function verifyPlanOrder(orgId, { razorpay_order_id: orderId, razorpay_payment_id: paymentId, razorpay_signature: signature }) {
+  if (!verifyOrderSignature(orderId, paymentId, signature)) throw ApiError.badRequest('Payment could not be verified. If money was deducted, the plan activates within 5–10 minutes; otherwise contact support.');
+  const invoice = await Invoice.findOne({ orgId, razorpayOrderId: orderId, kind: 'plan' });
+  if (!invoice) throw ApiError.badRequest('This payment does not match this account’s checkout');
+  await applyPlanOrder(orgId, invoice, paymentId);
+  return Invoice.findById(invoice._id).lean();
 }
 
 /* ------------------------------------------------------------------ */
@@ -192,7 +292,7 @@ const ADDON_RULES = {
 
 function addonQuote(org, key, quantity) {
   const rule = ADDON_RULES[key];
-  if (!rule || !ADDONS[key]) throw ApiError.badRequest('Ye add-on available nahi hai');
+  if (!rule || !ADDONS[key]) throw ApiError.badRequest('This add-on is not available');
   const qty = Math.min(Math.max(Math.round(Number(quantity) || rule.min), rule.min), rule.max);
   const currency = currencyOf(org);
   const unit = pricing.addonPrice(key, currency);
@@ -201,7 +301,7 @@ function addonQuote(org, key, quantity) {
 }
 
 async function createAddonOrder(orgId, { addon, quantity }, user) {
-  if (!configured()) throw ApiError.badRequest('Online payment abhi set nahi hai. Team se add-on activate karwayein.', { code: 'BILLING_NOT_CONFIGURED' });
+  if (!configured()) throw ApiError.badRequest('Online payment is not set up yet. Ask our team to activate the add-on.', { code: 'BILLING_NOT_CONFIGURED' });
   const org = await Organization.findById(orgId).lean();
   let q = addonQuote(org, addon, quantity);
   let order;
@@ -216,6 +316,10 @@ async function createAddonOrder(orgId, { addon, quantity }, user) {
   } catch (err) {
     const desc = String(err.response?.data?.error?.description || '');
     if (q.currency !== 'INR' && /currency/i.test(desc)) {
+      logger.warn(
+        `[billing] FALLBACK TO INR: ${q.currency} add-on order (${addon}) for org ${orgId} is being charged in INR because ` +
+          'International Payments / this currency is not enabled on the Razorpay account.',
+      );
       q = addonQuote({ ...org, currency: 'INR' }, addon, quantity);
       ({ data: order } = await create(q).catch((e) => { throw rzpFail(e, 'Order create failed'); }));
     } else throw rzpFail(err, 'Order create failed');
@@ -266,7 +370,7 @@ async function grantAddon(orgId, invoice, paymentId) {
   if (key === 'leadRevival') {
     try {
       const PlatformRequest = require('../../models/PlatformRequest');
-      await PlatformRequest.create({ orgId, type: 'addon', addon: key, quantity: qty, message: 'Paid in-app — lead revival campaign set up karein', status: 'open' });
+      await PlatformRequest.create({ orgId, type: 'addon', addon: key, quantity: qty, message: 'Paid in-app — set up the lead revival campaign', status: 'open' });
     } catch (err) {
       logger.warn('[billing] could not create lead revival request', { error: err.message });
     }
@@ -276,9 +380,9 @@ async function grantAddon(orgId, invoice, paymentId) {
 }
 
 async function verifyAddonPayment(orgId, { razorpay_order_id: orderId, razorpay_payment_id: paymentId, razorpay_signature: signature }) {
-  if (!verifyOrderSignature(orderId, paymentId, signature)) throw ApiError.badRequest('Payment verify nahi hua. Agar paisa kat gaya hai to 5-10 minute mein apne aap update ho jayega, warna support se baat karein.');
+  if (!verifyOrderSignature(orderId, paymentId, signature)) throw ApiError.badRequest('Payment could not be verified. If money was deducted, it updates within 5–10 minutes; otherwise contact support.');
   const invoice = await Invoice.findOne({ orgId, razorpayOrderId: orderId });
-  if (!invoice) throw ApiError.badRequest('Ye payment is account ke order se match nahi karta');
+  if (!invoice) throw ApiError.badRequest('This payment does not match this account’s order');
   await grantAddon(orgId, invoice, paymentId);
   return Invoice.findById(invoice._id).lean();
 }
@@ -311,6 +415,7 @@ async function activate(orgId, { plan, cycle, subscriptionId, periodEnd, setupFe
   org.cancelAtPeriodEnd = false;
   org.suspendedReason = null;
   if (subscriptionId) {
+    org.razorpay.mode = 'subscription';
     org.razorpay.subscriptionId = subscriptionId;
     if (org.razorpay.pendingSubscriptionId === subscriptionId) org.razorpay.pendingSubscriptionId = null;
   }
@@ -343,24 +448,23 @@ async function recordInvoice(orgId, data) {
 }
 
 async function verifyCheckout(orgId, { razorpay_payment_id: paymentId, razorpay_subscription_id: subscriptionId, razorpay_signature: signature }) {
-  if (!verifySignature(paymentId, subscriptionId, signature)) throw ApiError.badRequest('Payment signature verify nahi hua');
+  if (!verifySignature(paymentId, subscriptionId, signature)) throw ApiError.badRequest('Payment signature could not be verified');
   const org = await Organization.findById(orgId).lean();
   if (!org || org.razorpay?.pendingSubscriptionId !== subscriptionId) {
-    throw ApiError.badRequest('Ye payment is account ke checkout se match nahi karta');
+    throw ApiError.badRequest('This payment does not match this account’s checkout');
   }
   const q = quote(org, org.pendingPlan, org.pendingCycle || 'monthly');
   const updated = await activate(orgId, {
     plan: org.pendingPlan,
     cycle: org.pendingCycle,
     subscriptionId,
-    setupFeePaid: q.setupFee > 0 || org.razorpay?.setupFeePaid,
   });
   await recordInvoice(orgId, {
     plan: updated.plan,
     billingCycle: updated.billingCycle,
     amount: q.firstPayment,
     currency: q.currency,
-    description: `${q.planName} (${q.cycle})${q.setupFee ? ' + setup' : ''}`,
+    description: `${q.planName} (${q.cycle})`,
     razorpayPaymentId: paymentId,
     razorpaySubscriptionId: subscriptionId,
     periodStart: new Date(),
@@ -412,7 +516,10 @@ async function handleWebhook(event) {
   if (!sub && orderId) {
     const invoice = await Invoice.findOne({ razorpayOrderId: orderId });
     if (invoice) {
-      if (['payment.captured', 'order.paid'].includes(type)) await grantAddon(invoice.orgId, invoice, payment?.id || null);
+      if (['payment.captured', 'order.paid'].includes(type)) {
+        if (invoice.kind === 'plan') await applyPlanOrder(invoice.orgId, invoice, payment?.id || null);
+        else await grantAddon(invoice.orgId, invoice, payment?.id || null);
+      }
       else if (type === 'payment.failed' && invoice.status === 'pending') {
         await Invoice.updateOne({ _id: invoice._id }, { $set: { status: 'failed', description: `${invoice.description} — ${payment?.error_description || 'failed'}` } });
       }
@@ -513,10 +620,12 @@ module.exports = {
   quote,
   createCheckout,
   verifyCheckout,
+  verifyPlanOrder,
+  paymentMode,
   cancel,
   verifyWebhookSignature,
   handleWebhook,
   recordOfflinePayment,
   activate,
-  withGst,
+  withGst: (inr) => pricing.withTax(inr, 'INR'),
 };

@@ -171,14 +171,18 @@ async function incrementUsage(orgId, field, amount = 1) {
   // Bulk sends also feed a lifetime counter (used for the trial's total limit).
   if (field === "messagesSent" || field === "emailsSent")
     inc.bulkMessagesTotal = amount;
+  // Lifetime totals (the free trial's AI conversation / campaign limits).
+  if (field === "aiConversations" || field === "campaigns")
+    inc[`usageTotals.${field}`] = amount;
   await Organization.updateOne({ _id: orgId }, { $inc: inc });
   const updated = await Organization.findById(orgId)
-    .select("usage bulkMessagesTotal")
+    .select("usage bulkMessagesTotal usageTotals")
     .lean();
   const cached = byId.get(String(orgId));
   if (cached && updated) {
     cached.snap.usage = updated.usage;
     cached.snap.bulkMessagesTotal = updated.bulkMessagesTotal || 0;
+    cached.snap.usageTotals = updated.usageTotals || {};
   }
   return updated?.usage || null;
 }

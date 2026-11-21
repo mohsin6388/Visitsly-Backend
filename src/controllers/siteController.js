@@ -43,10 +43,10 @@ const listSites = asyncHandler(async (req, res) => {
 const uploadSiteBrochure = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const siteName = String(req.body.siteName || '').trim();
-  if (!siteName) throw ApiError.badRequest('Site / project ka naam likhein.');
+  if (!siteName) throw ApiError.badRequest('Enter a site / project name.');
   const brochureFile = req.files?.brochure?.[0];
   const imageFiles = req.files?.images || [];
-  if (!brochureFile && !imageFiles.length) throw ApiError.badRequest('Brochure PDF ya photos chunein.');
+  if (!brochureFile && !imageFiles.length) throw ApiError.badRequest('Choose a brochure PDF or photos.');
 
   let brochure = null;
   if (brochureFile) {
@@ -59,7 +59,7 @@ const uploadSiteBrochure = asyncHandler(async (req, res) => {
     images.push(result.secure_url);
   }
   const site = await upsertSite({ ownerId, name: siteName, city: String(req.body.city || '').trim(), location: String(req.body.location || '').trim(), brochure, images });
-  return new ApiResponse(201, { site }, `${site.name} ke liye ${brochure ? 'brochure' : 'photos'} save ho gaye`).send(res);
+  return new ApiResponse(201, { site }, `${brochure ? 'Brochure' : 'Photos'} saved for ${site.name}`).send(res);
 });
 
 /** PATCH /api/sites/:id — rename / city / location / description / maps link. */
@@ -70,7 +70,7 @@ const updateSite = asyncHandler(async (req, res) => {
   const { name, city, location, description, mapsLink } = req.body;
   if (name && keyFor(name) !== site.nameKey) {
     const nameKey = keyFor(name);
-    if (await PropertySite.exists({ ownerId, nameKey, _id: { $ne: site._id } })) throw ApiError.conflict('Is naam ki site pehle se hai.');
+    if (await PropertySite.exists({ ownerId, nameKey, _id: { $ne: site._id } })) throw ApiError.conflict('A site with this name already exists.');
     // Keep the sheet rows linked to the renamed site.
     await Property.updateMany({ ownerId, projectName: new RegExp(`^\\s*${site.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i') }, { $set: { projectName: name.trim() } });
     site.name = name.trim();
@@ -93,7 +93,7 @@ const removeBrochure = asyncHandler(async (req, res) => {
     { new: true },
   );
   if (!site) throw ApiError.notFound('Site not found');
-  return new ApiResponse(200, { site }, 'Brochure hata diya').send(res);
+  return new ApiResponse(200, { site }, 'Brochure removed').send(res);
 });
 
 /** DELETE /api/sites/:id/images — body { url } */
@@ -101,7 +101,7 @@ const removeImage = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const site = await PropertySite.findOneAndUpdate({ _id: req.params.id, ownerId }, { $pull: { images: req.body.url } }, { new: true });
   if (!site) throw ApiError.notFound('Site not found');
-  return new ApiResponse(200, { site }, 'Photo hata di').send(res);
+  return new ApiResponse(200, { site }, 'Photo removed').send(res);
 });
 
 module.exports = { listSites, uploadSiteBrochure, updateSite, removeBrochure, removeImage };

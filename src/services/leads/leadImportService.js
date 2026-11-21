@@ -1,6 +1,6 @@
 const Lead = require("../../models/Lead");
 const Conversation = require("../../models/Conversation");
-const { toWhatsAppNumber } = require("../whatsapp/metaWhatsappClient");
+const { normalizePhone, isValidEmail, extractEmail, phoneVariants } = require("../../utils/phone");
 
 function fallbackName(row, phone) {
   const name = String(row.name || "").trim();
@@ -10,7 +10,6 @@ function fallbackName(row, phone) {
   return "New lead";
 }
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
  * Normalizes mixed-channel contact rows and checks duplicates in the database
@@ -18,7 +17,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
  * email address on the same row (and vice versa). The partial phone index is
  * the final race-condition guard for simultaneous phone duplicates.
  */
-async function importLeadRows(ownerId, rows) {
+async function importLeadRows(ownerId, rows, opts = {}) {
   const normalized = [];
   let invalid = 0;
   let skipped = 0;
@@ -26,15 +25,12 @@ async function importLeadRows(ownerId, rows) {
   for (const row of rows || []) {
     let phone = null;
     const rawPhone = String(row.phone || "").trim();
-    let email = String(row.email || "").trim().toLowerCase();
+    let email = extractEmail(row.email) || String(row.email || "").trim().toLowerCase();
 
-    if (email && !EMAIL_RE.test(email)) email = "";
+    if (email && !isValidEmail(email)) email = "";
     if (rawPhone) {
-      try {
-        phone = toWhatsAppNumber(rawPhone);
-      } catch {
-        phone = null; // Keep a valid email contact, if present.
-      }
+      const result = normalizePhone(rawPhone, opts);
+      phone = result.ok ? result.phone : null; // Keep a valid email contact, if present.
     }
 
     if (!phone && !email) {
@@ -49,13 +45,13 @@ async function importLeadRows(ownerId, rows) {
   const phones = [...new Set(normalized.map((item) => item.phone).filter(Boolean))];
   const emails = [...new Set(normalized.map((item) => item.email).filter(Boolean))];
   const [existingPhoneRows, existingEmailRows] = await Promise.all([
-    phones.length ? Lead.find({ ownerId, phone: { $in: phones } }, { phone: 1 }).lean() : [],
+    phones.length ? Lead.find({ ownerId, phone: { $in: [...new Set(phones.flatMap(phoneVariants))] } }, { phone: 1 }).lean() : [],
     emails.length ? Lead.find({ ownerId, email: { $in: emails } }, { email: 1 }).lean() : [],
   ]);
   // Contacts already in Upload Data: not re-inserted, but returned so a bulk
   // upload can still build an audience from the whole sheet.
   const existingIds = [...new Set([...existingPhoneRows, ...existingEmailRows].map((lead) => String(lead._id)))];
-  const seenPhones = new Set(existingPhoneRows.map((lead) => lead.phone));
+  const seenPhones = new Set(existingPhoneRows.map((lead) => { const n = normalizePhone(lead.phone, opts); return n.ok ? n.phone : lead.phone; }));
   const seenEmails = new Set(existingEmailRows.map((lead) => String(lead.email || "").toLowerCase()));
   const docs = [];
 

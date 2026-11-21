@@ -20,8 +20,9 @@ const DAY = 24 * 60 * 60 * 1000;
 /** Monthly recurring revenue contribution of one org (INR, before GST). */
 function mrrOf(org) {
   if (org.status !== 'active' && org.status !== 'past_due') return 0;
-  const plan = getPlan(org.plan);
-  const monthly = org.priceOverride || (org.billingCycle === 'annual' ? plan.annual / 12 : plan.monthly);
+  // Approximate, in INR list prices (priceOverride is INR).
+  const price = require('../config/pricing').planPrice(getPlan(org.plan).code, 'INR');
+  const monthly = org.priceOverride || (org.billingCycle === 'annual' ? (price.annual || 0) / 12 : price.monthly || 0);
   return Math.round(monthly);
 }
 
@@ -144,6 +145,18 @@ const updateOrg = asyncHandler(async (req, res) => {
   }
   if (b.currentPeriodEnd) org.currentPeriodEnd = new Date(b.currentPeriodEnd);
   if (b.limitOverrides !== undefined) org.limitOverrides = b.limitOverrides || {};
+  if (b.featureOverrides !== undefined) {
+    // null value = remove the override (back to the plan default).
+    const next = {};
+    for (const [k, v] of Object.entries(b.featureOverrides || {})) if (typeof v === 'boolean') next[k] = v;
+    org.featureOverrides = next;
+    org.markModified('featureOverrides');
+  }
+  // Only the platform admin may change the billing country / currency after onboarding.
+  if (b.country && b.country !== org.country) {
+    org.country = b.country;
+    org.currency = require('../config/pricing').currencyForCountry(b.country);
+  }
   if (b.priceOverride !== undefined) org.priceOverride = b.priceOverride || null;
   if (b.notes !== undefined) org.notes = b.notes;
   if (b.addons) {
@@ -203,7 +216,7 @@ const listAdmins = asyncHandler(async (req, res) => {
 
 const createAdmin = asyncHandler(async (req, res) => {
   const email = String(req.body.email).trim().toLowerCase();
-  if (await User.exists({ email })) throw ApiError.conflict('Is email se pehle se login hai');
+  if (await User.exists({ email })) throw ApiError.conflict('A login already exists for this email');
   const user = new User({ name: req.body.name, email, role: 'admin', isSuperAdmin: true, orgId: null });
   user.setPassword(req.body.password);
   await user.save();
@@ -212,7 +225,7 @@ const createAdmin = asyncHandler(async (req, res) => {
 });
 
 const updateAdmin = asyncHandler(async (req, res) => {
-  if (req.params.id === req.admin.id && req.body.isActive === false) throw ApiError.badRequest('Aap khud ko deactivate nahi kar sakte');
+  if (req.params.id === req.admin.id && req.body.isActive === false) throw ApiError.badRequest('You can’t deactivate yourself');
   const user = await User.findOne({ _id: req.params.id, isSuperAdmin: true });
   if (!user) throw ApiError.notFound('Admin not found');
   if (typeof req.body.isActive === 'boolean') {

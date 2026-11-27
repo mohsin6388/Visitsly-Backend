@@ -55,13 +55,13 @@ const updateBudget = require('../utils/asyncHandler')(async (req, res) => {
   // Changing the amount or period re-arms the alerts.
   if (b.amount !== undefined || b.period !== undefined || b.startDate !== undefined) $set['budget.lastAlert'] = { periodKey: null, level: 0, at: null };
   if (b.period === 'custom' && (!b.startDate || !b.endDate || b.startDate > b.endDate)) {
-    throw require('../utils/ApiError').badRequest('Custom period ke liye sahi start aur end date chunein');
+    throw require('../utils/ApiError').badRequest('Choose valid start and end dates for a custom period');
   }
   await OrganizationModel.updateOne({ _id: req.org._id }, { $set });
   orgServiceForBudget.invalidate(req.org._id);
   const org = await OrganizationModel.findById(req.org._id).select('_id ownerUserId budget name currency').lean();
   const spend = await budgetService.computeSpend(org);
-  return new (require('../utils/ApiResponse'))(200, { budget: budgetView(org), spend }, 'Budget save ho gaya').send(res);
+  return new (require('../utils/ApiResponse'))(200, { budget: budgetView(org), spend }, 'Budget saved').send(res);
 });
 
 /** POST /api/reports/budget/send — send the spend report to WhatsApp now. */
@@ -70,7 +70,7 @@ const sendBudgetReport = require('../utils/asyncHandler')(async (req, res) => {
   const spend = await budgetService.computeSpend(org);
   const result = await budgetService.sendReport(org, spend);
   const ok = result.whatsapp.some((r) => r.ok);
-  return new (require('../utils/ApiResponse'))(200, { result, spend }, ok ? 'Report WhatsApp par bhej di' : result.email?.ok ? 'WhatsApp nahi gaya (24 ghante ka window band) — report email par bhej di' : 'Report nahi gayi — Settings mein alert number / template check karein').send(res);
+  return new (require('../utils/ApiResponse'))(200, { result, spend }, ok ? 'Report sent on WhatsApp' : result.email?.ok ? 'WhatsApp not sent (24-hour window closed) — report sent by email' : 'Report not sent — check the alert number / template in Settings').send(res);
 });
 
 module.exports.getBudget = getBudget;

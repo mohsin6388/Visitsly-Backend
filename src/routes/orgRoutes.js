@@ -1,4 +1,5 @@
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const authenticate = require('../middlewares/auth');
 const roleGuard = require('../middlewares/roleGuard');
@@ -8,6 +9,7 @@ const v = require('../validators/saasValidators');
 const g = require('../controllers/growthController');
 const cp = require('../controllers/cpController');
 const { z } = require('zod');
+const { requireFeature } = require('../services/saas/subscription');
 
 const oid = z.string().regex(/^[a-f\d]{24}$/i);
 const s = {
@@ -25,13 +27,16 @@ const s = {
 
 router.use(authenticate);
 
-const managers = roleGuard.org('owner', 'manager');
+const managers = roleGuard.org('owner');
 
 router.get('/', c.getOrg);
 router.patch('/', managers, validate(v.updateOrgSchema), c.updateOrg);
-router.patch('/onboarding', validate(v.onboardingSchema), c.updateOnboarding);
+router.patch('/onboarding', managers, validate(v.onboardingSchema), c.updateOnboarding);
+// Onboarding wizard (owner only): final submit + per-step draft.
+router.patch('/profile', roleGuard.org('owner'), validate(v.orgProfileSchema), c.updateProfile);
+router.patch('/profile/draft', roleGuard.org('owner'), validate(v.orgProfileDraftSchema), c.saveProfileDraft);
 
-router.get('/whatsapp', c.getWhatsapp);
+router.get('/whatsapp', managers, c.getWhatsapp);
 router.get('/whatsapp/health', managers, c.whatsappHealth);
 router.post('/whatsapp/fix-webhook', managers, c.fixWhatsappWebhook);
 router.post('/whatsapp/embedded-signup', managers, validate(v.embeddedSignupSchema), c.connectEmbedded); // backward-compatible legacy flow
@@ -39,6 +44,8 @@ router.post('/whatsapp/embedded-signup/prepare', managers, validate(v.embeddedSi
 router.post('/whatsapp/embedded-signup/complete', managers, validate(v.embeddedSignupCompleteSchema), c.completeEmbeddedSignup);
 router.post('/whatsapp/manual', managers, validate(v.manualConnectSchema), c.connectManual);
 router.post('/whatsapp/disconnect', managers, c.disconnectWhatsapp);
+router.post('/whatsapp/test-message', managers, rateLimit({ windowMs: 15 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false, keyGenerator: (req) => String(req.org?._id || req.user?.actorId || 'authenticated'), message: { success: false, message: 'Too many test messages. Try again in 15 minutes.' } }), validate(v.whatsappTestMessageSchema), c.sendWhatsappTestMessage);
+router.post('/whatsapp/coexistence/sync', managers, c.retryCoexistenceSync);
 router.get('/whatsapp/opening-template/options', managers, c.listOpeningTemplateOptions);
 router.patch('/whatsapp/opening-template', managers, validate(v.openingTemplateSchema), c.updateOpeningTemplate);
 
@@ -49,17 +56,19 @@ router.delete('/whatsapp/numbers/:phoneNumberId', managers, c.removeNumber);
 router.get('/lead-sources', managers, g.getLeadSources);
 router.patch('/lead-sources', managers, validate(s.sources), g.updateLeadSources);
 router.post('/lead-sources/test', managers, validate(z.object({ body: z.object({ phone: z.string().trim().min(10).max(20), name: z.string().trim().max(80).optional(), source: z.enum(['website_form', 'facebook_ads', 'google_ads', '99acres', 'magicbricks', 'housing']).optional() }) })), g.testLeadSource);
-router.post('/lead-sources/meta/pages', managers, validate(s.metaPages), g.metaPages);
-router.post('/lead-sources/meta/connect', managers, validate(s.metaConnect), g.metaConnect);
+router.post('/lead-sources/meta/pages', managers, requireFeature('metaLeadAds'), validate(s.metaPages), g.metaPages);
+router.post('/lead-sources/meta/connect', managers, requireFeature('metaLeadAds'), validate(s.metaConnect), g.metaConnect);
 router.post('/lead-sources/meta/disconnect', managers, g.metaDisconnect);
 
-// Lead routing
+// Lead routing (Growth+: Team Lead Assignment)
+const routingFeature = requireFeature('teamRouting');
 router.get('/routing', managers, g.getRouting);
-router.patch('/routing', managers, validate(s.routing), g.updateRouting);
-router.post('/routing/assign', managers, validate(s.assign), g.assignLeads);
-router.post('/routing/distribute', managers, g.distributeUnassigned);
+router.patch('/routing', managers, routingFeature, validate(s.routing), g.updateRouting);
+router.post('/routing/assign', managers, routingFeature, validate(s.assign), g.assignLeads);
+router.post('/routing/distribute', managers, routingFeature, g.distributeUnassigned);
 
-router.patch('/weekly-report', managers, validate(s.weekly), g.updateWeeklyReport);
+// Weekly WhatsApp report (Builder Pro+)
+router.patch('/weekly-report', managers, requireFeature('weeklyReports'), validate(s.weekly), g.updateWeeklyReport);
 
 // Channel partners (builders)
 router.get('/channel-partners', managers, cp.listPartners);

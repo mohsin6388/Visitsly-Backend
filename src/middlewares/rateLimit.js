@@ -23,4 +23,13 @@ const authLimiter = rateLimit({
   message: { success: false, message: 'Too many auth attempts, please try again later.' },
 });
 
-module.exports = { apiLimiter, authLimiter };
+// E-mail sender setup (OTP / DNS checks call Brevo): keep it slow.
+const emailSetupLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many email setup attempts, please try again later.' },
+});
+
+module.exports = { apiLimiter, authLimiter, emailSetupLimiter };

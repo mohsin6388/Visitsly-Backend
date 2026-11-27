@@ -58,6 +58,7 @@ const updateSettingsSchema = z.object({
         callStartHour: z.number().int().min(0).max(23).optional(),
         callEndHour: z.number().int().min(1).max(24).optional(),
         callRetries: z.number().int().min(0).max(2).optional(),
+        reminderCall: z.boolean().optional(),
       })
       .optional(),
     followUp: z
@@ -87,7 +88,33 @@ const updateSettingsSchema = z.object({
         language: z.string().max(20).optional(),
       })
       .optional(),
+    calling: z
+      .object({
+        dnd: z
+          .object({
+            enabled: z.boolean().optional(),
+            apiUrl: z.union([z.literal(''), z.string().trim().url().max(500)]).optional(),
+            apiKey: z.string().trim().max(300).optional(),
+            apiKeyHeader: z.string().trim().max(60).regex(/^[A-Za-z0-9-]*$/).optional(),
+          })
+          .optional(),
+      })
+      .optional(),
+    assistant: z
+      .object({
+        name: z.string().trim().max(40).optional(),
+        gender: z.enum(['female', 'male']).optional(),
+        defaultLanguage: z.string().trim().max(30).optional(),
+        instructions: z.string().max(1500).optional(),
+      })
+      .optional(),
   }),
 });
 
-module.exports = { updateSettingsSchema };
+const improvePromptSchema = z.object({
+  body: z.object({
+    text: z.string().trim().min(5).max(3000),
+  }),
+});
+
+module.exports = { updateSettingsSchema, improvePromptSchema };

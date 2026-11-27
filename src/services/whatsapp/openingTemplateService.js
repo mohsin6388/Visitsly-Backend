@@ -406,7 +406,7 @@ function fill(text, variables, values) {
  * organization. Throws a coded, organization-specific error instead of ever
  * falling back to another tenant, an env value or a plain text message.
  */
-async function resolveForSend({ lead }) {
+async function resolveForSend({ lead, language = null }) {
   const ctx = currentContext();
   assertConnected(ctx);
 
@@ -458,6 +458,20 @@ async function resolveForSend({ lead }) {
       }. Select another approved template in WhatsApp settings. Nothing was sent.`,
       { organizationId: ctx.orgId, templateName: selection.name },
     );
+  }
+
+  // E5: when the customer's chat language is saved and the company has an
+  // approved translation of the SAME template in it, send that translation.
+  const wanted = require("../language/languages").info(require("../language/languages").normalize(language));
+  if (wanted && wanted.waCodes.length && require("../language/languages").fromTemplateCode(template.language) !== wanted.name) {
+    const all = await getTemplates().catch(() => []);
+    const translated = wanted.waCodes
+      .map((code) => all.find((t) => t.name === selection.name && String(t.language).toLowerCase() === code.toLowerCase() && String(t.status).toUpperCase() === "APPROVED"))
+      .find(Boolean);
+    if (translated) {
+      const check = analyze(translated, selection.variables);
+      if (check.eligible && !check.needsMapping) template = translated;
+    }
   }
 
   const info = analyze(template, selection.variables);

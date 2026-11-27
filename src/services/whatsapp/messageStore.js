@@ -99,8 +99,18 @@ async function afterInbound(conversation, message) {
       },
     },
   );
+  // The dashboard toast shows who wrote: lead name, else phone. One indexed lookup, never throws.
+  let leadName = null;
+  try {
+    const Lead = require('../../models/Lead');
+    const lead = await Lead.findById(message.leadId).select('name phone').lean();
+    leadName = (lead?.name && String(lead.name).trim()) || lead?.phone || null;
+  } catch (err) {
+    logger.warn('[messages] lead name lookup failed', { error: err.message });
+  }
   emitLive(conversation.ownerId, conversation._id, message.leadId, message, {
     conversation: { _id: conversation._id, status: conversation.status, unreadCount: conversation.unreadCount },
+    leadName,
   });
 }
 

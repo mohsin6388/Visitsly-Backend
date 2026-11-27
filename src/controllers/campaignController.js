@@ -4,13 +4,27 @@ const ApiResponse = require("../utils/ApiResponse");
 const Campaign = require("../models/Campaign");
 const Audience = require("../models/Audience");
 const EmailMessage = require("../models/EmailMessage");
+const OutboundJob = require("../models/OutboundJob");
 const { launchCampaign } = require("../services/campaign/campaignService");
 const queue = require("../services/queue/outboundQueue");
 const { emitToUser } = require("../sockets");
 
 /** POST /api/campaigns/launch */
 const launch = asyncHandler(async (req, res) => {
-  const { rows, leadIds, audienceId, ...config } = req.body;
+  const { rows, audienceId, recipientFilter = "all", ...config } = req.body;
+  let { leadIds } = req.body;
+
+  // Optional: only first-message leads (never sent on this channel) or only follow-ups.
+  if (Array.isArray(leadIds) && leadIds.length && recipientFilter !== "all") {
+    const channel = config.channels?.whatsapp ? "whatsapp" : "email";
+    const sent = new Set((await OutboundJob.distinct("leadId", { ownerId: req.user.id, channel, status: "sent", leadId: { $in: leadIds } })).map(String));
+    leadIds = leadIds.filter((id) => (recipientFilter === "unsent" ? !sent.has(String(id)) : sent.has(String(id))));
+    if (!leadIds.length) {
+      throw new ApiError(400, recipientFilter === "unsent"
+        ? "All selected contacts were already messaged. Choose \"All selected\" or \"Follow-up\"."
+        : "None of the selected contacts were messaged before, so there is no one to follow up.");
+    }
+  }
 
   const result = await launchCampaign({
     ownerId: req.user.id,
@@ -42,6 +56,7 @@ const launch = asyncHandler(async (req, res) => {
       whatsappAvailable: result.whatsappAvailable,
       emailAvailable: result.emailAvailable,
       totalDays: result.totalDays,
+      notScheduled: result.notScheduled || 0,
       firstRunAt: result.firstRunAt,
       lastRunAt: result.lastRunAt,
     },
@@ -122,6 +137,16 @@ const retry = control(
   "Failed jobs re-queued",
 );
 
+/** DELETE /api/campaigns/:id — remove a finished / cancelled campaign and its history. */
+const remove = asyncHandler(async (req, res) => {
+  const result = await queue.deleteCampaign(req.user.id, req.params.id);
+  if (!result) throw ApiError.notFound("Campaign not found");
+  const AuditLog = require("../models/AuditLog");
+  await AuditLog.create({ userId: req.user.actorId || req.user.id, action: "campaign.delete", entityType: "Campaign", entityId: result.campaign._id, meta: { name: result.campaign.name, jobs: result.modified }, ip: req.ip }).catch(() => {});
+  emitToUser(req.user.id, "outreach:campaign", { campaignId: String(result.campaign._id), status: "deleted" });
+  return new ApiResponse(200, { deleted: true }, "Campaign deleted").send(res);
+});
+
 /** GET /api/outreach/summary — sidebar badges + page header cards */
 const summary = asyncHandler(async (req, res) => {
   const data = await queue.getOutreachSummary(req.user.id);
@@ -141,6 +166,7 @@ module.exports = {
   pause,
   resume,
   cancel,
+  remove,
   retry,
   summary,
   jobs,

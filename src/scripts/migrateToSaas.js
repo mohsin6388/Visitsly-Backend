@@ -82,10 +82,10 @@ const { encrypt } = require('../utils/crypto');
   if (owner.role === 'admin') owner.role = 'broker';
   await owner.save();
 
-  // Every other existing login joins the same company as a manager.
+  // Every other existing login joins the same company as an agent.
   const others = await User.updateMany(
     { _id: { $ne: owner._id }, orgId: null, isSuperAdmin: { $ne: true } },
-    { $set: { orgId: org._id, orgRole: 'manager' } }
+    { $set: { orgId: org._id, orgRole: 'agent' } }
   );
 
   if (legacySettings) {

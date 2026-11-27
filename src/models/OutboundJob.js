@@ -68,6 +68,12 @@ const outboundJobSchema = new Schema(
     sentAt: { type: Date, default: null },
 
     lastError: { type: String, default: null },
+
+    // Contact as it was when the job was created, so the campaign history
+    // still shows who it was for after the contact is deleted from Upload Data.
+    contactName: { type: String, default: "" },
+    contactPhone: { type: String, default: "" },
+    contactEmail: { type: String, default: "" },
     lastErrorCode: { type: String, default: null },
   },
   { timestamps: true },

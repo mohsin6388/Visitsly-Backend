@@ -6,7 +6,7 @@ const roleGuard = require('../middlewares/roleGuard');
 const validate = require('../middlewares/validate');
 const c = require('../controllers/reportsController');
 
-const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Date YYYY-MM-DD format mein ho');
+const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Date must be YYYY-MM-DD');
 const budgetSchema = z.object({
   body: z.object({
     enabled: z.boolean().optional(),
@@ -31,7 +31,7 @@ const budgetSchema = z.object({
 });
 
 // Reports compare the whole team, so owners and managers only.
-router.use(authenticate, roleGuard.org('owner', 'manager'));
+router.use(authenticate, roleGuard.org('owner'));
 router.get('/', c.getReport);
 router.get('/budget', c.getBudget);
 router.patch('/budget', validate(budgetSchema), c.updateBudget);

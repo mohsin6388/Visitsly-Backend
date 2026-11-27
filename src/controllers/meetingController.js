@@ -1,6 +1,7 @@
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const ApiResponse = require('../utils/ApiResponse');
+const agentScope = require('../services/saas/agentScope');
 const Meeting = require('../models/Meeting');
 const Lead = require('../models/Lead');
 const Conversation = require('../models/Conversation');
@@ -17,7 +18,7 @@ const listMeetings = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const { status, from, to, page, limit, source, when } = req.query;
 
-  const filter = { ownerId };
+  const filter = { ownerId, ...(await agentScope.byLeadFilter(req)) };
   if (status) filter.status = status;
   if (source) filter.source = source;
   if (from || to) {
@@ -31,7 +32,7 @@ const listMeetings = asyncHandler(async (req, res) => {
   if (when === 'upcoming') filter.preferredDate = { $gte: todayIST };
   if (when === 'past') filter.preferredDate = { $lt: todayIST };
 
-  const summaryFilter = { ownerId };
+  const summaryFilter = { ownerId, ...(await agentScope.byLeadFilter(req)) };
   if (source) summaryFilter.source = source;
   if (from || to) {
     summaryFilter.preferredDate = {};
@@ -69,7 +70,7 @@ const listMeetings = asyncHandler(async (req, res) => {
   const [todayCount, upcomingCount, chatBooked] = await Promise.all([
     Meeting.countDocuments({ ...summaryFilter, preferredDate: todayIST, status: { $in: ['scheduled', 'rescheduled'] } }),
     Meeting.countDocuments({ ...summaryFilter, preferredDate: { $gte: todayIST }, status: { $in: ['scheduled', 'rescheduled'] } }),
-    Meeting.countDocuments({ ownerId, source: 'whatsapp_ai' }),
+    Meeting.countDocuments({ ...summaryFilter, source: 'whatsapp_ai' }),
   ]);
 
   const summary = {
@@ -96,13 +97,15 @@ const createMeeting = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const { leadId, propertyId, preferredDate, preferredTime, notes } = req.body;
 
-  const lead = await Lead.findOne({ _id: leadId, ownerId });
+  const lead = await Lead.findOne({ _id: leadId, ...agentScope.leadScope(req) });
   if (!lead) throw ApiError.notFound('Lead not found');
 
   const meeting = await Meeting.create({ leadId, ownerId, propertyId, preferredDate, preferredTime, notes, source: 'manual' });
 
   await Lead.updateOne({ _id: leadId }, { $set: { status: 'site_visit' } });
   await Conversation.updateOne({ leadId }, { $set: { meetingStatus: 'scheduled' } });
+  // AI confirmation call (if the client's toggle is ON) goes out right away.
+  require('../services/visits/visitConfirmation').onVisitBooked(meeting);
 
   return new ApiResponse(201, { meeting }, 'Site visit scheduled').send(res);
 });
@@ -111,14 +114,19 @@ const createMeeting = asyncHandler(async (req, res) => {
 const updateMeeting = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const update = { ...req.body };
-  // Date/time badli to confirmation dobara puchni padegi
-  if (req.body.preferredDate || req.body.preferredTime) update['confirmation.status'] = 'none';
+  // Date/time badli to confirmation dobara puchni padegi (fresh call / WhatsApp)
+  const moved = Boolean(req.body.preferredDate || req.body.preferredTime);
+  if (moved) {
+    update.confirmation = { status: 'none' };
+    update.dateTentative = false;
+  }
   const meeting = await Meeting.findOneAndUpdate(
-    { _id: req.params.id, ownerId },
+    { _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) },
     { $set: update },
     { new: true, runValidators: true }
   );
   if (!meeting) throw ApiError.notFound('Meeting not found');
+  if (moved && ['scheduled', 'rescheduled'].includes(meeting.status)) require('../services/visits/visitConfirmation').onVisitBooked(meeting);
 
   // Keep the Google Calendar event in sync with reschedules/cancellations.
   if (meeting.googleEventId) {
@@ -160,7 +168,7 @@ const updateMeeting = asyncHandler(async (req, res) => {
 /** DELETE /api/meetings/:id */
 const deleteMeeting = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
-  const meeting = await Meeting.findOneAndDelete({ _id: req.params.id, ownerId });
+  const meeting = await Meeting.findOneAndDelete({ _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) });
   if (!meeting) throw ApiError.notFound('Meeting not found');
 
   if (meeting.googleEventId) {
@@ -175,30 +183,30 @@ const deleteMeeting = asyncHandler(async (req, res) => {
 /** POST /api/meetings/:id/send-confirmation — abhi WhatsApp confirmation bhejein. */
 const sendConfirmation = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
-  const meeting = await Meeting.findOne({ _id: req.params.id, ownerId }).select('_id');
+  const meeting = await Meeting.findOne({ _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) }).select('_id');
   if (!meeting) throw ApiError.notFound('Meeting not found');
   try {
     await require('../services/visits/visitConfirmation').sendConfirmation(meeting._id, { force: true });
   } catch (err) {
-    throw ApiError.badRequest(String(err.metaError?.message || err.message || 'Confirmation nahi gaya').slice(0, 250));
+    throw ApiError.badRequest(String(err.metaError?.message || err.message || 'Confirmation not sent').slice(0, 250));
   }
   const fresh = await Meeting.findById(meeting._id).lean();
-  return new ApiResponse(200, { meeting: fresh }, 'Confirmation WhatsApp par bhej diya').send(res);
+  return new ApiResponse(200, { meeting: fresh }, 'Confirmation sent on WhatsApp').send(res);
 });
 
 /** POST /api/meetings/:id/call-confirmation — AI call se confirm karwayein. */
 const callConfirmation = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
-  const meeting = await Meeting.findOne({ _id: req.params.id, ownerId }).select('_id');
+  const meeting = await Meeting.findOne({ _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) }).select('_id');
   if (!meeting) throw ApiError.notFound('Meeting not found');
   const base = (process.env.PUBLIC_API_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '').replace(/\/api$/, '');
   try {
     await require('../services/visits/visitConfirmation').callConfirmation(meeting._id, { publicBase: base });
   } catch (err) {
-    throw err.statusCode ? err : ApiError.badRequest(String(err.message || 'Call nahi laga').slice(0, 250));
+    throw err.statusCode ? err : ApiError.badRequest(String(err.message || 'Call failed').slice(0, 250));
   }
   const fresh = await Meeting.findById(meeting._id).lean();
-  return new ApiResponse(200, { meeting: fresh }, 'AI call lag rahi hai').send(res);
+  return new ApiResponse(200, { meeting: fresh }, 'AI call started').send(res);
 });
 
 /** GET /api/meetings/confirmation-stats?days=30 — numbers for the Visit confirmation page. */
@@ -208,12 +216,20 @@ const confirmationStats = asyncHandler(async (req, res) => {
   return new ApiResponse(200, { stats }).send(res);
 });
 
+/** GET /api/meetings/confirmation-calls?days=30&result=all|answered|missed — every AI confirmation call. */
+const confirmationCalls = asyncHandler(async (req, res) => {
+  const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 365);
+  const result = ['answered', 'missed', 'in_progress'].includes(req.query.result) ? req.query.result : 'all';
+  const data = await require('../services/visits/visitConfirmation').callsList({ days, result, limit: req.query.limit });
+  return new ApiResponse(200, data).send(res);
+});
+
 /** POST /api/meetings/:id/mark-confirmed { status: 'confirmed'|'declined' } — broker confirms by hand. */
 const markConfirmation = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const status = req.body?.status === 'declined' ? 'declined' : 'confirmed';
   const meeting = await Meeting.findOneAndUpdate(
-    { _id: req.params.id, ownerId },
+    { _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) },
     { $set: { 'confirmation.status': status, 'confirmation.repliedAt': new Date(), 'confirmation.confirmedVia': 'manual' } },
     { new: true },
   ).lean();
@@ -221,4 +237,4 @@ const markConfirmation = asyncHandler(async (req, res) => {
   return new ApiResponse(200, { meeting }, status === 'confirmed' ? 'Visit confirmed' : 'Visit marked as not coming').send(res);
 });
 
-module.exports = { listMeetings, createMeeting, updateMeeting, deleteMeeting, sendConfirmation, callConfirmation, confirmationStats, markConfirmation };
+module.exports = { listMeetings, createMeeting, updateMeeting, deleteMeeting, sendConfirmation, callConfirmation, confirmationStats, confirmationCalls, markConfirmation };

@@ -19,6 +19,7 @@ const Notification = require('../../models/Notification');
 const metaWhatsappClient = require('../whatsapp/metaWhatsappClient');
 const { recordOutboundMessage } = require('../whatsapp/messageStore');
 const orgService = require('../saas/orgService');
+const lang = require('../language');
 const logger = require('../../utils/logger');
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -30,15 +31,15 @@ const STOP_STATUSES = ['closed', 'lost', 'site_visit'];
 const DEFAULTS = { mode: 'auto', gapsDays: [1, 3, 7], startHour: 10, endHour: 19, timezone: 'Asia/Kolkata', messages: [], useAiDate: true, templateName: '', templateLanguage: '', templateVariableCount: 0 };
 
 const REENGAGE_TEXT = [
-  'Namaste {name}! Pichhli baar aapne bataya tha ki abhi zarurat nahi hai — koi baat nahi 🙂 Kuch naye options aur offers aaye hain. Agar aap dekhna chahein to bas "Haan" likh dijiye.',
-  'Namaste {name}, bas ek baar check kar rahe the — kya ab aap property dekh rahe hain? Zarurat ho to yahin message kar dijiye, hum turant madad karenge. (Message band karwane ke liye STOP likhein.)',
+  'Hi {name}! Last time you said it wasn’t the right time — no problem 🙂 We have some new options and offers. Reply "Yes" if you’d like to see them.',
+  'Hi {name}, just checking in — are you looking for a property now? Message us here anytime. (Reply STOP to opt out.)',
 ];
 
 const DEFAULT_TEXT = [
-  'Namaste {name}! Aapki property requirement par aage baat karni thi. Kya aap abhi dekh rahe hain? Bataiye, main madad kar dun.',
-  'Namaste {name}, aapke liye kuch achhe options aur details ready hain. Chahein to site visit bhi book kar dein, bas bata dijiye.',
-  'Namaste {name}, aakhri baar pooch raha hoon. Agar abhi zarurat nahi hai to koi baat nahi, jab bhi chahiye ho yahin message kar dena.',
-  'Namaste {name}, agar aap abhi bhi property dekh rahe hain to bataiye, hum madad ke liye taiyaar hain.',
+  'Hi {name}! Following up on your property requirement. Are you still looking? Happy to help.',
+  'Hi {name}, we have some good options ready for you. Would you like to book a site visit?',
+  'Hi {name}, checking one last time. No worries if now isn’t the time — message us here whenever you need.',
+  'Hi {name}, let us know if you’re still looking for a property — we’re here to help.',
 ];
 
 function config(settings) {
@@ -55,6 +56,42 @@ function reengageText(cfg, lead, step) {
   const custom = String(cfg.reengage?.message || '').trim();
   const base = custom || REENGAGE_TEXT[Math.min(step - 1, REENGAGE_TEXT.length - 1)];
   return base.replace(/\{name\}/gi, firstName(lead) || 'ji').replace(/\s+([,!])/g, '$1');
+}
+
+/** The customer's saved chat language (E5); null when they never wrote. */
+async function savedLanguage(lead, conversation = null) {
+  return lang.normalize(conversation?.language) || (await lang.savedLanguageForLead(lead?._id));
+}
+
+/** Saved chat language, else the company default, else English (the old default texts). */
+async function customerLanguage(lead, conversation = null, settings = null) {
+  const saved = await savedLanguage(lead, conversation);
+  if (saved) return saved;
+  const s = settings || (await require('../settings/settingsService').getOrCreateSettings().catch(() => null));
+  return lang.normalize(s?.assistant?.defaultLanguage) || 'English';
+}
+
+/**
+ * Follow-up / re-engage text in the customer's language. Built-in texts come
+ * from the language catalog; the company's own text is translated when the
+ * customer chats in another language.
+ */
+async function stepText({ cfg, lead, step, kind = 'sequence', conversation = null, settings = null }) {
+  const language = await customerLanguage(lead, conversation, settings);
+  const custom = String(kind === 'reengage' ? cfg.reengage?.message || '' : cfg.messages?.[step - 1] || '').trim();
+  if (custom) {
+    const filled = custom.replace(/\{name\}/gi, firstName(lead) || 'ji').replace(/\s+([,!])/g, '$1');
+    // The company's own words: translated only for a customer with a saved chat language.
+    const saved = await savedLanguage(lead, conversation);
+    return saved ? lang.translateText(filled, saved) : filled;
+  }
+  const key = kind === 'reengage' ? `reengage.${Math.min(step, 2)}` : `followup.${Math.min(step, 4)}`;
+  return lang.t(key, language, { name: lang.nameVar(lead) });
+}
+
+/** First re-engage message for a lead, in their language (manual follow-up default). */
+function reengageTextFor(cfg, lead, step = 1) {
+  return stepText({ cfg, lead, step, kind: 'reengage' });
 }
 
 /**
@@ -82,16 +119,10 @@ async function createReengageStep(cfg, conversation, lead) {
     kind: 'reengage',
     step: done + 1,
     nextFollowUpDate: new Date(),
-    nextFollowUpMessage: reengageText(cfg, lead, done + 1),
+    nextFollowUpMessage: await stepText({ cfg, lead, step: done + 1, kind: 'reengage', conversation }),
     urgency: 'low',
     generatedBy: 'reengage',
   });
-}
-
-function sequenceText(cfg, lead, step) {
-  const custom = String(cfg.messages?.[step - 1] || '').trim();
-  const base = custom || DEFAULT_TEXT[Math.min(step - 1, DEFAULT_TEXT.length - 1)];
-  return base.replace(/\{name\}/gi, firstName(lead) || 'ji').replace(/\s+([,!])/g, '$1');
 }
 
 function hourIn(tz) {
@@ -114,14 +145,19 @@ function inWorkingHours(cfg) {
  */
 async function sendFollowUpNow(followUp, { text } = {}) {
   const lead = await Lead.findById(followUp.leadId);
-  if (!lead?.phone) throw new Error('Lead ka WhatsApp number nahi hai');
+  if (!lead?.phone) throw new Error('Lead has no WhatsApp number');
   const conversation = await Conversation.findOne({ leadId: lead._id });
-  if (!conversation) throw new Error('Is lead ki WhatsApp chat shuru nahi hui, pehle pehla message bhejein');
-  if (conversation.optedOut || lead.optedOut) throw new Error('Customer ne STOP likh kar messages band karwaye hain');
+  if (!conversation) throw new Error('No WhatsApp chat with this lead yet — send the first message first');
+  if (conversation.optedOut || lead.optedOut) throw new Error('Customer opted out (STOP)');
   const settings = await require('../settings/settingsService').getOrCreateSettings();
   const cfg = config(settings);
-  const body = String(text || followUp.nextFollowUpMessage || '').trim();
-  if (!body) throw new Error('Message khali hai');
+  let body = String(text || followUp.nextFollowUpMessage || '').trim();
+  if (!body) throw new Error('Message is empty');
+  // E5: automatic follow-ups go out in the customer's saved chat language
+  // (text typed by the team is sent exactly as typed).
+  if (!text && followUp.kind !== 'manual' && lang.normalize(conversation.language)) {
+    body = await lang.translateText(body, conversation.language);
+  }
 
   const lastInbound = conversation.lastInboundAt ? new Date(conversation.lastInboundAt).getTime() : 0;
   const windowOpen = Date.now() - lastInbound < DAY;
@@ -135,10 +171,17 @@ async function sendFollowUpNow(followUp, { text } = {}) {
       const values = [firstName(lead) || 'Customer', settings.companyName || 'our team'];
       const count = Math.min(Math.max(Number(cfg.templateVariableCount) || 0, 0), values.length);
       const components = count ? [{ type: 'body', parameters: values.slice(0, count).map((t) => ({ type: 'text', text: String(t) })) }] : [];
-      ({ messageId } = await metaWhatsappClient.sendTemplateMessage({ phone: lead.phone, templateName: cfg.templateName, languageCode: cfg.templateLanguage || 'en_US', components }));
-      shown = `[Follow-up template: ${cfg.templateName}] ${body}`;
+      const sent = await lang.sendTemplateInLanguage({
+        phone: lead.phone,
+        templateName: cfg.templateName,
+        configuredLanguage: cfg.templateLanguage || 'en_US',
+        language: lang.normalize(conversation.language), // saved language only; else the configured template
+        buildComponents: () => components,
+      });
+      messageId = sent.messageId;
+      shown = `[Follow-up template: ${cfg.templateName} · ${sent.languageCode}] ${body}`;
     } else {
-      throw new Error('Lead ne 24 ghante se message nahi kiya, isliye free message nahi ja sakta. Follow-ups page par "Setup" me ek approved template chunein.');
+      throw new Error('The lead has not messaged in 24 hours, so a free message is not allowed. Choose an approved template in Follow-ups → Setup.');
     }
   } catch (err) {
     err.message = String(err.metaError?.message || err.message);
@@ -179,7 +222,7 @@ async function createSequenceStep(cfg, conversation, lead) {
     kind: 'sequence',
     step: done + 1,
     nextFollowUpDate: new Date(),
-    nextFollowUpMessage: sequenceText(cfg, lead, done + 1),
+    nextFollowUpMessage: await stepText({ cfg, lead, step: done + 1, kind: 'sequence', conversation }),
     urgency: done + 1 >= cfg.gapsDays.length ? 'low' : 'medium',
     generatedBy: 'sequence',
   });
@@ -189,7 +232,7 @@ async function notifyDue(followUp, lead, cfg) {
   await Notification.create({
     userId: followUp.ownerId,
     type: 'follow_up_due',
-    title: `Follow-up ka time: ${lead?.name || 'Lead'}`,
+    title: `Follow-up due: ${lead?.name || 'Lead'}`,
     body: String(followUp.nextFollowUpMessage || '').slice(0, 200),
     link: '/follow-ups',
   }).catch(() => {});
@@ -199,6 +242,10 @@ async function notifyDue(followUp, lead, cfg) {
 async function processOrg(settings) {
   const cfg = config(settings);
   if (cfg.mode === 'manual') return;
+  // Automatic follow-ups are a Growth+ feature. Without it the follow-ups are
+  // still created and the team is reminded, but nothing is sent automatically.
+  const { hasFeature } = require('../saas/subscription');
+  if (cfg.mode === 'auto' && !hasFeature(require('../../context/tenantContext').getOrg(), 'autoFollowUps')) cfg.mode = 'remind';
   const now = new Date();
 
   // 1) Jin leads ko ab follow-up nahi chahiye (closed/lost/visit book), unke pending band
@@ -288,4 +335,4 @@ function startFollowUpScheduler() {
   logger.info('[followup-auto] Scheduler started (every 10 min)');
 }
 
-module.exports = { startFollowUpScheduler, sendFollowUpNow, tick, config, DEFAULT_TEXT, REENGAGE_TEXT, reengageText };
+module.exports = { startFollowUpScheduler, sendFollowUpNow, tick, config, DEFAULT_TEXT, REENGAGE_TEXT, reengageText, reengageTextFor, stepText, customerLanguage };

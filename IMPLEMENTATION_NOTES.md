@@ -100,5 +100,327 @@ See **SAAS_SETUP.md** for the full design and the go-live checklist. In short:
 
 - Admin panel is now a separate app (`propai-admin-panel`) with its own auth: `/api/admin-auth/*`, admin JWT secrets, and an `adminRefreshToken` cookie scoped to `/api/admin-auth`. `/api/platform/*` accepts only admin tokens. Customer login refuses PropAI admins. Support access uses a 60-minute "support session" token opened from the admin panel; the old `X-Org-Id` header was removed.
 - CORS allows the customer app, the admin app, `CORS_ORIGINS`, and white-label domains (reloaded on change). Public `/api/inbound/*` reflects any origin.
-- New: lead capture (`leadCapture.js`, `portalParsers.js`, `metaLeadAds.js`, `inboundController.js`), round-robin routing (`routing.js`), reports and weekly report (`reportsService.js`), cost sheets with a pdfkit PDF (`Quote`, `quoteService.js`), channel partner portal (`ChannelPartner`, `cpController.js`), Bolna AI calling (`CallLog`, `voiceService.js`), extra WhatsApp numbers (`Organization.extraNumbers` and `tenantContext.runWithNumber`), add-ons and white-label (`Organization.addons/branding`), and customer requests (`PlatformRequest`).
+- New: lead capture (`leadCapture.js`, `portalParsers.js`, `metaLeadAds.js`, `inboundController.js`), round-robin routing (`routing.js`), reports and weekly report (`reportsService.js`), cost sheets with a pdfkit PDF (`Quote`, `quoteService.js`), channel partner portal (`ChannelPartner`, `cpController.js`), AI calling via Plivo + ElevenLabs + Gemini/Groq (`CallLog`, `voiceService.js`, `voiceAgent.js`, `plivoClient.js`, `tts.js`), extra WhatsApp numbers (`Organization.extraNumbers` and `tenantContext.runWithNumber`), add-ons and white-label (`Organization.addons/branding`), and customer requests (`PlatformRequest`).
 - Tests: 105 end-to-end API checks and 14 browser checks (customer app, public form, CP portal, admin panel, support session, mobile width).
+
+
+---
+
+## Nov 2026 update — shorter language question, brochure review, billing guard, coupons & offers
+
+### Deployment (uploads fail with "413 Request Entity Too Large")
+nginx in front of the API domain defaults to `client_max_body_size 1m`, so brochure/image uploads are
+rejected **before** they reach Node (the app's multer limit is already 30 MB per file). In the server block of
+the API domain (e.g. `api.visitsly.com`) add:
+
+```nginx
+client_max_body_size 60m;     # PDF 10 MB + 10 images x 5 MB
+proxy_read_timeout 180s;      # upload + Cloudinary + Gemini extraction
+```
+
+then `sudo nginx -t && sudo systemctl reload nginx`. Multer limits are unchanged.
+
+### New / changed endpoints
+| Method + path | Purpose |
+|---|---|
+| `POST /api/properties/brochure/extract` | Upload brochure + images, extract + validate with Gemini, return `{ extracted, brochure, images, warnings }`. **Nothing is saved.** Uploaded files are removed again if extraction fails. |
+| `POST /api/properties/brochure/confirm` | Body = reviewed fields + `brochure` + `images` → validates (zod + normaliser) and creates the Property + site brochure. |
+| `POST /api/properties/brochure` | Unchanged (old clients). |
+| `GET/POST /api/billing/coupon/validate` | `{ code, plan, cycle }` → `{ valid, coupon, quote }`. Creates/counts nothing. |
+| `GET /api/billing/quote?plan&cycle&coupon=` | Quote now includes offer + coupon (extra fields only). |
+| `POST /api/billing/checkout` | Accepts optional `coupon`; coupon and offer are re-validated server-side. New 400 code `PLAN_ALREADY_ACTIVE`. |
+| `POST /api/billing/checkout/cancel` | `{ orderId \| subscriptionId }` — popup dismissed → clears pendingPlan. |
+| `GET/POST/PATCH /api/platform/coupons`, `POST /api/platform/coupons/:id/disable`, `GET /api/platform/coupons/:id/redemptions` | Coupon admin (admin auth, audit-logged). |
+| `GET/PUT/DELETE /api/platform/plan-offers` | Set / list / clear strike-through offers per plan + cycle + currency (audit-logged). |
+| `GET /api/public/plans`, `GET /api/billing` | Plans may carry `offer: { monthly?, annual? }` (additive). `/api/billing` also returns `activePlanLocked`. |
+
+Socket event `conversation:newMessage` now also carries `leadName` (inbound messages).
+
+### Billing decisions
+* **Maths:** list price → offer price (or the company's custom `priceOverride`, which wins) → minus coupon → + GST/tax
+  (`pricing.withTax`). Razorpay amount, quote, and invoice (`subtotal`, `taxAmount`, `amount`, `pricing.*`) are
+  computed from the same quote.
+* **Coupon `appliesTo`:** `first` (default) — a Razorpay subscription cannot discount only its first charge cleanly,
+  so the first period is paid as a **one-time order** (existing order mode); the customer renews from the Billing
+  page afterwards. `all` — the subscription is created on a Razorpay plan priced at the discounted amount.
+* **Offers in subscription mode:** the offer price is locked into the Razorpay plan for the life of that subscription.
+* **Redemptions** are counted only after a successful payment, once per payment/order id.
+* **Plan safety:** a plan changes only after a verified payment. `handleWebhook` uses `sub.notes.plan/cycle`;
+  `pendingPlan` is used only when the webhook's subscription id equals `razorpay.pendingSubscriptionId`; unknown
+  subscriptions are ignored. `activate()` no longer falls back to `pendingPlan`.
+* **No plan switching while a plan is active:** `PLAN_ALREADY_ACTIVE` when status is `active`, the period is live and
+  the requested plan/cycle differs (or an auto-renewing subscription already exists). Same-plan renewal in order mode
+  still works. Platform admins change plans via `/api/platform/orgs/:id`.
+* New collections: `coupons`, `couponredemptions`, `planoffers`. New optional fields: `Invoice.pricing`,
+  `Organization.pendingCheckout`. No new env variables.
+
+### Tests
+`npm run test:billing` (guard, coupon/offer maths, redemption, webhook safety) and `npm run test:brochure`
+(extraction validation) were added; existing suites are unchanged except one assertion in `test/language.smoke.js`.
+
+# Part A + Part B (team permissions, Email via Brevo) — Nov 2026
+
+See EMAIL_SETUP.md for Part B. Route → permission table:
+
+info: [gemini] Model chain: gemini-3.5-flash -> gemini-3.5-flash-lite -> gemini-3.1-flash-lite -> gemini-2.5-flash (2 attempts each) {"timestamp":"2026-11-27T07:08:51.623Z"}
+| Method | Route | Agent access |
+|---|---|---|
+| POST | `/api/auth/signup` | public (no login; secured by token/signature) |
+| POST | `/api/auth/verify-email` | public (no login; secured by token/signature) |
+| POST | `/api/auth/resend-verification` | public (no login; secured by token/signature) |
+| POST | `/api/auth/change-password` | any logged-in agent (data scoped to their assigned leads) |
+| POST | `/api/auth/login` | public (no login; secured by token/signature) |
+| POST | `/api/auth/refresh` | public (no login; secured by token/signature) |
+| POST | `/api/auth/logout` | public (no login; secured by token/signature) |
+| POST | `/api/auth/forgot-password` | public (no login; secured by token/signature) |
+| POST | `/api/auth/reset-password` | public (no login; secured by token/signature) |
+| GET | `/api/auth/me` | any logged-in agent (data scoped to their assigned leads) |
+| PATCH | `/api/auth/profile` | any logged-in agent (data scoped to their assigned leads) |
+| POST | `/api/uploads/image` | any logged-in agent (data scoped to their assigned leads) |
+| GET | `/api/email/status` | owner only |
+| POST | `/api/email/sender` | owner only |
+| POST | `/api/email/sender/verify` | owner only |
+| POST | `/api/email/sender/resend` | owner only |
+| POST | `/api/email/sender/check-dns` | owner only |
+| DELETE | `/api/email/sender` | owner only |
+| GET | `/api/email/wallet` | owner only |
+| GET | `/api/email/estimate` | owner only |
+| GET | `/api/email/templates` | owner only |
+| POST | `/api/email/templates` | owner only |
+| PUT | `/api/email/templates/:id` | owner only |
+| DELETE | `/api/email/templates/:id` | owner only |
+| GET | `/api/email/details` | owner only |
+| POST | `/api/webhooks/brevo` | public (no login; secured by token/signature) |
+| GET | `/api/webhooks/email-unsubscribe/:token` | public (no login; secured by token/signature) |
+| POST | `/api/webhooks/email-unsubscribe/:token` | public (no login; secured by token/signature) |
+| POST | `/api/webhooks/razorpay` | public (no login; secured by token/signature) |
+| GET | `/api/webhooks/meta-leads` | public (no login; secured by token/signature) |
+| POST | `/api/webhooks/meta-leads` | public (no login; secured by token/signature) |
+| POST | `/api/webhooks/voice/plivo/:event/:callId` | public (no login; secured by token/signature) |
+| GET | `/api/webhooks/voice/plivo/:event/:callId` | public (no login; secured by token/signature) |
+| GET | `/api/webhooks/voice/audio/:file` | public (no login; secured by token/signature) |
+| POST | `/api/leads/import/preview` | needs leadImport |
+| POST | `/api/leads/import/parse-text` | needs leadImport |
+| POST | `/api/leads/import/confirm` | needs leadImport |
+| POST | `/api/leads/start-conversations` | needs chatReply |
+| GET | `/api/leads/export` | owner only |
+| GET | `/api/leads/import-files` | any of leads + whatsappLeads |
+| POST | `/api/leads/bulk-delete` | needs leadDelete |
+| GET | `/api/leads` | any of leads + whatsappLeads + inbox + siteVisits + followUps + dashboard |
+| POST | `/api/leads` | needs leadCreate |
+| GET | `/api/leads/:id` | any of leads + whatsappLeads + inbox + siteVisits + followUps + dashboard |
+| PATCH | `/api/leads/:id` | needs leadEdit |
+| DELETE | `/api/leads/:id` | needs leadDelete |
+| POST | `/api/leads/:id/tags` | needs leadEdit |
+| GET | `/api/audiences` | owner only |
+| POST | `/api/audiences` | owner only |
+| GET | `/api/audiences/:id/leads` | owner only |
+| GET | `/api/audiences/:id` | owner only |
+| PATCH | `/api/audiences/:id` | owner only |
+| DELETE | `/api/audiences/:id` | owner only |
+| POST | `/api/campaigns/launch` | owner only |
+| GET | `/api/campaigns` | owner only |
+| GET | `/api/campaigns/:id` | owner only |
+| POST | `/api/campaigns/:id/pause` | owner only |
+| POST | `/api/campaigns/:id/resume` | owner only |
+| POST | `/api/campaigns/:id/cancel` | owner only |
+| DELETE | `/api/campaigns/:id` | owner only |
+| POST | `/api/campaigns/:id/retry-failed` | owner only |
+| GET | `/api/outreach/summary` | owner only |
+| GET | `/api/outreach/jobs` | owner only |
+| POST | `/api/properties/brochure` | owner only |
+| POST | `/api/properties/brochure/extract` | owner only |
+| POST | `/api/properties/brochure/confirm` | owner only |
+| POST | `/api/properties/import/preview` | owner only |
+| POST | `/api/properties/import/confirm` | owner only |
+| GET | `/api/properties/export` | owner only |
+| POST | `/api/properties/bulk-delete` | owner only |
+| POST | `/api/properties` | owner only |
+| GET | `/api/properties` | any of properties + chatReply |
+| GET | `/api/properties/:id` | any of properties + chatReply |
+| PATCH | `/api/properties/:id` | owner only |
+| DELETE | `/api/properties/:id` | owner only |
+| GET | `/api/sites` | any of properties + chatReply |
+| POST | `/api/sites/brochure` | owner only |
+| PATCH | `/api/sites/:id` | owner only |
+| DELETE | `/api/sites/:id/brochures/:brochureId` | owner only |
+| DELETE | `/api/sites/:id/images` | owner only |
+| GET | `/api/whatsapp/webhook` | public (no login; secured by token/signature) |
+| POST | `/api/whatsapp/webhook` | public (no login; secured by token/signature) |
+| POST | `/api/whatsapp/webhook/forward` | public (no login; secured by token/signature) |
+| GET | `/api/whatsapp/status` | any logged-in agent (data scoped to their assigned leads) |
+| GET | `/api/whatsapp/templates` | any logged-in agent (data scoped to their assigned leads) |
+| GET | `/api/whatsapp/templates/all` | any logged-in agent (data scoped to their assigned leads) |
+| POST | `/api/whatsapp/templates` | owner only |
+| DELETE | `/api/whatsapp/templates/:name` | owner only |
+| GET | `/api/whatsapp/diagnostics` | owner only |
+| POST | `/api/whatsapp/repair-subscription` | owner only |
+| POST | `/api/whatsapp/send-test` | owner only |
+| POST | `/api/whatsapp/send-test-template` | owner only |
+| POST | `/api/whatsapp/disconnect` | owner only |
+| POST | `/api/whatsapp/reconnect` | owner only |
+| GET | `/api/conversations` | any of inbox + whatsappLeads |
+| GET | `/api/conversations/counts` | any of inbox + whatsappLeads |
+| GET | `/api/conversations/:id` | any of inbox + whatsappLeads |
+| GET | `/api/conversations/:id/media/:messageId` | any of inbox + whatsappLeads |
+| POST | `/api/conversations/:id/messages` | needs chatReply |
+| POST | `/api/conversations/:id/media` | needs chatReply |
+| POST | `/api/conversations/:id/property-media` | needs chatReply |
+| PATCH | `/api/conversations/:id/language` | needs chatReply |
+| POST | `/api/conversations/:id/takeover` | needs chatReply |
+| POST | `/api/conversations/:id/resume-ai` | needs chatReply |
+| POST | `/api/conversations/:id/read` | any of inbox + whatsappLeads |
+| POST | `/api/conversations/:id/close` | needs chatReply |
+| POST | `/api/conversations/:id/reopen` | needs chatReply |
+| GET | `/api/meetings` | any of siteVisits + dashboard + inbox + leads + whatsappLeads |
+| GET | `/api/meetings/confirmation-stats` | owner only |
+| GET | `/api/meetings/confirmation-calls` | owner only |
+| POST | `/api/meetings` | needs siteVisits |
+| PATCH | `/api/meetings/:id` | needs siteVisits |
+| POST | `/api/meetings/:id/send-confirmation` | needs siteVisits + chatReply |
+| POST | `/api/meetings/:id/call-confirmation` | owner only |
+| POST | `/api/meetings/:id/mark-confirmation` | needs siteVisits |
+| DELETE | `/api/meetings/:id` | needs siteVisits |
+| GET | `/api/followups` | any of followUps + dashboard |
+| PATCH | `/api/followups/:id` | needs followUps |
+| POST | `/api/followups/:id/send` | needs followUps + chatReply |
+| POST | `/api/followups/lead/:id` | needs followUps |
+| DELETE | `/api/followups/:id` | needs followUps |
+| GET | `/api/settings` | owner only (writes) |
+| PATCH | `/api/settings` | owner only (writes) |
+| POST | `/api/settings/ai/pause` | owner only (writes) |
+| POST | `/api/settings/ai/resume` | owner only (writes) |
+| POST | `/api/settings/daily-report/send-now` | owner only (writes) |
+| POST | `/api/settings/test-alert` | owner only (writes) |
+| POST | `/api/settings/assistant/improve` | owner only (writes) |
+| GET | `/api/analytics/dashboard` | needs dashboard |
+| GET | `/api/analytics/timeseries` | needs dashboard |
+| GET | `/api/analytics/funnel` | needs dashboard |
+| GET | `/api/analytics/lead-sources` | owner only |
+| GET | `/api/analytics/source-performance` | owner only |
+| GET | `/api/analytics/meta-billing` | owner only |
+| GET | `/api/analytics/property-performance` | owner only |
+| GET | `/api/notifications` | any logged-in agent (data scoped to their assigned leads) |
+| PATCH | `/api/notifications/read-all` | any logged-in agent (data scoped to their assigned leads) |
+| PATCH | `/api/notifications/:id/read` | any logged-in agent (data scoped to their assigned leads) |
+| DELETE | `/api/notifications/:id` | any logged-in agent (data scoped to their assigned leads) |
+| GET | `/api/audit-logs` | any logged-in agent (data scoped to their assigned leads) |
+| GET | `/api/org` | any logged-in agent (data scoped to their assigned leads) |
+| PATCH | `/api/org` | owner only |
+| PATCH | `/api/org/onboarding` | owner only |
+| PATCH | `/api/org/profile` | owner only |
+| PATCH | `/api/org/profile/draft` | owner only |
+| GET | `/api/org/whatsapp` | owner only |
+| GET | `/api/org/whatsapp/health` | owner only |
+| POST | `/api/org/whatsapp/fix-webhook` | owner only |
+| POST | `/api/org/whatsapp/embedded-signup` | owner only |
+| POST | `/api/org/whatsapp/embedded-signup/prepare` | owner only |
+| POST | `/api/org/whatsapp/embedded-signup/complete` | owner only |
+| POST | `/api/org/whatsapp/manual` | owner only |
+| POST | `/api/org/whatsapp/disconnect` | owner only |
+| POST | `/api/org/whatsapp/test-message` | owner only |
+| POST | `/api/org/whatsapp/coexistence/sync` | owner only |
+| GET | `/api/org/whatsapp/opening-template/options` | owner only |
+| PATCH | `/api/org/whatsapp/opening-template` | owner only |
+| POST | `/api/org/whatsapp/numbers` | owner only |
+| DELETE | `/api/org/whatsapp/numbers/:phoneNumberId` | owner only |
+| GET | `/api/org/lead-sources` | owner only |
+| PATCH | `/api/org/lead-sources` | owner only |
+| POST | `/api/org/lead-sources/test` | owner only |
+| POST | `/api/org/lead-sources/meta/pages` | owner only |
+| POST | `/api/org/lead-sources/meta/connect` | owner only |
+| POST | `/api/org/lead-sources/meta/disconnect` | owner only |
+| GET | `/api/org/routing` | owner only |
+| PATCH | `/api/org/routing` | owner only |
+| POST | `/api/org/routing/assign` | owner only |
+| POST | `/api/org/routing/distribute` | owner only |
+| PATCH | `/api/org/weekly-report` | owner only |
+| GET | `/api/org/channel-partners` | owner only |
+| PATCH | `/api/org/channel-partners/settings` | owner only |
+| PATCH | `/api/org/channel-partners/:id` | owner only |
+| POST | `/api/org/deals/:leadId` | owner only |
+| GET | `/api/org/requests` | owner only |
+| POST | `/api/org/requests` | owner only |
+| GET | `/api/org/team` | owner only |
+| POST | `/api/org/team` | owner only |
+| POST | `/api/org/team/bulk` | owner only |
+| POST | `/api/org/team/:id/set-password` | owner only |
+| PATCH | `/api/org/team/:id` | owner only |
+| POST | `/api/org/team/:id/reset-password` | owner only |
+| GET | `/api/billing` | owner only |
+| GET | `/api/billing/quote` | owner only |
+| GET | `/api/billing/coupon/validate` | owner only |
+| POST | `/api/billing/coupon/validate` | owner only |
+| POST | `/api/billing/checkout` | owner only |
+| POST | `/api/billing/checkout/cancel` | owner only |
+| POST | `/api/billing/verify` | owner only |
+| POST | `/api/billing/verify-order` | owner only |
+| GET | `/api/billing/invoices/:id/pdf` | owner only |
+| POST | `/api/billing/invoices/:id/resend` | owner only |
+| POST | `/api/billing/cancel` | owner only |
+| POST | `/api/billing/addon-checkout` | owner only |
+| POST | `/api/billing/addon-verify` | owner only |
+| POST | `/api/admin-auth/login` | public (no login; secured by token/signature) |
+| POST | `/api/admin-auth/refresh` | public (no login; secured by token/signature) |
+| POST | `/api/admin-auth/logout` | public (no login; secured by token/signature) |
+| GET | `/api/admin-auth/me` | public (no login; secured by token/signature) |
+| POST | `/api/admin-auth/change-password` | public (no login; secured by token/signature) |
+| GET | `/api/inbound/form/:key` | public (no login; secured by token/signature) |
+| POST | `/api/inbound/leads/:key` | public (no login; secured by token/signature) |
+| POST | `/api/inbound/google-ads/:key` | public (no login; secured by token/signature) |
+| GET | `/api/reports` | owner only |
+| GET | `/api/reports/budget` | owner only |
+| PATCH | `/api/reports/budget` | owner only |
+| POST | `/api/reports/budget/send` | owner only |
+| GET | `/api/quotes/public/:token` | public (no login; secured by token/signature) |
+| GET | `/api/quotes` | any of leads + whatsappLeads + inbox |
+| POST | `/api/quotes/preview` | any of leads + whatsappLeads + inbox |
+| POST | `/api/quotes` | needs leadEdit |
+| DELETE | `/api/quotes/:id` | needs leadEdit |
+| POST | `/api/quotes/:id/send-whatsapp` | needs chatReply |
+| GET | `/api/cp/me` | public (no login; secured by token/signature) |
+| GET | `/api/cp/me/leads` | public (no login; secured by token/signature) |
+| POST | `/api/cp/me/leads` | public (no login; secured by token/signature) |
+| GET | `/api/cp/me/inventory` | public (no login; secured by token/signature) |
+| GET | `/api/cp/:slug/info` | public (no login; secured by token/signature) |
+| POST | `/api/cp/:slug/register` | public (no login; secured by token/signature) |
+| POST | `/api/cp/:slug/login` | public (no login; secured by token/signature) |
+| GET | `/api/voice/settings` | owner only |
+| PATCH | `/api/voice/settings` | owner only |
+| GET | `/api/voice/calls` | owner only |
+| GET | `/api/voice/history` | owner only |
+| DELETE | `/api/voice/history/:id` | owner only |
+| DELETE | `/api/voice/history` | owner only |
+| GET | `/api/voice/leads` | owner only |
+| POST | `/api/voice/queue` | owner only |
+| POST | `/api/voice/queue/cancel` | owner only |
+| POST | `/api/voice/call/:leadId` | owner only |
+| POST | `/api/voice/test-call` | owner only |
+| GET | `/api/platform/stats` | public (no login; secured by token/signature) |
+| GET | `/api/platform/orgs` | public (no login; secured by token/signature) |
+| GET | `/api/platform/orgs/:id` | public (no login; secured by token/signature) |
+| PATCH | `/api/platform/orgs/:id` | public (no login; secured by token/signature) |
+| GET | `/api/platform/orgs/:id/email` | public (no login; secured by token/signature) |
+| POST | `/api/platform/orgs/:id/email-credit` | public (no login; secured by token/signature) |
+| POST | `/api/platform/orgs/:id/email-unpause` | public (no login; secured by token/signature) |
+| POST | `/api/platform/orgs/:id/payments` | public (no login; secured by token/signature) |
+| POST | `/api/platform/orgs/:id/support-session` | public (no login; secured by token/signature) |
+| GET | `/api/platform/payments` | public (no login; secured by token/signature) |
+| GET | `/api/platform/payments/:id/pdf` | public (no login; secured by token/signature) |
+| GET | `/api/platform/admins` | public (no login; secured by token/signature) |
+| POST | `/api/platform/admins` | public (no login; secured by token/signature) |
+| PATCH | `/api/platform/admins/:id` | public (no login; secured by token/signature) |
+| GET | `/api/platform/requests` | public (no login; secured by token/signature) |
+| PATCH | `/api/platform/requests/:id` | public (no login; secured by token/signature) |
+| GET | `/api/platform/activity` | public (no login; secured by token/signature) |
+| GET | `/api/platform/revenue` | public (no login; secured by token/signature) |
+| GET | `/api/platform/coupons` | public (no login; secured by token/signature) |
+| POST | `/api/platform/coupons` | public (no login; secured by token/signature) |
+| PATCH | `/api/platform/coupons/:id` | public (no login; secured by token/signature) |
+| POST | `/api/platform/coupons/:id/disable` | public (no login; secured by token/signature) |
+| GET | `/api/platform/coupons/:id/redemptions` | public (no login; secured by token/signature) |
+| GET | `/api/platform/plan-offers` | public (no login; secured by token/signature) |
+| PUT | `/api/platform/plan-offers` | public (no login; secured by token/signature) |
+| DELETE | `/api/platform/plan-offers/:id` | public (no login; secured by token/signature) |
+
+(Routes under /api/platform/* are protected by the separate platform-admin token (adminAuth), not by the tenant guards — the script lists them as 'public' only because it looks for tenant guards.)

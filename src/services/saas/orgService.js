@@ -171,16 +171,109 @@ async function incrementUsage(orgId, field, amount = 1) {
   // Bulk sends also feed a lifetime counter (used for the trial's total limit).
   if (field === "messagesSent" || field === "emailsSent")
     inc.bulkMessagesTotal = amount;
+  // Lifetime totals (the free trial's AI conversation / campaign limits).
+  if (field === "aiConversations" || field === "campaigns")
+    inc[`usageTotals.${field}`] = amount;
   await Organization.updateOne({ _id: orgId }, { $inc: inc });
   const updated = await Organization.findById(orgId)
-    .select("usage bulkMessagesTotal")
+    .select("usage bulkMessagesTotal usageTotals")
     .lean();
   const cached = byId.get(String(orgId));
   if (cached && updated) {
     cached.snap.usage = updated.usage;
     cached.snap.bulkMessagesTotal = updated.bulkMessagesTotal || 0;
+    cached.snap.usageTotals = updated.usageTotals || {};
   }
   return updated?.usage || null;
+}
+
+/** Starts a new month's counters when the stored month is old (cheap no-op otherwise). */
+async function rollMonth(orgId, month) {
+  await Organization.updateOne(
+    { _id: orgId, "usage.month": { $ne: month } },
+    {
+      $set: {
+        "usage.month": month,
+        "usage.aiConversations": 0,
+        "usage.messagesSent": 0,
+        "usage.campaigns": 0,
+        "usage.emailsSent": 0,
+        "usage.voiceMinutes": 0,
+      },
+    },
+  );
+}
+
+/**
+ * Bills AI calling minutes for a finished call.
+ *  - usage.voiceMinutes (the monthly report counter) always grows by the full
+ *    `billed` minutes, exactly like incrementUsage did.
+ *  - The part that the monthly plan allowance cannot cover is taken from the
+ *    recharged packs (org.voicePrepaidUsed, lifetime, capped at the pack
+ *    balance) — so a bought pack is really consumed and never "refills" on
+ *    the 1st of the month.
+ * Race-safe: the monthly $inc returns the value BEFORE this call (so two calls
+ * finishing together never share the same plan allowance), and the pack
+ * counter is moved with a compare-and-set that re-reads on conflict.
+ */
+async function consumeVoiceMinutes(orgId, billed) {
+  const minutes = Math.max(0, Math.floor(Number(billed) || 0));
+  if (!orgId || !minutes) return null;
+  const month = currentMonthIST();
+  await rollMonth(orgId, month);
+  const before = await Organization.findOneAndUpdate(
+    { _id: orgId },
+    { $inc: { "usage.voiceMinutes": minutes } },
+    { new: false, projection: "usage plan limitOverrides featureOverrides addonGrants voicePrepaidUsed" },
+  ).lean();
+  if (!before) return null;
+  const { splitVoiceMinutes } = require("./subscription"); // lazy: subscription requires this file
+  const split = splitVoiceMinutes(before, minutes);
+  let want = split.fromPack;
+  let taken = 0;
+  let current = split.packUsed;
+  for (let attempt = 0; attempt < 5 && want > 0; attempt += 1) {
+    const take = Math.min(want, Math.max(0, split.packPurchased - current));
+    if (take <= 0) break;
+    // eslint-disable-next-line no-await-in-loop
+    const res = await Organization.updateOne(
+      { _id: orgId, voicePrepaidUsed: current === 0 ? { $in: [0, null] } : current },
+      { $inc: { voicePrepaidUsed: take } },
+    );
+    if (res.modifiedCount) {
+      taken = take;
+      break;
+    }
+    // Someone else consumed pack minutes at the same moment: re-read and retry.
+    // eslint-disable-next-line no-await-in-loop
+    const latest = await Organization.findById(orgId).select("voicePrepaidUsed").lean();
+    current = Math.max(0, Number(latest?.voicePrepaidUsed) || 0);
+  }
+  const updated = await Organization.findById(orgId).select("usage voicePrepaidUsed").lean();
+  const cached = byId.get(String(orgId));
+  if (cached && updated) {
+    cached.snap.usage = updated.usage;
+    cached.snap.voicePrepaidUsed = updated.voicePrepaidUsed || 0;
+  }
+  return { billed: minutes, fromPlan: split.fromPlan, fromPack: taken, usage: updated?.usage || null };
+}
+
+/**
+ * The org snapshot with the live calling counters (the 30 s cache may lag
+ * behind calls that just finished, or on another server). Falls back to the
+ * given snapshot if the read fails.
+ */
+async function withFreshVoice(org) {
+  if (!org?._id) return org;
+  try {
+    const live = await Organization.findById(org._id)
+      .select("usage voicePrepaidUsed addonGrants limitOverrides featureOverrides plan status voice.paused")
+      .lean();
+    // `voice` is merged (the snapshot's other voice settings stay), only `paused` is refreshed.
+    return live ? { ...org, ...live, voice: { ...(org.voice || {}), ...(live.voice || {}) }, _id: org._id } : org;
+  } catch {
+    return org;
+  }
 }
 
 function usageFor(org) {
@@ -215,5 +308,7 @@ module.exports = {
   runForOwner,
   runForOrg,
   incrementUsage,
+  consumeVoiceMinutes,
+  withFreshVoice,
   usageFor,
 };

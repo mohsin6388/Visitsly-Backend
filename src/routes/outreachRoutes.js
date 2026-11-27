@@ -7,7 +7,7 @@ const validate = require("../middlewares/validate");
 const c = require("../controllers/campaignController");
 const { listJobsQuerySchema } = require("../validators/campaignValidators");
 
-router.use(authenticate, roleGuard("broker", "admin"), roleGuard.org('owner', 'manager')); // SaaS: agents can't run bulk sends or change settings
+router.use(authenticate, roleGuard("broker", "admin"), roleGuard.org('owner')); // SaaS: agents can't run bulk sends or change settings
 
 router.get("/summary", c.summary);
 router.get("/jobs", validate(listJobsQuerySchema), c.jobs);

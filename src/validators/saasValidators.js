@@ -1,6 +1,16 @@
 const { z } = require("zod");
 
-const orgRoles = z.enum(["manager", "agent"]);
+// Only Owner and Agent exist; teammates are always added as agents.
+const orgRoles = z.enum(["agent"]);
+const permissionsSchema = z
+  .object({
+    dashboard: z.boolean(), leads: z.boolean(), inbox: z.boolean(), whatsappLeads: z.boolean(),
+    siteVisits: z.boolean(), followUps: z.boolean(), properties: z.boolean(),
+    leadCreate: z.boolean(), leadImport: z.boolean(), leadEdit: z.boolean(), leadDelete: z.boolean(), chatReply: z.boolean(),
+    showFullPhone: z.boolean(),
+  })
+  .partial()
+  .strict();
 const planCode = z.enum(["starter", "growth", "builder", "enterprise"]);
 const cycle = z.enum(["monthly", "annual"]);
 
@@ -13,6 +23,37 @@ const updateOrgSchema = z.object({
     billingEmail: z.string().email().optional().or(z.literal("")),
     phone: z.string().trim().max(20).optional(),
     country: z.string().trim().toUpperCase().max(8).optional(),
+  }),
+});
+
+const countryCode = z
+  .string()
+  .trim()
+  .toUpperCase()
+  .refine((c) => require("../config/countries").isCountryCode(c), "Choose a valid country");
+
+// Onboarding wizard — final submit (PATCH /api/org/profile).
+const orgProfileSchema = z.object({
+  body: z.object({
+    ownerName: z.string().trim().min(2, "Enter your name").max(100),
+    companyName: z.string().trim().min(2, "Enter your company name").max(120),
+    country: countryCode,
+    city: z.string().trim().min(2, "Enter your city").max(80),
+    businessType: z.enum(["broker", "agency", "builder"], {
+      errorMap: () => ({ message: "Choose Broker, Agency or Builder" }),
+    }),
+  }),
+});
+
+// Onboarding wizard — answers saved after each step (PATCH /api/org/profile/draft).
+const orgProfileDraftSchema = z.object({
+  body: z.object({
+    ownerName: z.string().trim().max(100).optional(),
+    companyName: z.string().trim().max(120).optional(),
+    country: z.string().trim().toUpperCase().max(8).optional(),
+    city: z.string().trim().max(80).optional(),
+    businessType: z.enum(["broker", "agency", "builder", ""]).optional(),
+    step: z.number().int().min(0).max(10).optional(),
   }),
 });
 
@@ -47,9 +88,18 @@ const embeddedSignupCompleteSchema = z.object({
       .string()
       .regex(/^[a-f\d]{24}$/i, "Invalid or expired connection attempt"),
     phoneNumberId: z.string().trim().regex(/^\d+$/, "Invalid Phone Number ID"),
+    // Required for a NEW number; not used for coexistence (existing Business app number).
     pin: z
       .string()
-      .regex(/^\d{6}$/, "Registration PIN must be exactly 6 digits"),
+      .regex(/^\d{6}$/, "Registration PIN must be exactly 6 digits")
+      .optional(),
+  }),
+});
+
+const whatsappTestMessageSchema = z.object({
+  body: z.object({
+    phone: z.string().trim().min(8).max(20),
+    text: z.string().trim().max(500).optional(),
   }),
 });
 
@@ -68,17 +118,17 @@ const manualConnectSchema = z.object({
   body: z.object({
     // Lenient on input (people paste with spaces / "Bearer " / quotes); the
     // service cleans and validates properly with friendly messages.
-    accessToken: z.string().trim().min(20, "Access token adhoora lag raha hai — poora copy karke paste karein").max(2000),
+    accessToken: z.string().trim().min(20, "The access token looks incomplete — paste the full token").max(2000),
     phoneNumberId: z
       .string()
       .trim()
       .transform((v) => v.replace(/\D/g, ""))
-      .refine((v) => v.length >= 8, "Phone Number ID sahi nahi hai (sirf numbers, WhatsApp Manager → API Setup se copy karein)"),
+      .refine((v) => v.length >= 8, "Invalid Phone Number ID (digits only, from WhatsApp Manager → API Setup)"),
     businessAccountId: z
       .string()
       .trim()
       .transform((v) => v.replace(/\D/g, ""))
-      .refine((v) => v.length >= 8, "WhatsApp Business Account ID sahi nahi hai (sirf numbers)"),
+      .refine((v) => v.length >= 8, "Invalid WhatsApp Business Account ID (digits only)"),
   }),
 });
 
@@ -107,6 +157,7 @@ const inviteSchema = z.object({
     email: z.string().email(),
     phone: z.string().trim().max(20).optional(),
     orgRole: orgRoles.default("agent"),
+    permissions: permissionsSchema.optional(),
     password: z
       .string()
       .min(8)
@@ -118,25 +169,26 @@ const inviteSchema = z.object({
 
 const strongPassword = z
   .string()
-  .min(8, "Password kam se kam 8 characters ka ho")
+  .min(8, "Password must be at least 8 characters")
   .max(128)
-  .regex(/[A-Z]/, "Password mein ek capital letter (A-Z) hona chahiye")
-  .regex(/[0-9]/, "Password mein ek number (0-9) hona chahiye");
+  .regex(/[A-Z]/, "Password needs one capital letter (A-Z)")
+  .regex(/[0-9]/, "Password needs one number (0-9)");
 
 const bulkInviteSchema = z.object({
   body: z.object({
     members: z
       .array(
         z.object({
-          name: z.string().trim().min(2, "Naam likhein").max(100),
-          email: z.string().trim().email("Email sahi nahi hai"),
+          name: z.string().trim().min(2, "Enter a name").max(100),
+          email: z.string().trim().email("Invalid email"),
           phone: z.string().trim().max(20).optional().or(z.literal("")),
-          orgRole: z.enum(["manager", "agent"]).default("agent"),
+          orgRole: orgRoles.default("agent"),
+          permissions: permissionsSchema.optional(),
           password: strongPassword.optional().or(z.literal("").transform(() => undefined)),
         }),
       )
-      .min(1, "Kam se kam ek teammate add karein")
-      .max(50, "Ek baar mein 50 tak teammates add karein"),
+      .min(1, "Add at least one teammate")
+      .max(50, "Add up to 50 teammates at a time"),
   }),
 });
 
@@ -150,6 +202,7 @@ const updateMemberSchema = z.object({
   body: z.object({
     name: z.string().trim().min(2).max(100).optional(),
     orgRole: orgRoles.optional(),
+    permissions: permissionsSchema.optional(),
     isActive: z.boolean().optional(),
   }),
 });
@@ -158,12 +211,69 @@ const memberIdSchema = z.object({
   params: z.object({ id: z.string().regex(/^[a-f\d]{24}$/i) }),
 });
 
+const couponCodeField = z.string().trim().min(1).max(40);
+
 const checkoutSchema = z.object({
-  body: z.object({ plan: planCode, cycle: cycle.default("monthly") }),
+  body: z.object({ plan: planCode, cycle: cycle.default("monthly"), coupon: couponCodeField.optional() }),
 });
 
 const quoteSchema = z.object({
-  query: z.object({ plan: planCode, cycle: cycle.default("monthly") }),
+  query: z.object({ plan: planCode, cycle: cycle.default("monthly"), coupon: couponCodeField.optional() }),
+});
+
+// GET (query) or POST (body) /api/billing/coupon/validate — the controller reads whichever carries the data.
+const couponValidateSchema = z.object({
+  body: z.object({ code: couponCodeField, plan: planCode, cycle: cycle.default("monthly") }),
+});
+const couponValidateQuerySchema = z.object({
+  query: z.object({ code: couponCodeField, plan: planCode, cycle: cycle.default("monthly") }),
+});
+
+const checkoutAbandonSchema = z.object({
+  body: z.object({ orderId: z.string().max(60).optional(), subscriptionId: z.string().max(60).optional() }),
+});
+
+/* ---- Platform (admin panel): coupons + plan offers ---- */
+const isoDate = z.preprocess((v) => (v === "" || v === undefined ? null : v), z.coerce.date().nullable());
+const couponBody = z.object({
+  code: z.string().trim().min(3).max(40).regex(/^[A-Za-z0-9_-]+$/, "Use letters, numbers, - or _ only"),
+  description: z.string().max(200).optional(),
+  type: z.enum(["percent", "flat"]),
+  value: z.number().positive(),
+  currency: z.enum(["INR", "AED", "USD"]).nullable().optional(),
+  validFrom: isoDate.optional(),
+  validUntil: isoDate.optional(),
+  maxRedemptions: z.number().int().min(1).nullable().optional(),
+  perOrgLimit: z.number().int().min(1).max(100).optional(),
+  applicablePlans: z.array(z.enum(["starter", "growth", "builder"])).optional(),
+  applicableCycles: z.array(z.enum(["monthly", "annual"])).optional(),
+  active: z.boolean().optional(),
+  appliesTo: z.enum(["first", "all"]).optional(),
+});
+const couponRules = (b, ctx) => {
+  if (b.type === "percent" && b.value !== undefined && b.value > 100) ctx.addIssue({ code: "custom", path: ["value"], message: "A percent coupon can be at most 100" });
+  if (b.type === "flat" && !b.currency) ctx.addIssue({ code: "custom", path: ["currency"], message: "A flat coupon needs a currency" });
+  if (b.validFrom && b.validUntil && b.validFrom > b.validUntil) ctx.addIssue({ code: "custom", path: ["validUntil"], message: "validUntil must be after validFrom" });
+};
+const couponCreateSchema = z.object({ body: couponBody.superRefine(couponRules) });
+const couponUpdateSchema = z.object({
+  params: z.object({ id: z.string().regex(/^[a-f\d]{24}$/i) }),
+  body: couponBody.omit({ code: true }).partial().superRefine((b, ctx) => {
+    if (b.type === "percent" && b.value !== undefined && b.value > 100) ctx.addIssue({ code: "custom", path: ["value"], message: "A percent coupon can be at most 100" });
+    if (b.validFrom && b.validUntil && b.validFrom > b.validUntil) ctx.addIssue({ code: "custom", path: ["validUntil"], message: "validUntil must be after validFrom" });
+  }),
+});
+const planOfferSetSchema = z.object({
+  body: z.object({
+    plan: z.enum(["starter", "growth", "builder"]),
+    cycle: cycle,
+    currency: z.enum(["INR", "AED", "USD"]).default("INR"),
+    offerPrice: z.number().positive(),
+    label: z.string().max(60).optional(),
+    validFrom: isoDate.optional(),
+    validUntil: isoDate.optional(),
+    active: z.boolean().optional(),
+  }),
 });
 
 const verifySchema = z.object({
@@ -198,10 +308,18 @@ const platformUpdateSchema = z.object({
         campaignsPerMonth: limitValue,
         bulkMessages: limitValue,
         aiRepliesPerContact: limitValue,
+        voiceMinutesIncluded: limitValue,
       })
       .nullable()
       .optional(),
     priceOverride: z.number().int().min(0).nullable().optional(),
+    // Billing country (sets the currency). Customers can't change it after
+    // onboarding; only the platform admin can.
+    country: countryCode.optional(),
+    featureOverrides: z
+      .record(z.string().max(40), z.boolean().nullable())
+      .nullable()
+      .optional(),
     notes: z.string().max(5000).optional(),
     addons: z
       .object({
@@ -237,7 +355,7 @@ const adminCreateSchema = z.object({
     email: z.string().email(),
     password: z
       .string()
-      .min(10, "Admin password kam se kam 10 characters")
+      .min(10, "Admin password must be at least 10 characters")
       .regex(/[A-Z]/)
       .regex(/[0-9]/),
   }),
@@ -310,10 +428,13 @@ module.exports = {
   requestUpdateSchema,
   customerRequestSchema,
   updateOrgSchema,
+  orgProfileSchema,
+  orgProfileDraftSchema,
   onboardingSchema,
   embeddedSignupSchema,
   embeddedSignupPrepareSchema,
   embeddedSignupCompleteSchema,
+  whatsappTestMessageSchema,
   manualConnectSchema,
   openingTemplateSchema,
   inviteSchema,
@@ -323,6 +444,12 @@ module.exports = {
   memberIdSchema,
   checkoutSchema,
   quoteSchema,
+  couponValidateSchema,
+  couponValidateQuerySchema,
+  checkoutAbandonSchema,
+  couponCreateSchema,
+  couponUpdateSchema,
+  planOfferSetSchema,
   verifySchema,
   platformUpdateSchema,
   offlinePaymentSchema,

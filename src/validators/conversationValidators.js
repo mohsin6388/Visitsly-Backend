@@ -39,7 +39,7 @@ const mediaParamSchema = z.object({
 
 const sendManualReplySchema = z.object({
   params: z.object({ id: objectId }),
-  body: z.object({ text: z.string().trim().min(1, 'Message likhein').max(4096, 'Message bahut lamba hai (4096 characters tak)') }),
+  body: z.object({ text: z.string().trim().min(1, 'Type a message').max(4096, 'Message is too long (max 4096 characters)') }),
 });
 
 const propertyMediaSchema = z.object({
@@ -47,7 +47,17 @@ const propertyMediaSchema = z.object({
   body: z.object({ propertyId: objectId, kind: z.enum(['brochure', 'photos']) }),
 });
 
+const LANGUAGES = require('../services/language/languages').NAMES;
+
+// language: one of the supported languages, or null = back to automatic.
+const setLanguageSchema = z.object({
+  params: z.object({ id: objectId }),
+  body: z.object({ language: z.enum(LANGUAGES).nullable() }),
+  query: z.object({ ownerId: objectId.optional() }).optional(),
+});
+
 module.exports = {
+  setLanguageSchema,
   listConversationsSchema,
   getConversationSchema,
   idParamSchema,

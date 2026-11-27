@@ -19,7 +19,7 @@ function defaultsFor(orgId) {
     ...(orgId ? { orgId } : {}),
     companyName: name || '',
     openingText: name
-      ? `Namaste! Thank you for your interest in ${name}. Main aapki property search mein help kar sakta/sakti hoon. Aap kis type ki property dekh rahe hain?`
+      ? `Hi! Thank you for your interest in ${name}. I can help with your property search. What kind of property are you looking for?`
       : '',
   };
 }
@@ -47,8 +47,13 @@ async function getPublicSettings(orgId) {
   const settings = await getOrCreateSettings(orgId);
   const withKey = await Settings.findOne(scope(orgId)).select('+geminiApiKeyEncrypted');
 
+  const obj = settings.toObject();
+  // Never send the DND API key back to the browser — only whether one is saved.
+  if (obj.calling?.dnd) {
+    obj.calling = { ...obj.calling, dnd: { ...obj.calling.dnd, apiKey: '', apiKeySet: Boolean(obj.calling.dnd.apiKey) } };
+  }
   return {
-    ...settings.toObject(),
+    ...obj,
     geminiApiKeyEncrypted: undefined,
     geminiKeyConfigured: !!withKey?.geminiApiKeyEncrypted,
   };

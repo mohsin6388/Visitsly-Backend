@@ -5,6 +5,8 @@ const env = require('../config/env');
 const tenantContext = require('../context/tenantContext');
 const orgService = require('../services/saas/orgService');
 const { subscriptionState } = require('../services/saas/subscription');
+const { normalizeOrgRole, permissionsFor } = require('../services/saas/permissions');
+const agentScope = require('../services/saas/agentScope');
 
 // Routes a company can still use when its trial/subscription has lapsed, so
 // it can pay, manage the team, or read and export its data.
@@ -66,7 +68,7 @@ const authenticate = async (req, res, next) => {
 
     if (!orgId) {
       throw ApiError.unauthorized(isSuperAdmin(user)
-        ? 'PropAI admin login admin panel se karein'
+        ? 'Admins must log in from the admin panel'
         : 'This login is not linked to any company');
     }
 
@@ -76,17 +78,27 @@ const authenticate = async (req, res, next) => {
     const tenantRole = user.role === 'admin' ? 'broker' : user.role; // 'admin' would bypass owner scoping
     req.org = org;
     req.subscription = subscriptionState(org);
+    // Only Owner and Agent exist; a legacy 'manager' is treated as 'agent' (lower privilege).
+    const orgRole = support ? 'owner' : normalizeOrgRole(user.orgRole || 'owner');
     req.user = {
       id: org.ownerUserId,
       actorId: user._id.toString(),
       role: tenantRole,
-      orgRole: support ? 'owner' : user.orgRole || 'owner',
+      orgRole,
+      permissions: permissionsFor({ orgRole, permissions: user.permissions }),
       isSuperAdmin: false,
       impersonating: support,
       email: user.email,
       name: user.name,
       tenant: true,
     };
+
+    // Agents without "show full phone" only ever receive the last 4 digits, in every JSON response.
+    // (Not on /api/auth: that is the person's own profile.)
+    if (agentScope.mustMask(req) && !String(req.originalUrl || '').startsWith('/api/auth')) {
+      const json = res.json.bind(res);
+      res.json = (body) => json(agentScope.maskPayload(body));
+    }
 
     const path = req.originalUrl || '';
     const readOnly = ['GET', 'HEAD', 'OPTIONS'].includes(req.method);

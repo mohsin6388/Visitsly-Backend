@@ -13,6 +13,7 @@ const { orgSummary } = require('../services/saas/orgSummary');
 const whatsappConnect = require('../services/saas/whatsappConnect');
 const openingTemplateService = require('../services/whatsapp/openingTemplateService');
 const { assertWithinLimit } = require('../services/saas/subscription');
+const { teamAvailable, sanitizePermissions, permissionsFor } = require('../services/saas/permissions');
 const logger = require('../utils/logger');
 
 function requireOrg(req) {
@@ -42,19 +43,23 @@ const getOrg = asyncHandler(async (req, res) => {
   return new ApiResponse(200, { org: await orgSummary(org) }).send(res);
 });
 
-/** PATCH /api/org — company profile (owner/manager). */
+/** PATCH /api/org — company profile (owner only). */
 const updateOrg = asyncHandler(async (req, res) => {
   const org = requireOrg(req);
   const allowed = ['name', 'city', 'businessType', 'gstin', 'billingEmail', 'phone'];
   const $set = {};
   for (const key of allowed) if (req.body[key] !== undefined) $set[key] = req.body[key];
   if ($set.name) $set['onboarding.companyDone'] = true;
-  // Billing country decides the currency. Not changeable while a paid
-  // subscription is running (the Razorpay plan is in the old currency).
+  // Billing country decides the currency (what Razorpay charges). It is fixed
+  // once onboarding is done; after that only a platform admin can change it.
   if (req.body.country && String(req.body.country).toUpperCase() !== String(org.country || 'IN').toUpperCase()) {
-    if (org.status === 'active' && org.razorpay?.subscriptionId) {
-      throw ApiError.badRequest('Active subscription ke dauran billing country nahi badal sakte. Support se baat karein.');
+    if (org.onboarding?.profileDone !== false) {
+      throw new ApiError(403, 'Country and billing currency can’t be changed after setup. Contact support if this is wrong.', { code: 'COUNTRY_LOCKED' });
     }
+    if (org.status === 'active' && org.razorpay?.subscriptionId) {
+      throw ApiError.badRequest('Billing country can’t be changed during an active subscription. Contact support.');
+    }
+    if (!require('../config/countries').isCountryCode(req.body.country)) throw ApiError.badRequest('Choose a valid country');
     $set.country = String(req.body.country).toUpperCase();
     $set.currency = require('../config/pricing').currencyForCountry($set.country);
   }
@@ -65,6 +70,87 @@ const updateOrg = asyncHandler(async (req, res) => {
     await require('../models/Settings').updateOne({ orgId: org._id }, { $set: { companyName: $set.name } });
   }
   return new ApiResponse(200, { org: await freshSummary(org._id) }, 'Company profile updated').send(res);
+});
+
+/**
+ * PATCH /api/org/profile — onboarding wizard submit (owner only).
+ * Saves the owner's name and the company profile, fixes the billing country
+ * and currency, and marks the wizard done. Once done, the country can only
+ * be changed by a platform admin.
+ */
+const updateProfile = asyncHandler(async (req, res) => {
+  const org = requireOrg(req);
+  const { ownerName, companyName, city, businessType } = req.body;
+  const country = String(req.body.country).toUpperCase();
+  const pricing = require('../config/pricing');
+  const Settings = require('../models/Settings');
+  const { defaultOpeningText, PLACEHOLDER_COMPANY } = require('./authController');
+
+  const current = await Organization.findById(org._id).select('name country currency onboarding status razorpay').lean();
+  if (!current) throw ApiError.notFound('Company not found');
+  const alreadyDone = current.onboarding?.profileDone !== false;
+  const countryChanged = country !== String(current.country || 'IN').toUpperCase();
+  if (alreadyDone && countryChanged) {
+    throw new ApiError(403, 'Country and billing currency can’t be changed after setup. Contact support if this is wrong.', { code: 'COUNTRY_LOCKED' });
+  }
+
+  const $set = {
+    name: companyName,
+    city,
+    businessType,
+    'onboarding.companyDone': true,
+    'onboarding.profileDone': true,
+  };
+  if (!alreadyDone) {
+    // First completion: country + currency become final here.
+    $set.country = country;
+    $set.currency = pricing.currencyForCountry(country);
+    $set['onboarding.profileCompletedAt'] = new Date();
+    $set['onboarding.profileDraft'] = { ownerName: '', companyName: '', country: '', city: '', businessType: '', step: 0 };
+  }
+  await Organization.updateOne({ _id: org._id }, { $set });
+
+  // The owner's own name (req.user.actorId = the real logged-in person).
+  await User.updateOne({ _id: req.user.actorId, orgId: org._id }, { $set: { name: ownerName } });
+
+  // Keep the AI's company name in sync; refresh the opening text if it still
+  // mentions the signup placeholder / the previous company name.
+  const settings = await Settings.findOne({ orgId: org._id }).select('companyName openingText').lean();
+  if (settings) {
+    const patch = { companyName };
+    const previous = [PLACEHOLDER_COMPANY, current.name, settings.companyName].filter(Boolean);
+    if (!settings.openingText || previous.some((n) => settings.openingText === defaultOpeningText(n))) {
+      patch.openingText = defaultOpeningText(companyName);
+    }
+    await Settings.updateOne({ orgId: org._id }, { $set: patch });
+  }
+
+  orgService.invalidate(org._id);
+  await AuditLog.create({
+    orgId: org._id,
+    userId: req.user.actorId,
+    action: 'org.profile',
+    entityType: 'Organization',
+    entityId: org._id,
+    meta: { ownerName, companyName, country: alreadyDone ? current.country : country, city, businessType, currency: alreadyDone ? current.currency : $set.currency, firstCompletion: !alreadyDone },
+    ip: req.ip,
+  });
+  return new ApiResponse(200, { org: await freshSummary(org._id) }, 'Profile saved').send(res);
+});
+
+/** PATCH /api/org/profile/draft — save wizard answers after each step (resume later). */
+const saveProfileDraft = asyncHandler(async (req, res) => {
+  const org = requireOrg(req);
+  if (org.onboarding?.profileDone !== false) {
+    return new ApiResponse(200, { saved: false }, 'Profile already completed').send(res);
+  }
+  const $set = {};
+  for (const key of ['ownerName', 'companyName', 'country', 'city', 'businessType', 'step']) {
+    if (req.body[key] !== undefined) $set[`onboarding.profileDraft.${key}`] = req.body[key];
+  }
+  if (Object.keys($set).length) await Organization.updateOne({ _id: org._id, 'onboarding.profileDone': false }, { $set });
+  orgService.invalidate(org._id);
+  return new ApiResponse(200, { saved: true }).send(res);
 });
 
 /** PATCH /api/org/onboarding — tick or dismiss checklist items. */
@@ -97,7 +183,7 @@ const whatsappHealth = asyncHandler(async (req, res) => {
 const fixWhatsappWebhook = asyncHandler(async (req, res) => {
   const org = requireOrg(req);
   const health = await whatsappConnect.resubscribeWebhook(org._id);
-  return new ApiResponse(200, { health }, 'Webhook dobara jod diya gaya').send(res);
+  return new ApiResponse(200, { health }, 'Webhook reconnected').send(res);
 });
 
 const connectEmbedded = asyncHandler(async (req, res) => {
@@ -153,6 +239,23 @@ const connectManual = asyncHandler(async (req, res) => {
     .catch((err) => logger.warn('[org] WhatsApp connected but audit log could not be written', { organizationId: String(org._id), error: err.message }));
   const fresh = await orgService.getSnapshot(org._id, { fresh: true });
   return new ApiResponse(200, { whatsapp: whatsappConnect.publicView(fresh) }, 'WhatsApp connected').send(res);
+});
+
+/** POST /api/org/whatsapp/test-message — send a test message to the owner's own number. */
+const sendWhatsappTestMessage = asyncHandler(async (req, res) => {
+  const org = requireOrg(req);
+  const result = await whatsappConnect.sendTestMessage(org._id, req.body);
+  await AuditLog.create({ userId: req.user.actorId, action: 'org.whatsapp.test_message', ip: req.ip }).catch(() => {});
+  const fresh = await orgService.getSnapshot(org._id, { fresh: true });
+  return new ApiResponse(200, { ...result, whatsapp: whatsappConnect.publicView(fresh) }, 'Test message sent').send(res);
+});
+
+/** POST /api/org/whatsapp/coexistence/sync — (re)request contacts + chat history sync (24h window). */
+const retryCoexistenceSync = asyncHandler(async (req, res) => {
+  const org = requireOrg(req);
+  await whatsappConnect.startCoexistenceSync(org._id);
+  const fresh = await orgService.getSnapshot(org._id, { fresh: true });
+  return new ApiResponse(200, { whatsapp: whatsappConnect.publicView(fresh) }, 'Sync requested').send(res);
 });
 
 const disconnectWhatsapp = asyncHandler(async (req, res) => {
@@ -226,14 +329,14 @@ const addNumber = asyncHandler(async (req, res) => {
   const org = requireOrg(req);
   await whatsappConnect.addNumber(org._id, req.body);
   const fresh = await orgService.getSnapshot(org._id, { fresh: true });
-  return new ApiResponse(201, { whatsapp: whatsappConnect.publicView(fresh) }, 'Number add ho gaya').send(res);
+  return new ApiResponse(201, { whatsapp: whatsappConnect.publicView(fresh) }, 'Number added').send(res);
 });
 
 const removeNumber = asyncHandler(async (req, res) => {
   const org = requireOrg(req);
   await whatsappConnect.removeNumber(org._id, req.params.phoneNumberId);
   const fresh = await orgService.getSnapshot(org._id, { fresh: true });
-  return new ApiResponse(200, { whatsapp: whatsappConnect.publicView(fresh) }, 'Number hata diya').send(res);
+  return new ApiResponse(200, { whatsapp: whatsappConnect.publicView(fresh) }, 'Number removed').send(res);
 });
 
 /* ---------------- Team ---------------- */
@@ -244,7 +347,8 @@ function teamRow(u) {
     name: u.name,
     email: u.email,
     phone: u.phone || '',
-    orgRole: u.orgRole || 'agent',
+    orgRole: u.orgRole === 'owner' ? 'owner' : 'agent',
+    permissions: permissionsFor(u),
     isActive: u.isActive,
     lastLoginAt: u.lastLoginAt,
     mustChangePassword: !!u.mustChangePassword,
@@ -258,6 +362,16 @@ const listTeam = asyncHandler(async (req, res) => {
   return new ApiResponse(200, { items: users.map(teamRow) }).send(res);
 });
 
+/** Starter/Trial have no team. Raised before any seat maths so the message is clear. */
+function assertTeamPlan(org) {
+  if (!teamAvailable(org)) throw ApiError.forbidden('Team members are available on Growth and above', { code: 'PLAN_LIMIT', key: 'team', requiredPlan: 'growth' });
+}
+
+/** Only the Owner manages the team (the route guard already checks; this keeps the controller safe on its own). */
+function assertOwner(req) {
+  if (req.user.orgRole !== 'owner') throw ApiError.forbidden('Only the company owner can manage the team');
+}
+
 function tempPassword() {
   return `Prop${crypto.randomBytes(4).toString('hex')}9A`;
 }
@@ -265,14 +379,15 @@ function tempPassword() {
 const inviteMember = asyncHandler(async (req, res) => {
   const org = requireOrg(req);
   const email = String(req.body.email).trim().toLowerCase();
-  const orgRole = req.body.orgRole || 'agent';
-  if (orgRole === 'owner') throw ApiError.badRequest('Company mein ek hi owner hota hai');
-  if (req.user.orgRole !== 'owner' && orgRole === 'manager') throw ApiError.forbidden('Manager sirf owner bana sakta hai');
+  assertOwner(req);
+  assertTeamPlan(org);
+  const orgRole = 'agent';
 
+  // Seat limit includes the owner (Growth 5, Builder 10, Enterprise unlimited; env + admin overrides apply).
   const activeUsers = await User.countDocuments({ orgId: org._id, isActive: true });
   assertWithinLimit('users', activeUsers, 1);
 
-  if (await User.exists({ email })) throw ApiError.conflict('Is email se pehle se ek PropAI login hai');
+  if (await User.exists({ email })) throw ApiError.conflict('A login already exists for this email');
 
   const password = req.body.password || tempPassword();
   const user = new User({
@@ -282,20 +397,21 @@ const inviteMember = asyncHandler(async (req, res) => {
     role: 'broker',
     orgId: org._id,
     orgRole,
+    permissions: sanitizePermissions(req.body.permissions),
     mustChangePassword: !req.body.password,
   });
   user.setPassword(password);
   await user.save();
 
-  await AuditLog.create({ userId: req.user.actorId, action: 'org.team.invite', entityType: 'User', entityId: user._id, meta: { email, orgRole }, ip: req.ip });
+  await AuditLog.create({ userId: req.user.actorId, action: 'org.team.invite', entityType: 'User', entityId: user._id, meta: { email, orgRole, permissions: permissionsFor(user) }, ip: req.ip });
 
   // Best-effort invite email (also returned once so the owner can share it on WhatsApp).
   try {
     const { sendDirectEmail } = require('../services/email/mailer');
     await sendDirectEmail({
       to: email,
-      subject: `${org.name} ne aapko ${env.saas.productName} par add kiya hai`,
-      text: `Namaste ${req.body.name},\n\n${org.name} ne aapko ${env.saas.productName} CRM par add kiya hai.\n\nLogin: ${env.appBaseUrl}/login\nEmail: ${email}\nPassword: ${password}\n\nPehli baar login ke baad password badal lijiye.`,
+      subject: `${org.name} added you to ${env.saas.productName}`,
+      text: `Hi ${req.body.name},\n\n${org.name} added you to ${env.saas.productName} CRM.\n\nLogin: ${env.appBaseUrl}/login\nEmail: ${email}\nPassword: ${password}\n\nPlease change your password after your first login.`,
     });
   } catch (err) {
     logger.info('[team] Invite email not sent', { error: err.message });
@@ -315,16 +431,17 @@ const inviteMember = asyncHandler(async (req, res) => {
  */
 const bulkInvite = asyncHandler(async (req, res) => {
   const org = requireOrg(req);
+  assertOwner(req);
+  assertTeamPlan(org);
   const rows = Array.isArray(req.body.members) ? req.body.members : [];
   const results = [];
   let active = await User.countDocuments({ orgId: org._id, isActive: true });
   for (const row of rows) {
     const email = String(row.email || '').trim().toLowerCase();
-    const orgRole = row.orgRole === 'manager' ? 'manager' : 'agent';
+    const orgRole = 'agent';
     try {
-      if (orgRole === 'manager' && req.user.orgRole !== 'owner') throw ApiError.forbidden('Manager sirf owner bana sakta hai');
       assertWithinLimit('users', active, 1);
-      if (await User.exists({ email })) throw ApiError.conflict('Is email se pehle se login bana hua hai');
+      if (await User.exists({ email })) throw ApiError.conflict('A login already exists for this email');
       const password = row.password || tempPassword();
       const user = new User({
         name: String(row.name).trim(),
@@ -333,42 +450,44 @@ const bulkInvite = asyncHandler(async (req, res) => {
         role: 'broker',
         orgId: org._id,
         orgRole,
+        permissions: sanitizePermissions(row.permissions),
         mustChangePassword: !row.password,
       });
       user.setPassword(password);
       await user.save();
       active += 1;
-      await AuditLog.create({ userId: req.user.actorId, action: 'org.team.invite', entityType: 'User', entityId: user._id, meta: { email, orgRole, bulk: true }, ip: req.ip });
+      await AuditLog.create({ userId: req.user.actorId, action: 'org.team.invite', entityType: 'User', entityId: user._id, meta: { email, orgRole, bulk: true, permissions: permissionsFor(user) }, ip: req.ip });
       try {
         const { sendDirectEmail } = require('../services/email/mailer');
         await sendDirectEmail({
           to: email,
-          subject: `${org.name} ne aapko ${env.saas.productName} par add kiya hai`,
-          text: `Namaste ${row.name},\n\n${org.name} ne aapko ${env.saas.productName} CRM par add kiya hai.\n\nLogin: ${env.appBaseUrl}/login\nEmail: ${email}\nPassword: ${password}\n\nLogin ke baad password badal sakte hain.`,
+          subject: `${org.name} added you to ${env.saas.productName}`,
+          text: `Hi ${row.name},\n\n${org.name} added you to ${env.saas.productName} CRM.\n\nLogin: ${env.appBaseUrl}/login\nEmail: ${email}\nPassword: ${password}\n\nYou can change your password after logging in.`,
         });
       } catch (err) {
         logger.info('[team] Invite email not sent', { error: err.message });
       }
       results.push({ ok: true, email, name: user.name, member: teamRow(user), password });
     } catch (err) {
-      results.push({ ok: false, email, name: row.name, error: err.message || 'Add nahi hua' });
+      results.push({ ok: false, email, name: row.name, error: err.message || 'Could not add' });
     }
   }
   const added = results.filter((r) => r.ok).length;
-  return new ApiResponse(201, { results, loginUrl: `${env.appBaseUrl}/login` }, `${added} teammate add hue${added < results.length ? `, ${results.length - added} nahi hue` : ''}`).send(res);
+  return new ApiResponse(201, { results, loginUrl: `${env.appBaseUrl}/login` }, `${added} teammate(s) added${added < results.length ? `, ${results.length - added} failed` : ''}`).send(res);
 });
 
-/** POST /api/org/team/:id/set-password — owner/manager sets a chosen password. */
+/** POST /api/org/team/:id/set-password — owner sets a chosen password. */
 const setMemberPassword = asyncHandler(async (req, res) => {
+  assertOwner(req);
   const member = await findMember(req);
-  if (member.orgRole === 'owner' && String(member._id) !== req.user.actorId) throw ApiError.forbidden('Owner ka password sirf owner badal sakta hai');
+  if (member.orgRole === 'owner' && String(member._id) !== req.user.actorId) throw ApiError.forbidden('Only the owner can change the owner’s password');
   member.setPassword(req.body.password);
   member.mustChangePassword = false;
   member.tokenVersion += 1;
   member.refreshTokenHash = null;
   await member.save();
   await AuditLog.create({ userId: req.user.actorId, action: 'org.team.set_password', entityType: 'User', entityId: member._id, ip: req.ip });
-  return new ApiResponse(200, {}, 'Password set ho gaya').send(res);
+  return new ApiResponse(200, {}, 'Password set').send(res);
 });
 
 async function findMember(req) {
@@ -379,12 +498,15 @@ async function findMember(req) {
 }
 
 const updateMember = asyncHandler(async (req, res) => {
+  assertOwner(req);
   const member = await findMember(req);
-  if (member.orgRole === 'owner') throw ApiError.badRequest('Owner ka role ya status yahan se nahi badalta');
-  if (req.body.orgRole) {
-    if (req.body.orgRole === 'owner') throw ApiError.badRequest('Ownership transfer ke liye support se baat karein');
-    if (req.user.orgRole !== 'owner' && req.body.orgRole === 'manager') throw ApiError.forbidden('Manager sirf owner bana sakta hai');
-    member.orgRole = req.body.orgRole;
+  // The owner can't be deactivated, demoted or have permissions edited.
+  if (member.orgRole === 'owner') throw ApiError.badRequest('The owner can’t be deactivated, changed or have permissions edited');
+  const before = permissionsFor(member);
+  if (req.body.orgRole) member.orgRole = 'agent';
+  if (member.orgRole === 'manager') member.orgRole = 'agent'; // legacy value → agent on first edit
+  if (req.body.permissions) {
+    member.permissions = { ...(member.permissions?.toObject?.() || {}), ...sanitizePermissions(req.body.permissions) };
   }
   if (typeof req.body.isActive === 'boolean') {
     if (req.body.isActive && !member.isActive) {
@@ -399,13 +521,19 @@ const updateMember = asyncHandler(async (req, res) => {
   if (req.body.name) member.name = req.body.name;
   await member.save();
   await AuditLog.create({ userId: req.user.actorId, action: 'org.team.update', entityType: 'User', entityId: member._id, meta: req.body, ip: req.ip });
+  if (req.body.permissions) {
+    const after = permissionsFor(member);
+    const changed = Object.fromEntries(Object.keys(after).filter((k) => before[k] !== after[k]).map((k) => [k, { from: before[k], to: after[k] }]));
+    await AuditLog.create({ userId: req.user.actorId, action: 'org.team.permissions', entityType: 'User', entityId: member._id, meta: { changed }, ip: req.ip });
+  }
   return new ApiResponse(200, { member: teamRow(member) }, 'Team member updated').send(res);
 });
 
 const resetMemberPassword = asyncHandler(async (req, res) => {
+  assertOwner(req);
   const member = await findMember(req);
   if (member.orgRole === 'owner' && String(member._id) !== req.user.actorId) {
-    throw ApiError.forbidden('Owner ka password sirf owner badal sakta hai');
+    throw ApiError.forbidden('Only the owner can change the owner’s password');
   }
   const password = tempPassword();
   member.setPassword(password);
@@ -421,6 +549,8 @@ module.exports = {
   removeNumber,
   getOrg,
   updateOrg,
+  updateProfile,
+  saveProfileDraft,
   updateOnboarding,
   getWhatsapp,
   whatsappHealth,
@@ -432,6 +562,8 @@ module.exports = {
   completeEmbeddedSignup,
   connectManual,
   disconnectWhatsapp,
+  sendWhatsappTestMessage,
+  retryCoexistenceSync,
   updateOpeningTemplate,
   listOpeningTemplateOptions,
   listTeam,

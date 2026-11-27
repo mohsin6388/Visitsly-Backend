@@ -412,4 +412,4 @@ happened to trigger `catchUpPendingConversations` again.
 
 ## Bulk email and reply tracking
 
-Bulk and transactional email uses Brevo HTTP API (not Gmail SMTP). Configure `BREVO_API_KEY`, `BREVO_FROM_EMAIL`, `BREVO_FROM_NAME`, and `EMAIL_REPLY_TO`; for in-dashboard replies configure `EMAIL_INBOUND_DOMAIN` and `BREVO_WEBHOOK_SECRET` along with Brevo sender authentication, inbound MX records, and transactional/inbound webhooks. See [`EMAIL_SETUP.md`](./EMAIL_SETUP.md). Existing production MongoDB installs should run `npm run migrate:lead-contact-indexes` once after a backup before creating email-only leads.
+Bulk (per-company verified sender) and transactional email use the Brevo HTTP API — see EMAIL_SETUP.md. Configure `BREVO_API_KEY`, `BREVO_FROM_EMAIL`, `BREVO_FROM_NAME`, and `EMAIL_REPLY_TO`; for in-dashboard replies configure `EMAIL_INBOUND_DOMAIN` and `BREVO_WEBHOOK_SECRET` along with Brevo sender authentication, inbound MX records, and transactional/inbound webhooks. See [`EMAIL_SETUP.md`](./EMAIL_SETUP.md). Existing production MongoDB installs should run `npm run migrate:lead-contact-indexes` once after a backup before creating email-only leads.

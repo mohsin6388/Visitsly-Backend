@@ -16,6 +16,7 @@ const { recordOutboundMessage } = require("../services/whatsapp/messageStore");
 const { aiReplyLimitInfo } = require("../services/saas/subscription");
 const tenantContext = require("../context/tenantContext");
 const logger = require("../utils/logger");
+const agentScope = require("../services/saas/agentScope");
 
 /** Brokers see only their own conversations; admins may pass ?ownerId= to inspect a specific broker. */
 function scopeOwnerId(req) {
@@ -72,8 +73,10 @@ const listConversations = asyncHandler(async (req, res) => {
     match.lastMessageDirection = "inbound";
   }
   if (leadId) match.leadId = oid(leadId);
-  if (req.user.orgRole === "agent" && req.org?.routing?.agentsSeeOnlyAssigned) {
-    match.assignedTo = oid(req.user.actorId);
+  // Agents only see chats of leads assigned to them (always on).
+  if (agentScope.isAgent(req)) {
+    const ids = await agentScope.assignedLeadIds(req);
+    match.leadId = leadId ? (ids.some((i) => String(i) === String(leadId)) ? oid(leadId) : { $in: [] }) : { $in: ids };
   }
 
   const pipeline = [
@@ -95,15 +98,10 @@ const listConversations = asyncHandler(async (req, res) => {
   if (search) {
     const re = new RegExp(escapeRe(search), "i");
     const digits = String(search).replace(/\D/g, "");
-    pipeline.push({
-      $match: {
-        $or: [
-          { "lead.name": re },
-          { "lead.phone": digits.length >= 4 ? new RegExp(digits) : re },
-          { lastMessagePreview: re },
-        ],
-      },
-    });
+    const or = [{ "lead.name": re }, { lastMessagePreview: re }];
+    // Agents who can't see full numbers can't search by phone (it would reveal digits).
+    if (!agentScope.mustMask(req)) or.splice(1, 0, { "lead.phone": digits.length >= 4 ? new RegExp(digits) : re });
+    pipeline.push({ $match: { $or: or } });
   }
   pipeline.push(
     { $limit: limit + 1 },
@@ -138,6 +136,7 @@ const listConversations = asyncHandler(async (req, res) => {
   // Cheap badge count (indexed) for the "Unread" chip.
   const unreadTotal = await Conversation.countDocuments({
     ownerId,
+    ...(await agentScope.byLeadFilter(req)),
     lastMessageAt: { $ne: null },
     unreadCount: { $gt: 0 },
   });
@@ -155,7 +154,7 @@ const listConversations = asyncHandler(async (req, res) => {
 /** GET /api/conversations/counts — numbers for the filter menu. */
 const filterCounts = asyncHandler(async (req, res) => {
   const ownerId = oid(scopeOwnerId(req));
-  const base = { ownerId, lastMessageAt: { $ne: null } };
+  const base = { ownerId, lastMessageAt: { $ne: null }, ...(await agentScope.byLeadFilter(req)) };
   const [unread, manual, byLead] = await Promise.all([
     Conversation.countDocuments({ ...base, unreadCount: { $gt: 0 } }),
     Conversation.countDocuments({ ...base, status: "manual" }),
@@ -202,7 +201,7 @@ const getConversation = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const limit = Math.min(Number(req.query.limit) || 40, 200);
 
-  const conversation = await Conversation.findOne({ _id: req.params.id, ownerId })
+  const conversation = await Conversation.findOne({ _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) })
     .populate("leadId")
     .populate("recommendedProperties", "projectName city location bhk budgetMin budgetMax images brochureUrl");
   if (!conversation) throw ApiError.notFound("Conversation not found");
@@ -246,19 +245,19 @@ const getConversation = asyncHandler(async (req, res) => {
 
 async function loadForSend(req) {
   const ownerId = scopeOwnerId(req);
-  const conversation = await Conversation.findOne({ _id: req.params.id, ownerId }).populate("leadId");
+  const conversation = await Conversation.findOne({ _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) }).populate("leadId");
   if (!conversation) throw ApiError.notFound("Conversation not found");
-  if (!conversation.leadId) throw ApiError.badRequest("Is chat ki lead delete ho chuki hai");
-  if (!conversation.leadId.phone) throw ApiError.badRequest("Is lead ka WhatsApp number nahi hai");
+  if (!conversation.leadId) throw ApiError.badRequest("This chat’s lead was deleted");
+  if (!conversation.leadId.phone) throw ApiError.badRequest("This lead has no WhatsApp number");
 
   const settingsService = require("../services/settings/settingsService");
   const settings = await settingsService.getOrCreateSettings();
   if (settings.whatsappDisconnected) {
-    throw ApiError.badRequest("WhatsApp band hai — Settings se dobara chalu karein", { code: "WHATSAPP_DISCONNECTED" });
+    throw ApiError.badRequest("WhatsApp is off — turn it on in Settings", { code: "WHATSAPP_DISCONNECTED" });
   }
   if (!withinWindow(conversation.lastInboundAt)) {
     throw ApiError.badRequest(
-      "Customer ne pichhle 24 ghante mein message nahi kiya, isliye WhatsApp ke rule ke hisaab se seedha message nahi ja sakta. Campaign / follow-up se approved template bhejein — customer reply karega to chat khul jayegi.",
+      "The customer has not messaged in the last 24 hours, so WhatsApp only allows an approved template. Send a template — the chat reopens when they reply.",
       { code: "WHATSAPP_24H_WINDOW_CLOSED" },
     );
   }
@@ -269,9 +268,9 @@ function sendError(err) {
   if (err instanceof ApiError) return err;
   const code = err.code || err.metaError?.code;
   if (code === "WHATSAPP_24H_WINDOW_CLOSED") {
-    return ApiError.badRequest("Customer ka 24 ghante wala WhatsApp window band ho gaya hai. Template se message bhejein.", { code });
+    return ApiError.badRequest("The 24-hour WhatsApp window is closed. Send a template.", { code });
   }
-  const friendly = require("../services/saas/whatsappConnect").friendlyMetaMessage(err.metaError, err.message || "Message nahi gaya");
+  const friendly = require("../services/saas/whatsappConnect").friendlyMetaMessage(err.metaError, err.message || "Message not sent");
   return ApiError.badRequest(friendly, { code: code || "WHATSAPP_SEND_FAILED" });
 }
 
@@ -306,7 +305,7 @@ const sendManualReply = asyncHandler(async (req, res) => {
  * Broker sends a photo / video / PDF / audio from the inbox.
  */
 const sendMediaReply = asyncHandler(async (req, res) => {
-  if (!req.file) throw ApiError.badRequest("File chunein");
+  if (!req.file) throw ApiError.badRequest("Choose a file");
   const { ownerId, conversation } = await loadForSend(req);
   const { originalname, mimetype, size, buffer } = req.file;
   let kind;
@@ -355,7 +354,7 @@ const sendMediaReply = asyncHandler(async (req, res) => {
     whatsappMessageId: messageId || null,
     ownerId,
   });
-  return new ApiResponse(201, { message }, "File bhej di gayi").send(res);
+  return new ApiResponse(201, { message }, "File sent").send(res);
 });
 
 /**
@@ -365,7 +364,7 @@ const sendMediaReply = asyncHandler(async (req, res) => {
 const sendPropertyMedia = asyncHandler(async (req, res) => {
   const { ownerId, conversation } = await loadForSend(req);
   const property = await Property.findOne({ _id: req.body.propertyId, ownerId });
-  if (!property) throw ApiError.notFound("Property nahi mili");
+  if (!property) throw ApiError.notFound("Property not found");
   const { attachSiteBrochure } = require("../services/sites/siteBrochure");
   await attachSiteBrochure(property).catch(() => null);
   const lead = conversation.leadId;
@@ -373,14 +372,14 @@ const sendPropertyMedia = asyncHandler(async (req, res) => {
   try {
     await tenantContext.runWithNumber(conversation.phoneNumberId, async () => {
       if (req.body.kind === "brochure") {
-        if (!property.brochureUrl) throw ApiError.badRequest("Is property ka brochure upload nahi hai — Properties page par brochure jodein.");
+        if (!property.brochureUrl) throw ApiError.badRequest("No brochure for this property — add one on the Properties page.");
         const filename = property.brochureName || `${property.projectName || "property"}-brochure.pdf`;
         const caption = `${property.projectName || "Property"} ka brochure 📄`;
         const { messageId } = await mediaService.sendMedia({ phone: lead.phone, kind: "document", link: property.brochureUrl, caption, filename });
         sent.push(await recordOutboundMessage({ conversationId: conversation._id, leadId: lead._id, text: caption, sender: "broker", type: "document", media: { url: property.brochureUrl, filename, mimeType: "application/pdf", caption }, whatsappMessageId: messageId, ownerId }));
       } else {
         const images = (property.images || []).slice(0, 6);
-        if (!images.length) throw ApiError.badRequest("Is property ki photos upload nahi hain — Properties page par photos jodein.");
+        if (!images.length) throw ApiError.badRequest("No photos for this property — add them on the Properties page.");
         for (let i = 0; i < images.length; i += 1) {
           const caption = i === 0 ? `${property.projectName || "Property"} ki photos 🏠` : "";
           const { messageId } = await mediaService.sendMedia({ phone: lead.phone, kind: "image", link: images[i], caption });
@@ -391,7 +390,7 @@ const sendPropertyMedia = asyncHandler(async (req, res) => {
   } catch (err) {
     throw sendError(err);
   }
-  return new ApiResponse(201, { messages: sent }, req.body.kind === "brochure" ? "Brochure bhej diya" : `${sent.length} photo bhej di`).send(res);
+  return new ApiResponse(201, { messages: sent }, req.body.kind === "brochure" ? "Brochure sent" : `${sent.length} photo(s) sent`).send(res);
 });
 
 /**
@@ -401,10 +400,10 @@ const sendPropertyMedia = asyncHandler(async (req, res) => {
  */
 const getMedia = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
-  const conversation = await Conversation.findOne({ _id: req.params.id, ownerId }).select("_id phoneNumberId").lean();
+  const conversation = await Conversation.findOne({ _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) }).select("_id phoneNumberId").lean();
   if (!conversation) throw ApiError.notFound("Conversation not found");
   const message = await Message.findOne({ _id: req.params.messageId, conversationId: conversation._id }).select("media type").lean();
-  if (!message?.media) throw ApiError.notFound("File nahi mili");
+  if (!message?.media) throw ApiError.notFound("File not found");
 
   const filename = (message.media.filename || `${message.type}-${String(message._id).slice(-6)}`).replace(/[^\w.\- ]+/g, "_");
   const disposition = `${req.query.download ? "attachment" : "inline"}; filename="${filename}"`;
@@ -426,40 +425,64 @@ const getMedia = asyncHandler(async (req, res) => {
     }
   } catch (err) {
     logger.warn("[media] could not stream file", { messageId: String(message._id), error: err.message });
-    throw new ApiError(410, "Ye file ab WhatsApp par available nahi hai (WhatsApp files ~30 din tak hi rakhta hai).");
+    throw new ApiError(410, "This file is no longer available on WhatsApp (files are kept ~30 days).");
   }
-  throw ApiError.notFound("File nahi mili");
+  throw ApiError.notFound("File not found");
+});
+
+/**
+ * PATCH /api/conversations/:id/language  { language: "Tamil" | null }
+ * The team sets the customer's language (locked — the AI, WhatsApp messages,
+ * reminders and calls all use it). null = automatic again (detected from the
+ * customer's messages). The customer is never asked again.
+ */
+const setConversationLanguage = asyncHandler(async (req, res) => {
+  const ownerId = scopeOwnerId(req);
+  const conversation = await Conversation.findOne({ _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) });
+  if (!conversation) throw ApiError.notFound("Conversation not found");
+  const { setByAgent } = require("../services/language");
+  const language = await setByAgent(conversation, req.body.language);
+  require("../sockets").emitToUser(conversation.ownerId, "conversation:updated", {
+    conversationId: conversation._id,
+    language: conversation.language,
+    languageSource: conversation.languageSource,
+  });
+  return new ApiResponse(
+    200,
+    { conversation: { _id: conversation._id, language: conversation.language, languageSource: conversation.languageSource } },
+    language ? `Chat language set to ${language}` : "Chat language set to automatic",
+  ).send(res);
 });
 
 /** POST /api/conversations/:id/takeover — pause the AI for this one lead. */
 const takeOverChat = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const conversation = await Conversation.findOneAndUpdate(
-    { _id: req.params.id, ownerId },
+    { _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) },
     { $set: { status: "manual" } },
     { new: true },
   );
   if (!conversation) throw ApiError.notFound("Conversation not found");
-  return new ApiResponse(200, { conversation }, "AI is chat ke liye ruk gaya — ab aap reply karenge").send(res);
+  return new ApiResponse(200, { conversation }, "AI paused for this chat — you are replying now").send(res);
 });
 
 /** POST /api/conversations/:id/resume-ai — hand the chat back to the AI. */
 const resumeAI = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const conversation = await Conversation.findOneAndUpdate(
-    { _id: req.params.id, ownerId },
+    { _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) },
     { $set: { status: "ai_active" } },
     { new: true },
   );
   if (!conversation) throw ApiError.notFound("Conversation not found");
-  return new ApiResponse(200, { conversation }, "AI dobara chalu").send(res);
+  return new ApiResponse(200, { conversation }, "AI resumed").send(res);
 });
 
 /** POST /api/conversations/:id/read — clears the unread badge. */
 const markRead = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const conversation = await Conversation.findOneAndUpdate(
-    { _id: req.params.id, ownerId },
+    { _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) },
     { $set: { unreadCount: 0 } },
     { new: true, projection: { unreadCount: 1 } },
   );
@@ -471,24 +494,24 @@ const markRead = asyncHandler(async (req, res) => {
 const closeConversation = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const conversation = await Conversation.findOneAndUpdate(
-    { _id: req.params.id, ownerId },
+    { _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) },
     { $set: { status: "closed" } },
     { new: true },
   );
   if (!conversation) throw ApiError.notFound("Conversation not found");
-  return new ApiResponse(200, { conversation }, "Chat close ho gayi").send(res);
+  return new ApiResponse(200, { conversation }, "Chat closed").send(res);
 });
 
 /** POST /api/conversations/:id/reopen */
 const reopenConversation = asyncHandler(async (req, res) => {
   const ownerId = scopeOwnerId(req);
   const conversation = await Conversation.findOneAndUpdate(
-    { _id: req.params.id, ownerId },
+    { _id: req.params.id, ownerId, ...(await agentScope.byLeadFilter(req)) },
     { $set: { status: "ai_active", optedOut: false } },
     { new: true },
   );
   if (!conversation) throw ApiError.notFound("Conversation not found");
-  return new ApiResponse(200, { conversation }, "Chat dobara khul gayi").send(res);
+  return new ApiResponse(200, { conversation }, "Chat reopened").send(res);
 });
 
 module.exports = {
@@ -499,6 +522,7 @@ module.exports = {
   sendMediaReply,
   sendPropertyMedia,
   getMedia,
+  setConversationLanguage,
   takeOverChat,
   resumeAI,
   markRead,

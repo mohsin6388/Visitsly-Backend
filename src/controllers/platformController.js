@@ -20,8 +20,9 @@ const DAY = 24 * 60 * 60 * 1000;
 /** Monthly recurring revenue contribution of one org (INR, before GST). */
 function mrrOf(org) {
   if (org.status !== 'active' && org.status !== 'past_due') return 0;
-  const plan = getPlan(org.plan);
-  const monthly = org.priceOverride || (org.billingCycle === 'annual' ? plan.annual / 12 : plan.monthly);
+  // Approximate, in INR list prices (priceOverride is INR).
+  const price = require('../config/pricing').planPrice(getPlan(org.plan).code, 'INR');
+  const monthly = org.priceOverride || (org.billingCycle === 'annual' ? (price.annual || 0) / 12 : price.monthly || 0);
   return Math.round(monthly);
 }
 
@@ -144,9 +145,24 @@ const updateOrg = asyncHandler(async (req, res) => {
   }
   if (b.currentPeriodEnd) org.currentPeriodEnd = new Date(b.currentPeriodEnd);
   if (b.limitOverrides !== undefined) org.limitOverrides = b.limitOverrides || {};
+  if (b.featureOverrides !== undefined) {
+    // null value = remove the override (back to the plan default).
+    const next = {};
+    for (const [k, v] of Object.entries(b.featureOverrides || {})) if (typeof v === 'boolean') next[k] = v;
+    org.featureOverrides = next;
+    org.markModified('featureOverrides');
+  }
+  // Only the platform admin may change the billing country / currency after onboarding.
+  if (b.country && b.country !== org.country) {
+    org.country = b.country;
+    org.currency = require('../config/pricing').currencyForCountry(b.country);
+  }
   if (b.priceOverride !== undefined) org.priceOverride = b.priceOverride || null;
   if (b.notes !== undefined) org.notes = b.notes;
   if (b.addons) {
+    if (b.addons.extraUsers > 0 && !require('../services/saas/permissions').teamAvailable(org)) {
+      throw ApiError.badRequest('Extra users can only be granted on Growth and above (Starter and Trial have no team)');
+    }
     for (const k of ['extraUsers', 'extraNumbers', 'aiPacks']) if (b.addons[k] !== undefined) org.addons[k] = b.addons[k];
   }
   if (b.branding) {
@@ -158,6 +174,51 @@ const updateOrg = asyncHandler(async (req, res) => {
   if (b.branding) await require('../services/saas/corsOrigins').refreshCustomDomains();
   await AuditLog.create({ userId: req.user.actorId, orgId: org._id, action: 'platform.org.update', entityType: 'Organization', entityId: org._id, meta: b, ip: req.ip });
   return new ApiResponse(200, { org: await orgSummary(await orgService.getSnapshot(org._id, { fresh: true })) }, 'Company updated').send(res);
+});
+
+/** GET /api/platform/orgs/:id/email — sender state + wallet WITH our cost / margin split (admin only). */
+const emailOverview = asyncHandler(async (req, res) => {
+  const org = await Organization.findById(req.params.id).select('name emailWallet').lean();
+  if (!org) throw ApiError.notFound('Company not found');
+  const wallet = require('../services/email/emailWallet');
+  const EmailSender = require('../models/EmailSender');
+  const EmailWalletTx = require('../models/EmailWalletTx');
+  const sender = await EmailSender.findOne({ orgId: org._id }).lean();
+  const p = wallet.pricing();
+  const rows = await EmailWalletTx.find({ orgId: org._id, type: 'debit', refundedAt: null }).select('costMilli marginMilli').lean();
+  const sum = rows.reduce((a, t) => ({ cost: a.cost + (t.costMilli || 0), margin: a.margin + (t.marginMilli || 0) }), { cost: 0, margin: 0 });
+  return new ApiResponse(200, {
+    sender: sender ? { email: sender.email, status: sender.status, domain: sender.domain, domainAuthStatus: sender.domainAuthStatus, paused: sender.paused, pausedReason: sender.pausedReason } : null,
+    wallet: {
+      ...wallet.summary(org),
+      costPerEmail: p.costMilli / 1000,
+      marginPerEmail: p.marginMilli / 1000,
+      totalCost: sum.cost / 1000,
+      totalMargin: sum.margin / 1000,
+      history: (await EmailWalletTx.find({ orgId: org._id, type: { $ne: 'debit' } }).sort({ createdAt: -1 }).limit(30).lean()).map((t) => ({ type: t.type, emails: t.emails, amount: t.amountMilli / 1000, note: t.note, at: t.createdAt })),
+    },
+  }).send(res);
+});
+
+/** POST /api/platform/orgs/:id/email-credit { emails, note } — manual credit (negative = correction). Audited. */
+const emailCredit = asyncHandler(async (req, res) => {
+  const emails = Math.trunc(Number(req.body?.emails));
+  if (!Number.isFinite(emails) || !emails || Math.abs(emails) > 1000000) throw ApiError.badRequest('Enter a non-zero number of emails (max 1,000,000)');
+  const org = await Organization.findById(req.params.id).select('_id').lean();
+  if (!org) throw ApiError.notFound('Company not found');
+  const r = await require('../services/email/emailWallet').adminAdjust(org._id, { emails, actorId: req.user.actorId, note: req.body?.note });
+  if (!r.changed) throw ApiError.badRequest(r.reason === 'insufficient' ? 'Wallet balance is lower than this correction' : 'Nothing changed');
+  await AuditLog.create({ userId: req.user.actorId, orgId: org._id, action: 'platform.email.credit', entityType: 'Organization', entityId: org._id, meta: { emails, note: req.body?.note || '' }, ip: req.ip });
+  return new ApiResponse(200, { wallet: require('../services/email/emailWallet').summary(await Organization.findById(org._id).select('emailWallet').lean()) }, 'Email wallet updated').send(res);
+});
+
+/** POST /api/platform/orgs/:id/email-unpause — after review, let a paused company send again. Audited. */
+const emailUnpause = asyncHandler(async (req, res) => {
+  const org = await Organization.findById(req.params.id).select('_id').lean();
+  if (!org) throw ApiError.notFound('Company not found');
+  await require('../models/EmailSender').updateOne({ orgId: org._id }, { $set: { paused: false, pausedReason: null, pausedAt: null } });
+  await AuditLog.create({ userId: req.user.actorId, orgId: org._id, action: 'platform.email.unpause', entityType: 'Organization', entityId: org._id, ip: req.ip });
+  return new ApiResponse(200, { ok: true }, 'Email sending resumed').send(res);
 });
 
 /** POST /api/platform/orgs/:id/payments — record offline (UPI/bank) payment. */
@@ -180,13 +241,36 @@ const supportSession = asyncHandler(async (req, res) => {
 });
 
 /** GET /api/platform/payments?status= — every invoice across companies. */
+/** GET /api/platform/payments/:id/pdf — any company's invoice (platform admin). Same PDF service as the customer. */
+const paymentPdf = asyncHandler(async (req, res) => {
+  if (!/^[a-f\d]{24}$/i.test(String(req.params.id))) throw ApiError.notFound('Invoice not found');
+  const { buffer, filename } = await require('../services/billing/invoiceService').pdfFor({ _id: req.params.id });
+  res.set({
+    'Content-Type': 'application/pdf',
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Content-Length': buffer.length,
+    'Cache-Control': 'private, no-store',
+  });
+  return res.status(200).send(buffer);
+});
+
 const listPayments = asyncHandler(async (req, res) => {
   const filter = {};
   if (['paid', 'failed', 'refunded'].includes(req.query.status)) filter.status = req.query.status;
   const items = await Invoice.find(filter).sort({ createdAt: -1 }).limit(500).populate('orgId', 'name city').lean();
   const total = items.filter((i) => i.status === 'paid').reduce((a, i) => a + (i.amount || 0), 0);
   return new ApiResponse(200, {
-    items: items.map((i) => ({ ...i, org: i.orgId ? { id: String(i.orgId._id), name: i.orgId.name, city: i.orgId.city } : null, orgId: undefined })),
+    // Invoice document fields (invoiceNumber, subtotal, taxAmount, emailedAt, billedTo) are returned as stored.
+    items: items.map((i) => ({
+      ...i,
+      invoiceNumber: i.invoiceNumber || null,
+      subtotal: i.subtotal ?? null,
+      taxAmount: i.taxAmount ?? null,
+      emailedAt: i.emailedAt || null,
+      billedTo: i.billedTo || null,
+      org: i.orgId ? { id: String(i.orgId._id), name: i.orgId.name, city: i.orgId.city } : null,
+      orgId: undefined,
+    })),
     totalPaid: total,
   }).send(res);
 });
@@ -203,7 +287,7 @@ const listAdmins = asyncHandler(async (req, res) => {
 
 const createAdmin = asyncHandler(async (req, res) => {
   const email = String(req.body.email).trim().toLowerCase();
-  if (await User.exists({ email })) throw ApiError.conflict('Is email se pehle se login hai');
+  if (await User.exists({ email })) throw ApiError.conflict('A login already exists for this email');
   const user = new User({ name: req.body.name, email, role: 'admin', isSuperAdmin: true, orgId: null });
   user.setPassword(req.body.password);
   await user.save();
@@ -212,7 +296,7 @@ const createAdmin = asyncHandler(async (req, res) => {
 });
 
 const updateAdmin = asyncHandler(async (req, res) => {
-  if (req.params.id === req.admin.id && req.body.isActive === false) throw ApiError.badRequest('Aap khud ko deactivate nahi kar sakte');
+  if (req.params.id === req.admin.id && req.body.isActive === false) throw ApiError.badRequest('You can’t deactivate yourself');
   const user = await User.findOne({ _id: req.params.id, isSuperAdmin: true });
   if (!user) throw ApiError.notFound('Admin not found');
   if (typeof req.body.isActive === 'boolean') {
@@ -281,4 +365,100 @@ const revenue = asyncHandler(async (req, res) => {
   return new ApiResponse(200, { months }).send(res);
 });
 
-module.exports = { stats, listOrgs, getOrgDetail, updateOrg, recordPayment, supportSession, listPayments, listAdmins, createAdmin, updateAdmin, listRequests, updateRequest, activity, revenue };
+/* ------------------------------------------------------------------ */
+/* Coupons + plan offers (admin panel)                                 */
+/* ------------------------------------------------------------------ */
+const Coupon = require('../models/Coupon');
+const CouponRedemption = require('../models/CouponRedemption');
+const PlanOffer = require('../models/PlanOffer');
+const pricingConfig = require('../config/pricing');
+const pricingService = require('../services/billing/pricingService');
+
+const OBJECT_ID = /^[a-f\d]{24}$/i;
+const dupMessage = (err, what) => (/E11000|duplicate/i.test(err.message) ? ApiError.conflict(`${what} already exists`) : err);
+
+/** GET /api/platform/coupons */
+const listCoupons = asyncHandler(async (req, res) => {
+  const items = await Coupon.find({}).sort({ createdAt: -1 }).limit(500).lean();
+  return new ApiResponse(200, { items }).send(res);
+});
+
+/** POST /api/platform/coupons */
+const createCoupon = asyncHandler(async (req, res) => {
+  const b = { ...req.body, code: pricingService.normaliseCode(req.body.code) };
+  if (b.type === 'percent') b.currency = null;
+  let coupon;
+  try {
+    coupon = await Coupon.create({ ...b, createdBy: req.user.actorId });
+  } catch (err) {
+    throw dupMessage(err, 'A coupon with this code');
+  }
+  await AuditLog.create({ userId: req.user.actorId, action: 'platform.coupon.create', entityType: 'Coupon', entityId: coupon._id, meta: { code: coupon.code, type: coupon.type, value: coupon.value }, ip: req.ip });
+  return new ApiResponse(201, { coupon }, 'Coupon created').send(res);
+});
+
+/** PATCH /api/platform/coupons/:id — edit, or { active:false } to disable. */
+const updateCoupon = asyncHandler(async (req, res) => {
+  const existing = await Coupon.findById(req.params.id).lean();
+  if (!existing) throw ApiError.notFound('Coupon not found');
+  const merged = { ...existing, ...req.body };
+  if (merged.type === 'flat' && !merged.currency) throw ApiError.badRequest('A flat coupon needs a currency');
+  if (merged.type === 'percent' && merged.value > 100) throw ApiError.badRequest('A percent coupon can be at most 100');
+  const update = { ...req.body };
+  if (update.type === 'percent') update.currency = null;
+  const coupon = await Coupon.findByIdAndUpdate(req.params.id, { $set: update }, { new: true }).lean();
+  await AuditLog.create({ userId: req.user.actorId, action: req.body.active === false ? 'platform.coupon.disable' : 'platform.coupon.update', entityType: 'Coupon', entityId: coupon._id, meta: { code: coupon.code, changes: req.body }, ip: req.ip });
+  return new ApiResponse(200, { coupon }, 'Coupon updated').send(res);
+});
+
+/** POST /api/platform/coupons/:id/disable */
+const disableCoupon = asyncHandler(async (req, res) => {
+  if (!OBJECT_ID.test(String(req.params.id))) throw ApiError.notFound('Coupon not found');
+  const coupon = await Coupon.findByIdAndUpdate(req.params.id, { $set: { active: false } }, { new: true }).lean();
+  if (!coupon) throw ApiError.notFound('Coupon not found');
+  await AuditLog.create({ userId: req.user.actorId, action: 'platform.coupon.disable', entityType: 'Coupon', entityId: coupon._id, meta: { code: coupon.code }, ip: req.ip });
+  return new ApiResponse(200, { coupon }, 'Coupon disabled').send(res);
+});
+
+/** GET /api/platform/coupons/:id/redemptions */
+const couponRedemptions = asyncHandler(async (req, res) => {
+  if (!OBJECT_ID.test(String(req.params.id))) throw ApiError.notFound('Coupon not found');
+  const items = await CouponRedemption.find({ couponId: req.params.id }).sort({ createdAt: -1 }).limit(200).lean();
+  return new ApiResponse(200, { items }).send(res);
+});
+
+/** GET /api/platform/plan-offers */
+const listPlanOffers = asyncHandler(async (req, res) => {
+  const items = await PlanOffer.find({}).sort({ plan: 1, cycle: 1, currency: 1 }).lean();
+  return new ApiResponse(200, { items }).send(res);
+});
+
+/** PUT /api/platform/plan-offers — create or replace the offer for plan + cycle + currency. */
+const setPlanOffer = asyncHandler(async (req, res) => {
+  const { plan, cycle, currency, offerPrice, label = '', validFrom = null, validUntil = null, active = true } = req.body;
+  if (!pricingConfig.supported(currency)) throw ApiError.badRequest(`${currency} is not a supported currency`);
+  const p = pricingConfig.planPrice(plan, currency);
+  const listPrice = cycle === 'annual' ? p.annual : p.monthly;
+  const price = pricingService.roundFor(offerPrice, currency);
+  if (!listPrice || !(price < listPrice)) throw ApiError.badRequest(`The offer price must be lower than the list price (${currency} ${listPrice}).`);
+  if (validFrom && validUntil && validFrom > validUntil) throw ApiError.badRequest('validUntil must be after validFrom');
+  const offer = await PlanOffer.findOneAndUpdate(
+    { plan, cycle, currency },
+    { $set: { offerPrice: price, label, validFrom, validUntil, active, createdBy: req.user.actorId } },
+    { new: true, upsert: true, setDefaultsOnInsert: true },
+  ).lean();
+  await AuditLog.create({ userId: req.user.actorId, action: 'platform.offer.set', entityType: 'PlanOffer', entityId: offer._id, meta: { plan, cycle, currency, offerPrice: price, listPrice, active }, ip: req.ip });
+  return new ApiResponse(200, { offer }, 'Offer saved').send(res);
+});
+
+/** DELETE /api/platform/plan-offers/:id — clears the offer (list price applies again). */
+const clearPlanOffer = asyncHandler(async (req, res) => {
+  if (!OBJECT_ID.test(String(req.params.id))) throw ApiError.notFound('Offer not found');
+  const offer = await PlanOffer.findByIdAndDelete(req.params.id).lean();
+  if (!offer) throw ApiError.notFound('Offer not found');
+  await AuditLog.create({ userId: req.user.actorId, action: 'platform.offer.clear', entityType: 'PlanOffer', entityId: offer._id, meta: { plan: offer.plan, cycle: offer.cycle, currency: offer.currency }, ip: req.ip });
+  return new ApiResponse(200, { cleared: true }, 'Offer cleared').send(res);
+});
+
+module.exports = {
+  emailOverview, emailCredit, emailUnpause, listCoupons, createCoupon, updateCoupon, disableCoupon, couponRedemptions, listPlanOffers, setPlanOffer, clearPlanOffer, stats, listOrgs, getOrgDetail, updateOrg, recordPayment, supportSession, listPayments, paymentPdf, listAdmins, createAdmin, updateAdmin, listRequests, updateRequest, activity, revenue };

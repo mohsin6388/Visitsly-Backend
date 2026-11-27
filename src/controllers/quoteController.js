@@ -1,3 +1,4 @@
+const agentScope = require('../services/saas/agentScope');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiError = require('../utils/ApiError');
 const ApiResponse = require('../utils/ApiResponse');
@@ -21,8 +22,8 @@ function view(req, q) {
 }
 
 const list = asyncHandler(async (req, res) => {
-  const filter = { ownerId: req.user.id };
-  if (req.query.leadId) filter.leadId = req.query.leadId;
+  const filter = { ownerId: req.user.id, ...(await agentScope.byLeadFilter(req)) };
+  if (req.query.leadId) filter.leadId = agentScope.isAgent(req) ? { $in: (await agentScope.assignedLeadIds(req)).filter((i) => String(i) === String(req.query.leadId)) } : req.query.leadId;
   const items = await Quote.find(filter).sort({ createdAt: -1 }).limit(200).lean();
   return new ApiResponse(200, { items: items.map((q) => view(req, q)) }).send(res);
 });
@@ -31,7 +32,7 @@ const create = asyncHandler(async (req, res) => {
   const b = req.body;
   let customer = b.customer || {};
   if (b.leadId) {
-    const lead = await Lead.findOne({ _id: b.leadId, ownerId: req.user.id }).lean();
+    const lead = await Lead.findOne({ _id: b.leadId, ...agentScope.leadScope(req) }).lean();
     if (!lead) throw ApiError.notFound('Lead not found');
     customer = { name: customer.name || lead.name, phone: customer.phone || lead.phone, email: customer.email || lead.email };
   }
@@ -52,7 +53,7 @@ const create = asyncHandler(async (req, res) => {
     notes: b.notes || '',
     createdBy: req.user.actorId,
   });
-  return new ApiResponse(201, { quote: view(req, quote) }, `Cost sheet ${quote.number} ban gaya`).send(res);
+  return new ApiResponse(201, { quote: view(req, quote) }, `Cost sheet ${quote.number} created`).send(res);
 });
 
 /** POST /api/quotes/preview — live totals while typing (nothing saved). */
@@ -62,7 +63,7 @@ const preview = asyncHandler(async (req, res) => {
 });
 
 const remove = asyncHandler(async (req, res) => {
-  await Quote.deleteOne({ _id: req.params.id, ownerId: req.user.id });
+  await Quote.deleteOne({ _id: req.params.id, ownerId: req.user.id, ...(await agentScope.byLeadFilter(req)) });
   return new ApiResponse(200, null, 'Deleted').send(res);
 });
 
@@ -89,15 +90,21 @@ const publicPdf = async (req, res, next) => {
 
 /** POST /api/quotes/:id/send-whatsapp — sends the PDF in the lead's chat. */
 const sendWhatsapp = asyncHandler(async (req, res) => {
-  const quote = await Quote.findOne({ _id: req.params.id, ownerId: req.user.id });
+  const quote = await Quote.findOne({ _id: req.params.id, ownerId: req.user.id, ...(await agentScope.byLeadFilter(req)) });
   if (!quote) throw ApiError.notFound('Quote not found');
   const phone = quote.customer?.phone;
-  if (!phone) throw ApiError.badRequest('Customer ka phone number nahi hai');
+  if (!phone) throw ApiError.badRequest('Customer has no phone number');
   const conversation = quote.leadId ? await Conversation.findOne({ leadId: quote.leadId }) : null;
   if (conversation && !metaWhatsappClient.isWithin24HourWindow(conversation.lastInboundAt)) {
-    throw ApiError.badRequest('Customer ne pichhle 24 ghante mein reply nahi kiya — WhatsApp rule ke hisaab se pehle template bhejein, ya PDF link copy karke share karein.');
+    throw ApiError.badRequest('No reply from the customer in 24 hours — send a template first, or copy and share the PDF link.');
   }
-  const caption = `${quote.project} — cost sheet ${quote.number}. All-inclusive Rs. ${Number(quote.totals.grandTotal).toLocaleString('en-IN')}`;
+  // E5: the caption is written in the customer's saved chat language.
+  const lang = require('../services/language');
+  const caption = lang.t('quote.caption', lang.normalize(conversation?.language) || 'English', {
+    project: quote.project,
+    number: quote.number,
+    total: Number(quote.totals.grandTotal).toLocaleString('en-IN'),
+  });
   const sent = await tenantContext.runWithNumber(conversation?.phoneNumberId, () =>
     metaWhatsappClient.sendDocumentMessage({ phone, documentUrl: publicPdfUrl(req, quote), filename: `${quote.number}.pdf`, caption }));
   quote.sentAt = new Date();
@@ -105,7 +112,7 @@ const sendWhatsapp = asyncHandler(async (req, res) => {
   if (conversation) {
     await recordOutboundMessage({ conversationId: conversation._id, leadId: quote.leadId, text: `📄 ${caption}`, sender: 'broker', whatsappMessageId: sent.messageId }).catch(() => {});
   }
-  return new ApiResponse(200, { quote: view(req, quote) }, 'Cost sheet WhatsApp par bhej di').send(res);
+  return new ApiResponse(200, { quote: view(req, quote) }, 'Cost sheet sent on WhatsApp').send(res);
 });
 
 module.exports = { list, create, preview, remove, publicPdf, sendWhatsapp };

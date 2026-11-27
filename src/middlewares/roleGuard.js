@@ -6,7 +6,7 @@ const ApiError = require('../utils/ApiError');
  *
  * SaaS: a company user works in one workspace that covers both the broker
  * and builder features, so tenant users pass any broker/builder guard.
- * 'admin'-only routes (audit log) need an owner or manager in the company.
+ * 'admin'-only routes (audit log) need the company owner.
  */
 const roleGuard = (...allowedRoles) => (req, res, next) => {
   if (!req.user) {
@@ -14,7 +14,7 @@ const roleGuard = (...allowedRoles) => (req, res, next) => {
   }
   if (req.user.tenant) {
     const tenantOk = allowedRoles.includes('broker') || allowedRoles.includes('builder');
-    const adminOk = allowedRoles.includes('admin') && ['owner', 'manager'].includes(req.user.orgRole);
+    const adminOk = allowedRoles.includes('admin') && req.user.orgRole === 'owner';
     if (tenantOk || adminOk) return next();
     return next(ApiError.forbidden('You do not have permission to perform this action'));
   }
@@ -24,18 +24,27 @@ const roleGuard = (...allowedRoles) => (req, res, next) => {
   next();
 };
 
-/** Company-level permission: roleGuard.org('owner', 'manager') */
-roleGuard.org = (...orgRoles) => (req, res, next) => {
-  if (!req.user) return next(ApiError.unauthorized('Authentication required'));
-  if (!req.user.tenant) return next(); // legacy single-client mode: no team roles
-  if (orgRoles.includes(req.user.orgRole)) return next();
-  return next(ApiError.forbidden('Ye kaam sirf company owner/manager kar sakte hain'));
+/** Company-level permission: roleGuard.org('owner'). Only Owner and Agent roles exist. */
+roleGuard.org = (...orgRoles) => {
+  const mw = (req, res, next) => {
+    if (!req.user) return next(ApiError.unauthorized('Authentication required'));
+    if (!req.user.tenant) return next(); // legacy single-client mode: no team roles
+    if (orgRoles.includes(req.user.orgRole)) return next();
+    return next(ApiError.forbidden('Only the company owner can do this'));
+  };
+  mw.orgRoles = orgRoles; // label (used by the route→permission table test)
+  return mw;
 };
 
 /** Reads allowed for every teammate; writes only for these company roles. */
-roleGuard.orgWrite = (...orgRoles) => (req, res, next) => {
-  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
-  return roleGuard.org(...orgRoles)(req, res, next);
+roleGuard.orgWrite = (...orgRoles) => {
+  const mw = (req, res, next) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
+    return roleGuard.org(...orgRoles)(req, res, next);
+  };
+  mw.orgRoles = orgRoles;
+  mw.writesOnly = true;
+  return mw;
 };
 
 /** Platform super-admin only (PropAI staff). */

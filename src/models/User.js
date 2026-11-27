@@ -38,9 +38,18 @@ const userSchema = new Schema(
     // ---- SaaS ----
     // Company (tenant) this user belongs to. Platform super-admins have none.
     orgId: { type: Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
-    // Permission inside the company: owner (billing + everything), manager
-    // (everything except billing), agent (leads, chats, visits only).
-    orgRole: { type: String, enum: ['owner', 'manager', 'agent'], default: 'owner' },
+    // Permission inside the company: owner (everything) or agent (only what the owner switched on,
+    // and only leads assigned to them). 'manager' is a legacy value, treated as 'agent' on read.
+    orgRole: { type: String, enum: ['owner', 'agent', 'manager'], default: 'owner' },
+    // Agent permission toggles (see services/saas/permissions.js). Keys that were never stored use the defaults.
+    permissions: {
+      type: new Schema({
+        dashboard: Boolean, leads: Boolean, inbox: Boolean, whatsappLeads: Boolean, siteVisits: Boolean, followUps: Boolean, properties: Boolean,
+        leadCreate: Boolean, leadImport: Boolean, leadEdit: Boolean, leadDelete: Boolean, chatReply: Boolean,
+        showFullPhone: Boolean,
+      }, { _id: false }),
+      default: undefined,
+    },
     // PropAI staff — can see every company from the Platform admin panel.
     isSuperAdmin: { type: Boolean, default: false },
     // Set when a teammate was invited with a temporary password.

@@ -1,3 +1,4 @@
+const agentScope = require('../services/saas/agentScope');
 const asyncHandler = require('../utils/asyncHandler');
 const ApiResponse = require('../utils/ApiResponse');
 const Lead = require('../models/Lead');
@@ -36,12 +37,16 @@ function startOfDay(d = new Date()) {
 const getDashboardSummary = asyncHandler(async (req, res) => {
   const filter = ownerFilter(req);
   const today = startOfDay();
+  // Agents: every number counts only leads assigned to them (and what hangs off those leads).
+  const agent = agentScope.isAgent(req);
+  const lf = agent ? { ...filter, assignedTo: new mongoose.Types.ObjectId(req.user.actorId) } : filter;
+  const cf = agent ? { ...filter, ...(await agentScope.byLeadFilter(req)) } : filter;
 
   // Message doesn't carry ownerId directly, so scope it via the lead ids
   // that belong to this owner (skipped entirely for admin/no-filter view).
   let leadIdFilter = {};
   if (filter.ownerId) {
-    const ownedLeadIds = await Lead.find(filter).distinct('_id');
+    const ownedLeadIds = await Lead.find(lf).distinct('_id');
     leadIdFilter = { leadId: { $in: ownedLeadIds } };
   }
 
@@ -63,28 +68,34 @@ const getDashboardSummary = asyncHandler(async (req, res) => {
     pendingFollowUps,
     recentUploads,
     latestConversations,
+    whatsappFailed,
+    emailFailed,
+    emailOpened,
   ] = await Promise.all([
-    Lead.countDocuments(filter),
-    Lead.countDocuments({ ...filter, createdAt: { $gte: today } }),
-    Conversation.countDocuments({ ...filter, status: { $in: ['ai_active', 'manual'] } }),
+    Lead.countDocuments(lf),
+    Lead.countDocuments({ ...lf, createdAt: { $gte: today } }),
+    Conversation.countDocuments({ ...cf, status: { $in: ['ai_active', 'manual'] } }),
     Message.countDocuments({ ...leadIdFilter, direction: 'outbound', sender: { $in: ['ai', 'broker'] }, status: { $in: ['sent', 'delivered', 'read'] } }),
     Message.countDocuments({ ...leadIdFilter, direction: 'inbound', sender: 'customer' }),
-    EmailMessage.countDocuments({ ...filter, direction: 'outbound', status: { $in: ['sent', 'delivered', 'delivery_delayed'] }, kind: { $in: ['campaign', 'reply'] } }),
-    EmailMessage.countDocuments({ ...filter, direction: 'inbound', kind: 'received' }),
-    Lead.countDocuments({ ...filter, status: 'hot' }),
-    Lead.countDocuments({ ...filter, status: 'warm' }),
-    Lead.countDocuments({ ...filter, status: 'cold' }),
-    Meeting.countDocuments({ ...filter, status: 'scheduled' }),
-    Meeting.countDocuments({ ...filter, status: 'visited' }),
-    Lead.countDocuments({ ...filter, status: 'closed' }),
-    Lead.countDocuments({ ...filter, status: 'lost' }),
-    FollowUp.countDocuments({ ...filter, status: 'pending' }),
-    Lead.find(filter).sort({ createdAt: -1 }).limit(8).select('name phone city status createdAt'),
-    Conversation.find(filter)
+    EmailMessage.countDocuments({ ...cf, direction: 'outbound', status: { $in: ['sent', 'delivered', 'delivery_delayed'] }, kind: { $in: ['campaign', 'reply'] } }),
+    EmailMessage.countDocuments({ ...cf, direction: 'inbound', kind: 'received' }),
+    Lead.countDocuments({ ...lf, status: 'hot' }),
+    Lead.countDocuments({ ...lf, status: 'warm' }),
+    Lead.countDocuments({ ...lf, status: 'cold' }),
+    Meeting.countDocuments({ ...cf, status: 'scheduled' }),
+    Meeting.countDocuments({ ...cf, status: 'visited' }),
+    Lead.countDocuments({ ...lf, status: 'closed' }),
+    Lead.countDocuments({ ...lf, status: 'lost' }),
+    FollowUp.countDocuments({ ...cf, status: 'pending' }),
+    Lead.find(lf).sort({ createdAt: -1 }).limit(8).select('name phone city status createdAt'),
+    Conversation.find(cf)
       .sort({ lastMessageAt: -1 })
       .limit(8)
       .populate('leadId', 'name phone')
       .select('leadId status lastMessageAt currentLeadScore aiSummary'),
+    Message.countDocuments({ ...leadIdFilter, direction: 'outbound', status: 'failed' }),
+    EmailMessage.countDocuments({ ...cf, direction: 'outbound', status: { $in: ['failed', 'bounced'] } }),
+    EmailMessage.countDocuments({ ...cf, direction: 'outbound', openedAt: { $ne: null } }),
   ]);
 
   const closedOrLost = dealsClosed + lostLeads;
@@ -107,6 +118,10 @@ const getDashboardSummary = asyncHandler(async (req, res) => {
       dealsClosed,
       pendingFollowUps,
       conversionRate,
+    },
+    channels: {
+      whatsapp: { sent: messagesSent, replies: repliesReceived, failed: whatsappFailed },
+      email: { sent: emailMessagesSent, replies: emailRepliesReceived, failed: emailFailed, opened: emailOpened },
     },
     recentActivity: {
       recentUploads,
@@ -143,7 +158,9 @@ const getTimeseries = asyncHandler(async (req, res) => {
   }
   const from = toUtcDay(fromStr);
   const toExclusive = toUtcDay(addDays(toStr, 1));
-  const ownedLeadIds = ownerId ? await Lead.find({ ownerId }).distinct('_id') : null;
+  const ownedLeadIds = ownerId
+    ? (agentScope.isAgent(req) ? await agentScope.assignedLeadIds(req) : await Lead.find({ ownerId }).distinct('_id'))
+    : null;
   const messageMatch = {
     timestamp: { $gte: from, $lt: toExclusive },
     ...(ownedLeadIds ? { leadId: { $in: ownedLeadIds } } : {}),
@@ -151,6 +168,7 @@ const getTimeseries = asyncHandler(async (req, res) => {
   const emailMatch = {
     ownerId: ownerId ? new mongoose.Types.ObjectId(ownerId) : { $exists: true },
     direction: { $in: ['outbound', 'inbound'] },
+    ...(agentScope.isAgent(req) ? { leadId: { $in: ownedLeadIds } } : {}),
   };
   const [whatsappRows, emailRows] = await Promise.all([
     Message.aggregate([
@@ -200,10 +218,13 @@ const getTimeseries = asyncHandler(async (req, res) => {
 /** GET /api/analytics/funnel — Sales Funnel + Site Visit Funnel. */
 const getFunnel = asyncHandler(async (req, res) => {
   const filter = ownerFilter(req);
+  const agent = agentScope.isAgent(req);
+  const leadMatch = agent ? { ...filter, assignedTo: new mongoose.Types.ObjectId(req.user.actorId) } : filter;
+  const meetingMatch = agent ? { ...filter, leadId: { $in: await agentScope.assignedLeadIds(req) } } : filter;
 
   const [byStatus, meetingsByStatus] = await Promise.all([
-    Lead.aggregate([{ $match: filter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
-    Meeting.aggregate([{ $match: filter }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+    Lead.aggregate([{ $match: leadMatch }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
+    Meeting.aggregate([{ $match: meetingMatch }, { $group: { _id: '$status', count: { $sum: 1 } } }]),
   ]);
 
   const statusMap = Object.fromEntries(byStatus.map((s) => [s._id, s.count]));

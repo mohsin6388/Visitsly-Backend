@@ -3,7 +3,6 @@ const asyncHandler = require("../utils/asyncHandler");
 const ApiError = require("../utils/ApiError");
 const ApiResponse = require("../utils/ApiResponse");
 const EmailMessage = require("../models/EmailMessage");
-const accounts = require("../services/email/emailAccountService");
 const logger = require("../utils/logger");
 
 const TZ = "Asia/Kolkata";
@@ -13,52 +12,95 @@ const PENDING_STATES = ["queued", "sending"];
 const ownerFilter = (req) => ({ ownerId: req.user.id });
 
 /* ------------------------------------------------------------------ */
-/* Email account (client ka apna official email)                       */
+/* Company sender (official email, verified through Brevo) + wallet     */
 /* ------------------------------------------------------------------ */
 
-/** GET /api/email/account */
-const getAccount = asyncHandler(async (req, res) => {
-  const account = await accounts.getAccount(req.user.id);
-  return new ApiResponse(200, { account: accounts.publicView(account) }).send(res);
-});
+const AuditLog = require("../models/AuditLog");
+const Organization = require("../models/Organization");
+const senders = require("../services/email/emailSenderService");
+const wallet = require("../services/email/emailWallet");
+const safety = require("../services/email/emailSafety");
 
-/** PUT /api/email/account — login verify hota hai, tabhi save. */
-const saveAccount = asyncHandler(async (req, res) => {
+const audit = (req, action, meta = {}) =>
+  AuditLog.create({ userId: req.user.actorId, action, meta, ip: req.ip }).catch(() => {});
+
+/** Domain errors from the services carry EMAIL_* / BREVO_* codes and client-ready messages. */
+function asClientError(err) {
+  const code = String(err?.code || "");
+  if (code.startsWith("EMAIL_") || code.startsWith("BREVO_")) return ApiError.badRequest(err.message);
+  return err;
+}
+const guard = (fn) => asyncHandler(async (req, res) => {
   try {
-    const account = await accounts.saveAccount(req.user.id, req.body || {});
-    return new ApiResponse(200, { account }, "Email account connect ho gaya").send(res);
+    return await fn(req, res);
   } catch (err) {
-    if (String(err.code || "").startsWith("EMAIL_")) throw ApiError.badRequest(err.message);
-    throw err;
+    throw asClientError(err);
   }
 });
 
-/** POST /api/email/account/test — apne aap ko test email. */
-const testAccount = asyncHandler(async (req, res) => {
-  const account = await accounts.getAccount(req.user.id, { withPassword: true });
-  if (!account) throw ApiError.badRequest("Pehle email account connect karein.");
-  const to = String(req.body?.to || account.fromEmail).trim();
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) throw ApiError.badRequest("Sahi email address daaliye.");
-  try {
-    await accounts.sendMail(account, {
-      to,
-      subject: "Visitsly test email",
-      text: "Ye Visitsly se ek test email hai. Agar ye mil gayi, to aapka email account sahi connect hai.",
-    });
-    await accounts.getAccount(req.user.id).then((a) => a && a.updateOne({ $set: { status: "connected", lastError: null } }));
-    return new ApiResponse(200, { to }, `Test email ${to} par bhej di`).send(res);
-  } catch (err) {
-    const message = accounts.friendlyError(err);
-    await accounts.markError(req.user.id, message);
-    logger.warn("[email] Test email failed", { ownerId: String(req.user.id), error: err.message });
-    throw ApiError.badRequest(message);
-  }
+async function freshOrg(req) {
+  return Organization.findById(req.org._id).select("name emailWallet").lean();
+}
+
+/** GET /api/email/status — sender + wallet + today's usage in one call (setup page). */
+const status = asyncHandler(async (req, res) => {
+  const [sender, org] = await Promise.all([senders.getSender(req.user.id), freshOrg(req)]);
+  const view = senders.publicView(sender);
+  if (sender) view.sentToday = await safety.sentToday(req.user.id);
+  view.dailyCap = safety.dailyCap();
+  return new ApiResponse(200, { sender: view, wallet: wallet.summary(org), featureEnabled: require("../services/saas/subscription").hasFeature(req.org, "emailCampaigns") }).send(res);
 });
 
-/** DELETE /api/email/account */
-const removeAccount = asyncHandler(async (req, res) => {
-  await accounts.removeAccount(req.user.id);
-  return new ApiResponse(200, { removed: true }, "Email account hata diya").send(res);
+/** POST /api/email/sender { email, displayName, guidelinesAccepted } — Brevo emails a 6-digit code. */
+const startSender = guard(async (req, res) => {
+  const sender = await senders.start({
+    org: req.org, ownerId: req.user.id, email: req.body?.email, displayName: req.body?.displayName, guidelinesAccepted: req.body?.guidelinesAccepted,
+  });
+  await audit(req, "email.sender.start", { email: sender.email });
+  return new ApiResponse(200, { sender: senders.publicView(sender) }, "We sent a 6-digit code to this email").send(res);
+});
+
+/** POST /api/email/sender/verify { otp } */
+const verifySender = guard(async (req, res) => {
+  const sender = await senders.verifyOtp(req.user.id, req.body?.otp);
+  await audit(req, "email.sender.verify", { email: sender.email });
+  return new ApiResponse(200, { sender: senders.publicView(sender) }, "Email verified").send(res);
+});
+
+/** POST /api/email/sender/resend — new code (Brevo has no resend call: the sender is re-created). */
+const resendSender = guard(async (req, res) => {
+  const sender = await senders.resendOtp(req.user.id);
+  return new ApiResponse(200, { sender: senders.publicView(sender) }, "We sent a new code").send(res);
+});
+
+/** POST /api/email/sender/check-dns — re-read DNS status and authenticate when ready. */
+const checkDns = guard(async (req, res) => {
+  const sender = await senders.checkDns(req.user.id);
+  await audit(req, "email.sender.check_dns", { domain: sender.domain, domainAuthStatus: sender.domainAuthStatus });
+  return new ApiResponse(200, { sender: senders.publicView(sender) }).send(res);
+});
+
+/** DELETE /api/email/sender */
+const removeSender = guard(async (req, res) => {
+  await senders.remove(req.user.id);
+  await audit(req, "email.sender.remove");
+  return new ApiResponse(200, { removed: true }, "Sender removed").send(res);
+});
+
+/** GET /api/email/wallet — balance, price per email (incl. GST), recent recharges. No cost / margin. */
+const getWallet = asyncHandler(async (req, res) => {
+  const org = await freshOrg(req);
+  const ledger = await wallet.recentLedger(req.org._id, 20);
+  return new ApiResponse(200, {
+    wallet: wallet.summary(org),
+    history: ledger.map((t) => ({ _id: t._id, type: t.type === "admin_credit" || t.type === "recharge" ? "credit" : "debit", emails: t.emails, amount: t.amountMilli / 1000, at: t.createdAt })),
+  }).send(res);
+});
+
+/** GET /api/email/estimate?count=N — launch-time cost estimate. */
+const estimate = asyncHandler(async (req, res) => {
+  const org = await freshOrg(req);
+  return new ApiResponse(200, { estimate: wallet.estimate(org, req.query.count) }).send(res);
 });
 
 /* ------------------------------------------------------------------ */
@@ -184,4 +226,24 @@ function scopedMatch(scoped) {
   return { $and: scoped.$and.map(cast) };
 }
 
-module.exports = { getAccount, saveAccount, testAccount, removeAccount, details };
+/**
+ * GET|POST /api/webhooks/email-unsubscribe/:token — public. The link in every bulk email
+ * (and the one-click List-Unsubscribe header) lands here. Only stops EMAIL campaigns.
+ */
+const unsubscribe = async (req, res) => {
+  const leadId = require("../utils/emailUnsub").verifyToken(req.params.token);
+  const page = (title, text) => res.status(leadId ? 200 : 400).type("html").send(
+    `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title></head><body style="font-family:Arial,Helvetica,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;background:#f8fafc;margin:0"><div style="max-width:420px;padding:32px;text-align:center;background:#fff;border-radius:14px;box-shadow:0 1px 8px rgba(0,0,0,.08)"><h2 style="margin:0 0 10px;color:#064e3b">${title}</h2><p style="color:#475569;line-height:1.6;margin:0">${text}</p></div></body></html>`,
+  );
+  if (!leadId) return page("Invalid link", "This unsubscribe link is invalid or incomplete.");
+  try {
+    await require("../models/Lead").updateOne({ _id: leadId }, { $set: { emailOptedOut: true, emailOptedOutAt: new Date() } });
+  } catch (err) {
+    logger.error("[email] unsubscribe failed", { error: err.message });
+    return res.status(500).type("html").send("Something went wrong. Please try again later.");
+  }
+  if (req.method === "POST") return res.json({ ok: true }); // mail clients' one-click
+  return page("You are unsubscribed", "You will no longer receive emails from this company.");
+};
+
+module.exports = { unsubscribe, status, startSender, verifySender, resendSender, checkDns, removeSender, getWallet, estimate, details };

@@ -37,7 +37,7 @@ properties and bill. Companies never see each other's data.
 - **Reports**: funnel, source-wise results (reply %, visit %, bookings, revenue), team performance and a daily trend. A weekly WhatsApp report goes to the owner every Monday.
 - **Cost sheets**: unit price breakup (rate × area, PLC/parking/club, discount, GST, stamp duty, registration) with a payment plan, a branded PDF link, and sending on WhatsApp inside the 24-hour window.
 - **Channel partner portal** (`/cp/<company-slug>`): brokers register and you approve them. They register customers with lead protection, track each lead's stage, see inventory and brochures, and see their commission. Use **Mark booked** in the chat panel with the deal value to drive commission and reports.
-- **AI voice calling** (Bolna): calls on demand from the chat panel, or auto-calls fresh leads that don't reply on WhatsApp. The result webhook writes a summary to the lead, books the visit and meters minutes.
+- **AI voice calling** (Plivo number + ElevenLabs voice + Gemini, Groq fallback): automatic site-visit confirmation calls, calls on demand from the chat panel, and optional auto-calls to fresh leads that don't reply on WhatsApp. Results are written to the lead/visit and minutes are metered. See `VOICE_SETUP.md`.
 - **Multiple WhatsApp numbers** (Builder: 2, Enterprise: unlimited, or the add-on): each buyer is pinned to the number they used. Replies and campaigns can go from a chosen number.
 - **White-label** (Enterprise, set in the admin panel): product name, logo and custom domain. The login page and sidebar show the customer's brand, and the domain is allowed by CORS automatically.
 - **Add-on requests** from Plan & Billing go to the admin panel's Requests page. Once paid, set the add-on on the company page.
@@ -51,7 +51,7 @@ properties and bill. Companies never see each other's data.
 | Portal leads by email | Brevo inbound parsing on your receiving subdomain (`EMAIL_INBOUND_DOMAIN`), already used for email replies. Forwarded mails to `leads-<key>@that-domain` become leads. |
 | Facebook/Instagram Lead Ads | In PropAI's Meta app, add a **Page** webhook subscription to field `leadgen` at `https://<backend>/api/webhooks/meta-leads` with the same verify token. Get App Review for `leads_retrieval`, `pages_show_list`, `pages_manage_metadata`, `pages_read_engagement` and `pages_manage_ads`. |
 | Google Ads | Nothing on your side. The customer copies the URL and key from Lead sources. |
-| AI calling | The customer creates a Bolna agent and pastes the API key and agent id. Bolna's webhook URL is shown on the AI calling page. Bill the ₹7/min add-on from the minutes shown on the company page. |
+| AI calling | Platform-managed — set the Plivo / ElevenLabs / Groq env vars once (see `VOICE_SETUP.md`). Customers only switch the automatic call ON/OFF. AI calling is on Growth and above; included minutes are enforced and customers recharge in Billing → Add-ons (₹7/min, prepaid; calls stop at 0 minutes). |
 | Cost sheet PDFs | Need `pdfkit`, which is already in package.json. Run `npm ci`. |
 
 ## Go-live checklist
@@ -122,3 +122,6 @@ DISPOSABLE_EMAIL_DOMAINS=example-disposable.com,another-temp-domain.example
 `BREVO_FROM_EMAIL` must be verified/authorized in Brevo and the domain should have its sender authentication configured. In production, signup fails safely if verification email delivery is not configured or fails. In local development, the verification link is printed to the backend log when Brevo is not configured. A blocklist of common disposable email domains is applied at signup; email ownership is confirmed by the verification link, not by syntax alone.
 
 The 7-day period starts when the email is successfully verified, not when the signup form is submitted. Existing verified accounts are preserved during migration. Paid plans retain the existing monthly recurring billing option; yearly billing remains optional.
+
+## Invoices (PDF + e-mail)
+Every successful payment (plan, renewal, add-on / minute recharge, offline payment recorded by an admin) gets a numbered invoice (`VIS-2026-27-000123`, per April–March financial year, prefix `INVOICE_PREFIX`). Customers see and download it on Billing → Invoices and get it by e-mail (needs Brevo); the platform admin panel can download it with `GET /api/platform/payments/:id/pdf` (the same list, `GET /api/platform/payments`, now also returns `invoiceNumber`, `subtotal`, `taxAmount`, `emailedAt`, `billedTo`). Seller details come from the optional `INVOICE_*` env vars (see `.env.example`); a line is printed only when its variable is set.

@@ -21,12 +21,22 @@ const updateSchema = z.object({
 const brochureParams = z.object({ params: z.object({ id: objectId, brochureId: objectId }) });
 const imageSchema = z.object({ params: z.object({ id: objectId }), body: z.object({ url: z.string().url() }) });
 
-router.use(authenticate);
+const { requireFeature } = require('../services/saas/subscription');
 
-router.get('/', listSites);
-router.post('/brochure', uploadBrochure.fields([{ name: 'brochure', maxCount: 1 }, { name: 'images', maxCount: 10 }]), uploadSiteBrochure);
-router.patch('/:id', validate(updateSchema), updateSite);
-router.delete('/:id/brochures/:brochureId', validate(brochureParams), removeBrochure);
-router.delete('/:id/images', validate(imageSchema), removeImage);
+// Multi-Project Bot (Builder Pro+): project sites with brochures, maps and
+// photos the AI answers from. Listing stays open (upgrade prompt in the UI).
+const multiProject = requireFeature('multiProjectBot');
+
+router.use(authenticate);
+// Agents can only read sites (Properties page, chat property picker); changes are Owner-only.
+const ownerOnly = require('../middlewares/roleGuard').org('owner');
+const can = require('../middlewares/can');
+
+router.get('/', can.any('properties', 'chatReply'), listSites);
+router.post('/brochure', ownerOnly, multiProject, uploadBrochure.fields([{ name: 'brochure', maxCount: 1 }, { name: 'images', maxCount: 10 }]), uploadSiteBrochure);
+router.patch('/:id', ownerOnly, multiProject, validate(updateSchema), updateSite);
+// Deleting stays allowed so a downgraded company can still clean up.
+router.delete('/:id/brochures/:brochureId', ownerOnly, validate(brochureParams), removeBrochure);
+router.delete('/:id/images', ownerOnly, validate(imageSchema), removeImage);
 
 module.exports = router;

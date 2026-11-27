@@ -13,6 +13,8 @@ const {
   extractPropertyDataWithAI,
 } = require("../services/brochureAiExtractor");
 const { upsertSite } = require("../services/sites/siteBrochure");
+const cloudinary = require("../config/cloudinary");
+const { normaliseExtracted } = require("../services/brochureValidation");
 
 /**
  * Scoping: builders only see/manage their own inventory. Admins can pass
@@ -93,6 +95,144 @@ const confirmImport = asyncHandler(async (req, res) => {
     201,
     { insertedCount: inserted.length },
     `Imported ${inserted.length} properties`,
+  ).send(res);
+});
+
+/**
+ * Shared by the brochure endpoints: create the Property and mirror the
+ * brochure + photos onto the project's site (best effort, like before).
+ */
+async function createBrochureProperty(ownerId, fields, brochure, images) {
+  const property = await Property.create({
+    ownerId,
+    ...fields,
+    images,
+    brochureUrl: brochure.url,
+    brochureName: brochure.originalName,
+    dataSource: "brochure",
+    brochureExtractionStatus: "completed",
+    brochureExtractedAt: new Date(),
+  });
+
+  // Keep the brochure and photos on the project's own site too, so every
+  // unit row of this project (and the AI) uses this site's brochure.
+  try {
+    await upsertSite({
+      ownerId,
+      name: property.projectName,
+      city: property.city || "",
+      location: property.location || "",
+      brochure: { url: brochure.url, name: brochure.originalName, publicId: brochure.publicId },
+      images,
+    });
+  } catch (err) {
+    console.error("[brochure-ai] Could not save brochure on site:", err.message);
+  }
+  return property;
+}
+
+/** Best-effort removal of Cloudinary files (never throws). */
+async function cleanupCloudinary({ brochurePublicId, imageUrls = [] }) {
+  try {
+    if (brochurePublicId) await cloudinary.uploader.destroy(brochurePublicId, { resource_type: "raw" });
+    for (const url of imageUrls) {
+      // https://res.cloudinary.com/<cloud>/image/upload/v123/properties/images/abc.jpg → properties/images/abc
+      const m = String(url).match(/\/upload\/(?:v\d+\/)?(.+?)\.[a-z0-9]+$/i);
+      if (m) await cloudinary.uploader.destroy(m[1], { resource_type: "image" });
+    }
+  } catch (err) {
+    console.error("[brochure-ai] Cloudinary cleanup failed:", err.message);
+  }
+}
+
+/** Uploads the brochure + photos; on any failure removes what was already uploaded. */
+async function uploadBrochureFiles(brochureFile, imageFiles) {
+  const brochureResult = await uploadBufferToCloudinary(brochureFile.buffer, {
+    folder: "properties/brochures",
+    resourceType: "raw",
+  });
+  const brochure = {
+    url: brochureResult.secure_url,
+    publicId: brochureResult.public_id,
+    originalName: brochureFile.originalname,
+  };
+  const images = [];
+  try {
+    for (const imageFile of imageFiles) {
+      const result = await uploadBufferToCloudinary(imageFile.buffer, {
+        folder: "properties/images",
+        resourceType: "image",
+      });
+      images.push(result.secure_url);
+    }
+  } catch (err) {
+    await cleanupCloudinary({ brochurePublicId: brochure.publicId, imageUrls: images });
+    throw err;
+  }
+  return { brochure, images };
+}
+
+/**
+ * POST /api/properties/brochure/extract
+ *
+ * Step 1 of the review flow: upload + extract + validate, but DO NOT create a
+ * property. The owner reviews/edits the fields, then calls /brochure/confirm.
+ */
+const extractBrochureForReview = asyncHandler(async (req, res) => {
+  const brochureFile = req.files?.brochure?.[0];
+  const imageFiles = req.files?.images || [];
+  if (!brochureFile) {
+    throw ApiError.badRequest("Please upload a brochure PDF. Property details will be extracted from the brochure.");
+  }
+
+  const { brochure, images } = await uploadBrochureFiles(brochureFile, imageFiles);
+
+  let normalised;
+  try {
+    const extractedData = await extractPropertyDataWithAI(brochure.url);
+    normalised = normaliseExtracted(extractedData, { currency: "INR" });
+  } catch (error) {
+    console.error("[brochure-ai] Extraction failed:", error.message);
+    // Nothing is saved, so don't leave orphaned files behind.
+    await cleanupCloudinary({ brochurePublicId: brochure.publicId, imageUrls: images });
+    if (error.code === "PROJECT_NAME_REQUIRED") {
+      throw ApiError.badRequest(
+        "Could not detect the project name from the brochure. Please upload a brochure containing clear project details.",
+      );
+    }
+    throw ApiError.badRequest(
+      "Property details could not be extracted from this brochure, and nothing was saved. Please try another PDF.",
+    );
+  }
+
+  return new ApiResponse(
+    200,
+    { extracted: normalised.data, brochure, images, warnings: normalised.warnings },
+    "Brochure processed. Please review the details before saving.",
+  ).send(res);
+});
+
+/**
+ * POST /api/properties/brochure/confirm
+ *
+ * Step 2: the (possibly edited) fields + the uploaded brochure/images →
+ * creates the Property. The body is validated by confirmBrochureSchema and
+ * normalised again server-side.
+ */
+const confirmBrochureProperty = asyncHandler(async (req, res) => {
+  const { brochure: b, images = [], ...fields } = req.body;
+  let normalised;
+  try {
+    normalised = normaliseExtracted(fields, { currency: "INR" });
+  } catch (err) {
+    throw ApiError.badRequest(err.message);
+  }
+  const brochure = { url: b.url, publicId: b.publicId || null, originalName: b.originalName || "brochure.pdf" };
+  const property = await createBrochureProperty(req.user.id, normalised.data, brochure, images);
+  return new ApiResponse(
+    201,
+    { property, brochure, images, warnings: normalised.warnings },
+    "Property created successfully",
   ).send(res);
 });
 
@@ -178,68 +318,32 @@ const uploadBrochureAndImages = asyncHandler(async (req, res) => {
   }
 
   // ==========================================
-  // 5. Create property AFTER AI extraction
+  // 5. Create property AFTER AI extraction (+ keep brochure on the site)
   // ==========================================
-  const propertyData = {
-    ownerId: req.user.id,
-
-    projectName: extractedData.projectName,
-    builderName: extractedData.builderName,
-    propertyType: extractedData.propertyType,
-    bhk: extractedData.bhk,
-    location: extractedData.location,
-    city: extractedData.city,
-
-    budgetMin: extractedData.budgetMin,
-    budgetMax: extractedData.budgetMax,
-
-    sizeSqft: extractedData.sizeSqft,
-
-    amenities: Array.isArray(extractedData.amenities)
-      ? extractedData.amenities
-      : [],
-
-    parking: Boolean(extractedData.parking),
-
-    reraNumber: extractedData.reraNumber,
-
-    nearbyMetro: extractedData.nearbyMetro,
-    nearbySchool: extractedData.nearbySchool,
-    nearbyHospital: extractedData.nearbyHospital,
-
-    mapsLink: extractedData.mapsLink,
-    description: extractedData.description,
-
+  const property = await createBrochureProperty(
+    req.user.id,
+    {
+      projectName: extractedData.projectName,
+      builderName: extractedData.builderName,
+      propertyType: extractedData.propertyType,
+      bhk: extractedData.bhk,
+      location: extractedData.location,
+      city: extractedData.city,
+      budgetMin: extractedData.budgetMin,
+      budgetMax: extractedData.budgetMax,
+      sizeSqft: extractedData.sizeSqft,
+      amenities: Array.isArray(extractedData.amenities) ? extractedData.amenities : [],
+      parking: Boolean(extractedData.parking),
+      reraNumber: extractedData.reraNumber,
+      nearbyMetro: extractedData.nearbyMetro,
+      nearbySchool: extractedData.nearbySchool,
+      nearbyHospital: extractedData.nearbyHospital,
+      mapsLink: extractedData.mapsLink,
+      description: extractedData.description,
+    },
+    brochure,
     images,
-
-    brochureUrl: brochure.url,
-    brochureName: brochure.originalName,
-
-    dataSource: "brochure",
-
-    brochureExtractionStatus: "completed",
-    brochureExtractedAt: new Date(),
-  };
-
-  // ==========================================
-  // 6. Save property to MongoDB
-  // ==========================================
-  const property = await Property.create(propertyData);
-
-  // Keep the brochure and photos on the project's own site too, so every
-  // unit row of this project (and the AI) uses this site's brochure.
-  try {
-    await upsertSite({
-      ownerId: req.user.id,
-      name: property.projectName,
-      city: property.city || "",
-      location: property.location || "",
-      brochure: { url: brochure.url, name: brochure.originalName, publicId: brochure.publicId },
-      images,
-    });
-  } catch (err) {
-    console.error("[brochure-ai] Could not save brochure on site:", err.message);
-  }
+  );
 
   // ==========================================
   // 7. Return response
@@ -430,6 +534,8 @@ module.exports = {
   confirmImport,
   createProperty,
   uploadBrochureAndImages,
+  extractBrochureForReview,
+  confirmBrochureProperty,
   listProperties,
   getProperty,
   updateProperty,

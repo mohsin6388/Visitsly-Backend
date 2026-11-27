@@ -91,7 +91,7 @@ async function captureLead(input) {
     const tag = `repeat:${input.source || 'form'}`;
     if (!lead.tags.includes(tag)) lead.tags.push(tag);
     await lead.save();
-    await Notification.create({ userId: ownerId, type: 'repeat_enquiry', title: `${lead.name} ne dobara enquiry ki`, body: noteLine.slice(0, 300), link: `/whatsapp/conversations?lead=${lead._id}` }).catch(() => {});
+    await Notification.create({ userId: ownerId, type: 'repeat_enquiry', title: `${lead.name} enquired again`, body: noteLine.slice(0, 300), link: `/whatsapp/conversations?lead=${lead._id}` }).catch(() => {});
     emitToUser(ownerId, 'notification:new', {});
     return { lead, created: false, reason: 'repeat' };
   }
@@ -132,7 +132,7 @@ async function captureLead(input) {
   await Notification.create({
     userId: ownerId,
     type: 'new_lead',
-    title: `Nayi lead: ${lead.name}`,
+    title: `New lead: ${lead.name}`,
     body: `${input.source || 'Form'}${lead.project ? ` · ${lead.project}` : ''}${assignee ? ` · ${assignee.name} ko assign` : ''}`,
     link: `/whatsapp/conversations?lead=${lead._id}`,
   }).catch(() => {});
@@ -154,7 +154,7 @@ async function captureLead(input) {
     const count = await Lead.countDocuments({ ownerId });
     const lim = checkLimit(org, 'contacts', count - 1, 1);
     if (!lim.ok) {
-      await Notification.create({ userId: ownerId, type: 'plan_limit', title: 'Contacts limit cross ho gayi', body: 'Nayi inbound leads abhi bhi save ho rahi hain, lekin upload/manual add band hai. Plan upgrade karein.', link: '/billing' });
+      await Notification.create({ userId: ownerId, type: 'plan_limit', title: 'Contacts limit exceeded', body: 'New inbound leads are still saved, but uploads and manual adds are blocked. Upgrade your plan.', link: '/billing' });
     }
   } catch { /* best effort */ }
 

@@ -12,7 +12,7 @@ const {
   createAudienceSchema, updateAudienceSchema, listAudiencesSchema, audienceLeadsSchema, idParamSchema,
 } = require('../validators/audienceValidators');
 
-router.use(authenticate, roleGuard('broker', 'admin'), roleGuard.org('owner', 'manager')); // SaaS: agents can't run bulk sends or change settings
+router.use(authenticate, roleGuard('broker', 'admin'), roleGuard.org('owner')); // SaaS: agents can't run bulk sends or change settings
 
 router.get('/', validate(listAudiencesSchema), listAudiences);
 router.post('/', validate(createAudienceSchema), createAudience);

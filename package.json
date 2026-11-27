@@ -11,7 +11,16 @@
     "seed:client": "node src/utils/seedClient.js",
     "migrate:lead-contact-indexes": "node src/scripts/migrateLeadContactIndexes.js",
     "saas:migrate": "node src/scripts/migrateToSaas.js",
-    "seed:superadmin": "node src/utils/seedSuperAdmin.js"
+    "seed:superadmin": "node src/utils/seedSuperAdmin.js",
+    "test:saas": "node test/saas-pricing.smoke.js",
+    "test:voice": "node test/voice-realtime.smoke.js && node test/voice-leadcall.smoke.js",
+    "test:language": "node test/language.smoke.js",
+    "test:minutes": "node test/voice-minutes.smoke.js",
+    "test:invoices": "node test/invoices.smoke.js",
+    "test:billing": "node test/billing-coupons.smoke.js",
+    "test:brochure": "node test/brochure-validation.smoke.js",
+    "test:team": "node test/team-permissions.smoke.js",
+    "test:email": "node test/email-brevo.smoke.js"
   },
   "dependencies": {
     "@google/genai": "^2.27.0",
@@ -45,7 +54,8 @@
     "zod": "^3.22.4",
     "compression": "^1.7.5",
     "@socket.io/redis-adapter": "^8.3.0",
-    "redis": "^4.7.0"
+    "redis": "^4.7.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

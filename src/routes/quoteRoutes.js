@@ -30,13 +30,13 @@ const quoteSchema = z.object({
     leadId: z.string().regex(/^[a-f\d]{24}$/i).optional().nullable(),
     propertyId: z.string().regex(/^[a-f\d]{24}$/i).optional().nullable(),
     customer: z.object({ name: z.string().max(150).optional(), phone: z.string().max(20).optional(), email: z.string().max(200).optional() }).optional(),
-    project: z.string().trim().min(1, 'Project ka naam chahiye').max(150),
+    project: z.string().trim().min(1, 'Project name is required').max(150),
     unit: unit.optional(),
     pricing,
     paymentPlan: plan,
     validTill: z.string().optional(),
     notes: z.string().max(2000).optional(),
-  }).refine((b) => (b.pricing.ratePerSqft && b.unit?.areaSqft) || b.pricing.baseAmount, { message: 'Rate x area ya base amount chahiye', path: ['pricing'] }),
+  }).refine((b) => (b.pricing.ratePerSqft && b.unit?.areaSqft) || b.pricing.baseAmount, { message: 'Rate × area or a base amount is required', path: ['pricing'] }),
 });
 const previewSchema = z.object({ body: z.object({ unit: unit.optional(), pricing, paymentPlan: plan }) });
 
@@ -44,10 +44,11 @@ const previewSchema = z.object({ body: z.object({ unit: unit.optional(), pricing
 router.get('/public/:token', c.publicPdf);
 
 router.use(authenticate);
-router.get('/', c.list);
-router.post('/preview', validate(previewSchema), c.preview);
-router.post('/', validate(quoteSchema), c.create);
-router.delete('/:id', c.remove);
-router.post('/:id/send-whatsapp', c.sendWhatsapp);
+const can = require('../middlewares/can');
+router.get('/', can.any('leads', 'whatsappLeads', 'inbox'), c.list);
+router.post('/preview', can.any('leads', 'whatsappLeads', 'inbox'), validate(previewSchema), c.preview);
+router.post('/', can('leadEdit'), validate(quoteSchema), c.create);
+router.delete('/:id', can('leadEdit'), c.remove);
+router.post('/:id/send-whatsapp', can('chatReply'), c.sendWhatsapp);
 
 module.exports = router;

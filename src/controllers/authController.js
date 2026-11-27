@@ -13,6 +13,7 @@ const {
 } = require('../utils/tokens');
 const { sendPasswordResetEmail, sendEmailVerificationEmail } = require('../services/email/mailer');
 const { isDisposableEmail } = require('../services/auth/emailAddress');
+const { normalizePhone, phoneVariants } = require('../utils/phone');
 const Organization = require('../models/Organization');
 const Settings = require('../models/Settings');
 const orgService = require('../services/saas/orgService');
@@ -26,11 +27,27 @@ async function orgFor(user) {
   return orgSummary(await orgService.getSnapshot(user.orgId));
 }
 
+/** First WhatsApp message the AI sends (refreshed when the real company name is set in onboarding). */
+function defaultOpeningText(companyName) {
+  return `Hi! Thank you for your interest in ${companyName}. I can help with your property search. What kind of property are you looking for?`;
+}
+
 function userJson(user) {
-  return { ...user.toSafeJSON(), isSuperAdmin: false }; // admin features live in the separate admin panel
+  const { normalizeOrgRole, permissionsFor } = require('../services/saas/permissions');
+  const orgRole = normalizeOrgRole(user.orgRole || 'owner'); // legacy 'manager' reads as 'agent'
+  // `permissions` = the full effective map (Owner: all true) — the frontend's useCan() reads it.
+  return { ...user.toSafeJSON(), orgRole, permissions: permissionsFor({ orgRole, permissions: user.permissions }), isSuperAdmin: false }; // admin features live in the separate admin panel
 }
 
 const REFRESH_COOKIE_NAME = 'refreshToken';
+
+// Used until the owner completes the onboarding wizard (PATCH /api/org/profile).
+const PLACEHOLDER_COMPANY = 'My Company';
+function placeholderName(email) {
+  const local = String(email || '').split('@')[0].replace(/[._+-]+/g, ' ').trim();
+  const name = local ? local.replace(/\b\w/g, (c) => c.toUpperCase()) : 'Owner';
+  return name.length >= 2 ? name.slice(0, 100) : 'Owner';
+}
 
 function durationToMs(value, fallback = 90 * 24 * 60 * 60 * 1000) {
   const match = String(value || '').match(/^(\d+)(s|m|h|d)$/i);
@@ -77,14 +94,14 @@ const login = asyncHandler(async (req, res) => {
     throw ApiError.unauthorized('Invalid email or password');
   }
   if (user.emailVerified === false) {
-    throw ApiError.forbidden('Login se pehle apna email verify karein. Verification link dobara bhejne ke liye signup page par email use karein.');
+    throw ApiError.forbidden('Verify your email before logging in. To get a new link, sign up again with the same email.');
   }
   if (!user.isActive) {
     throw ApiError.forbidden('This account has been deactivated');
   }
   if (env.saas.enabled && !user.orgId) {
     // PropAI staff use the separate admin panel, not the customer app.
-    throw ApiError.forbidden(isSuperAdminUser(user) ? 'PropAI admin login admin panel se karein' : 'This login is not linked to any company');
+    throw ApiError.forbidden(isSuperAdminUser(user) ? 'Platform admins must log in from the admin panel' : 'This login is not linked to any company');
   }
 
   const accessToken = await issueTokens(res, user);
@@ -100,9 +117,10 @@ const login = asyncHandler(async (req, res) => {
     ip: req.ip,
   });
 
+  const org = await orgFor(user);
   return new ApiResponse(
     200,
-    { user: userJson(user), accessToken, org: await orgFor(user) },
+    { user: userJson(user), accessToken, org, profileDone: org ? org.profileDone !== false : true },
     'Logged in successfully'
   ).send(res);
 });
@@ -226,8 +244,24 @@ const getMe = asyncHandler(async (req, res) => {
   return new ApiResponse(200, {
     user: { ...userJson(user), orgRole: req.user.orgRole || user.orgRole, impersonating: !!req.user.impersonating },
     org,
+    // Onboarding wizard gate (frontend): false only for new workspaces.
+    profileDone: org ? org.profileDone !== false : true,
   }).send(res);
 });
+
+/**
+ * One account per mobile number: true when a verified user already uses this
+ * number (stored in any older format) — optionally ignoring one user id.
+ */
+async function phoneInUse(phone, ignoreUserId = null) {
+  const variants = [...new Set(phoneVariants(phone))];
+  const query = {
+    emailVerified: { $ne: false },
+    $or: [{ phone: { $in: variants } }, { 'pendingSignup.phone': { $in: variants } }],
+  };
+  if (ignoreUserId) query._id = { $ne: ignoreUserId };
+  return Boolean(await User.exists(query));
+}
 
 /**
  * POST /api/auth/signup — create a pending account. Workspace creation and
@@ -235,25 +269,43 @@ const getMe = asyncHandler(async (req, res) => {
  */
 const signup = asyncHandler(async (req, res) => {
   if (!env.saas.enabled || !env.saas.signupEnabled) throw ApiError.forbidden('Signup is disabled');
-  const { companyName, name, email, phone, password, city, businessType, plan, country } = req.body;
+  const { companyName, name, email, password, city, businessType, plan } = req.body;
   const normalizedEmail = String(email || '').trim().toLowerCase();
+  // Detected country (IP first, then browser guess) sent by the signup page.
+  // Only a default: the customer confirms the real country in onboarding.
+  const { isCountryCode, DIAL_CODE } = require('../config/countries');
+  const hinted = String(req.body.country || '').trim().toUpperCase();
+  const country = isCountryCode(hinted) ? hinted : (await require('../services/geo/geoLookup').countryForRequest(req)) || 'IN';
+
+  // The phone arrives in full international format (+<code><number>). A number
+  // without "+" falls back to the detected country. Normalised so the same
+  // number can't be registered twice.
+  const parsedPhone = normalizePhone(req.body.phone, { defaultCountry: country, dialCode: DIAL_CODE[country] });
+  if (!parsedPhone.ok) throw ApiError.badRequest(parsedPhone.error ? `Enter a valid mobile number. ${parsedPhone.error}.` : 'Enter a valid mobile number.');
+  const phone = parsedPhone.phone;
 
   if (isDisposableEmail(normalizedEmail)) {
-    throw ApiError.badRequest('Temporary/disposable email addresses allowed nahi hain. Apna email address use karein jahan aap verification link receive kar sakein.');
+    throw ApiError.badRequest('Temporary email addresses are not allowed. Use an email you can verify.');
   }
   const existingUser = await User.findOne({ email: normalizedEmail });
   if (existingUser) {
     if (existingUser.emailVerified === false) {
-      throw ApiError.conflict('Is email ka verification pending hai. Verification link resend karein.');
+      throw ApiError.conflict('Email verification pending. Resend the verification link.');
     }
-    throw ApiError.conflict('Is email se pehle se account hai — login karein.');
+    throw ApiError.conflict('This email is already registered. Log in instead.');
+  }
+  if (await phoneInUse(phone)) {
+    throw ApiError.conflict('This mobile number is already registered. Log in instead.');
   }
 
   const rawToken = generateRawToken();
-  const baseSlug = Organization.slugify(companyName);
+  // Company details come later (onboarding wizard). Placeholders keep the
+  // pending-signup record and the workspace valid until then.
+  const company = String(companyName || '').trim() || PLACEHOLDER_COMPANY;
+  const baseSlug = Organization.slugify(company === PLACEHOLDER_COMPANY ? 'company' : company);
   const pendingPlan = plan && PLANS[plan]?.public ? plan : null;
   const user = new User({
-    name,
+    name: String(name || '').trim() || placeholderName(normalizedEmail),
     email: normalizedEmail,
     phone,
     role: 'broker',
@@ -262,13 +314,13 @@ const signup = asyncHandler(async (req, res) => {
     emailVerificationTokenHash: hashToken(rawToken),
     emailVerificationExpires: new Date(Date.now() + env.emailVerificationExpiresHours * 60 * 60 * 1000),
     pendingSignup: {
-      companyName,
+      companyName: company,
       slug: `${baseSlug}-${generateRawToken().slice(0, 6)}`,
       city: city || '',
       businessType: businessType || 'broker',
       phone: phone || '',
       plan: pendingPlan,
-      country: String(country || 'IN').toUpperCase().slice(0, 8),
+      country: country.slice(0, 8),
     },
   });
   user.setPassword(password);
@@ -282,7 +334,7 @@ const signup = asyncHandler(async (req, res) => {
     // the request. Duplicate-key races are still surfaced by the API handler.
     await User.deleteOne({ _id: user._id }).catch(() => {});
     if (err?.code === 'BREVO_NOT_CONFIGURED' || String(err?.code || '').startsWith('BREVO_')) {
-      throw new ApiError(503, 'Email verification abhi send nahi ho paayi. Please kuch der baad dobara try karein.');
+      throw new ApiError(503, 'We could not send the verification email. Please try again shortly.');
     }
     throw err;
   }
@@ -290,7 +342,7 @@ const signup = asyncHandler(async (req, res) => {
   return new ApiResponse(
     201,
     { email: normalizedEmail, verificationRequired: true, expiresInHours: env.emailVerificationExpiresHours },
-    `Verification email bhej di gayi hai. Email verify karne ke baad aapka ${TRIAL_DAYS}-day free trial shuru hoga.`
+    `Verification email sent. Your ${TRIAL_DAYS}-day free trial starts once you verify.`
   ).send(res);
 });
 
@@ -301,7 +353,7 @@ const signup = asyncHandler(async (req, res) => {
  */
 const verifyEmail = asyncHandler(async (req, res) => {
   const rawToken = String(req.body.token || '').trim();
-  if (!rawToken) throw ApiError.badRequest('Verification token missing hai');
+  if (!rawToken) throw ApiError.badRequest('Verification token is missing');
 
   const user = await User.findOneAndUpdate(
     {
@@ -317,17 +369,26 @@ const verifyEmail = asyncHandler(async (req, res) => {
   ).select('+emailVerificationTokenHash +emailVerificationExpires');
 
   if (!user) {
-    throw ApiError.badRequest('Verification link invalid ya expire ho gayi hai. Naya link mangwayein.');
+    throw ApiError.badRequest('This verification link is invalid or expired. Request a new one.');
   }
 
   const pending = user.pendingSignup;
+  if (pending?.phone && (await phoneInUse(pending.phone, user._id))) {
+    await User.deleteOne({ _id: user._id }).catch(() => {});
+    throw ApiError.conflict('This mobile number is already registered. Log in instead.');
+  }
   let org = null;
   try {
     let slug = pending.slug || Organization.slugify(pending.companyName);
     if (await Organization.exists({ slug })) slug = `${Organization.slugify(pending.companyName)}-${generateRawToken().slice(0, 8)}`;
 
+    // Placeholder company — the owner fills in the real details in the
+    // onboarding wizard after the first login (profileDone = false). The
+    // country is the detected one; currency is provisional and is only fixed
+    // when the wizard is completed.
+    const country = String(pending.country || 'IN').toUpperCase();
     org = await Organization.create({
-      name: pending.companyName,
+      name: pending.companyName || PLACEHOLDER_COMPANY,
       slug,
       ownerUserId: user._id,
       city: pending.city || '',
@@ -336,17 +397,17 @@ const verifyEmail = asyncHandler(async (req, res) => {
       phone: pending.phone || user.phone || '',
       plan: 'trial',
       status: 'trialing',
-      country: pending.country || 'IN',
-      currency: require('../config/pricing').currencyForCountry(pending.country || 'IN'),
+      country,
+      currency: require('../config/pricing').currencyForCountry(country),
       trialEndsAt: new Date(Date.now() + TRIAL_DAYS * 24 * 60 * 60 * 1000),
       pendingPlan: pending.plan && PLANS[pending.plan]?.public ? pending.plan : null,
-      onboarding: { companyDone: true },
+      onboarding: { companyDone: false, profileDone: false },
     });
 
     await Settings.create({
       orgId: org._id,
-      companyName: pending.companyName,
-      openingText: `Namaste! Thank you for your interest in ${pending.companyName}. Main aapki property search mein help kar sakta/sakti hoon. Aap kis type ki property dekh rahe hain?`,
+      companyName: org.name,
+      openingText: defaultOpeningText(org.name),
       referral: { enabled: false },
     });
 
@@ -384,14 +445,14 @@ const verifyEmail = asyncHandler(async (req, res) => {
   return new ApiResponse(
     200,
     { email: user.email, verified: true, trialDays: TRIAL_DAYS },
-    `Email verify ho gaya! Aapka ${TRIAL_DAYS} din ka free trial ab shuru hai. Login karke shuru karein.`
+    `Email verified. Your ${TRIAL_DAYS}-day free trial has started. Log in to continue.`
   ).send(res);
 });
 
 /** POST /api/auth/resend-verification — generic response prevents email enumeration. */
 const resendVerification = asyncHandler(async (req, res) => {
   const email = String(req.body.email || '').trim().toLowerCase();
-  const genericMessage = 'Agar is email par verification pending hai, to naya link bhej diya jayega.';
+  const genericMessage = 'If verification is pending for this email, a new link has been sent.';
   const user = await User.findOne({ email, emailVerified: false, 'pendingSignup.companyName': { $exists: true, $ne: '' } })
     .select('+emailVerificationTokenHash +emailVerificationExpires');
 
@@ -411,7 +472,7 @@ const resendVerification = asyncHandler(async (req, res) => {
 const changePassword = asyncHandler(async (req, res) => {
   const user = await User.findById(req.user.actorId || req.user.id).select('+passwordHash');
   if (!user || !(await user.comparePassword(req.body.currentPassword))) {
-    throw ApiError.badRequest('Current password galat hai');
+    throw ApiError.badRequest('Current password is incorrect');
   }
   user.setPassword(req.body.newPassword);
   user.mustChangePassword = false;
@@ -435,11 +496,18 @@ const updateProfile = asyncHandler(async (req, res) => {
   }
 
   if (email && email.toLowerCase() !== user.email) {
-    throw ApiError.badRequest('Login email change ke liye naya verification flow zaroori hai. Abhi support team se contact karein.');
+    throw ApiError.badRequest('Changing the login email needs verification. Please contact support.');
   }
 
   if (name !== undefined) user.name = name;
-  if (phone !== undefined) user.phone = phone;
+  if (phone !== undefined) {
+    const parsed = normalizePhone(phone, { defaultCountry: req.org?.country || 'IN' });
+    if (!parsed.ok) throw ApiError.badRequest('Enter a valid mobile number.');
+    if (parsed.phone !== user.phone && (await phoneInUse(parsed.phone, user._id))) {
+      throw ApiError.conflict('This mobile number is already registered.');
+    }
+    user.phone = parsed.phone;
+  }
 
   await user.save();
 
@@ -466,4 +534,6 @@ module.exports = {
   resetPassword,
   getMe,
   updateProfile,
+  defaultOpeningText,
+  PLACEHOLDER_COMPANY,
 };

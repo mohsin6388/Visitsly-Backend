@@ -59,7 +59,10 @@ function sanitizeFollowUpDate(raw, { score, urgency }) {
   return d;
 }
 
-function buildAnalysisPrompt(lead) {
+function buildAnalysisPrompt(lead, language = null) {
+  const languageLine = language
+    ? `\n\nLANGUAGE: the customer's saved chat language is ${language}. Write nextFollowUpMessage in ${require('../language').scriptNote(language)} — never in another language. (summary, requirement, memory and reason stay in English for the sales team.)`
+    : '';
   return `Today's date (India time) is ${istToday()}. All dates you return must be AFTER today.
 
 You are a real estate sales analyst reviewing the WhatsApp and email conversation between a sales executive (or the AI assistant) and a buyer named ${lead.name}.
@@ -77,7 +80,7 @@ Read the full conversation history and return a structured analysis:
 - A sensible next follow-up date (consider urgency — hot leads get followed up sooner, within 1-2 days; cold leads can wait longer) and a natural draft opening line for that follow-up.
 - Urgency level and an overall buying probability.
 
-Be realistic and conservative — don't inflate scores just because the buyer was polite.`;
+Be realistic and conservative — don't inflate scores just because the buyer was polite.${languageLine}`;
 }
 
 const POSITIVE_SIGNALS = [
@@ -150,10 +153,10 @@ async function analyzeLeadAsync({ leadId, conversationId = null }) {
   const entries = await loadLeadTranscript(leadId);
   if (!entries.some((e) => e.fromCustomer)) return; // no reply yet → not a lead
 
-  if (!conversationId) {
-    const conversation = await Conversation.findOne({ leadId }).select('_id').lean();
-    conversationId = conversation?._id || null;
-  }
+  const chat = await Conversation.findOne(conversationId ? { _id: conversationId } : { leadId }).select('_id language').lean();
+  if (!conversationId) conversationId = chat?._id || null;
+  // E5: the follow-up draft is written in the customer's saved chat language.
+  const language = require('../language').normalize(chat?.language) || null;
 
   const transcript = entries
     .map((e) => `[${e.channel}] ${e.fromCustomer ? 'Buyer' : 'Sales Exec'}: ${e.text}`)
@@ -165,7 +168,7 @@ async function analyzeLeadAsync({ leadId, conversationId = null }) {
     try {
       ({ parsed } = await generateStructured({
         apiKey,
-        systemInstruction: buildAnalysisPrompt(lead),
+        systemInstruction: buildAnalysisPrompt(lead, language),
         history: [{ role: 'user', text: transcript }],
         responseSchema: ANALYSIS_RESPONSE_SCHEMA,
         temperature: 0.3, // scoring should be consistent, not creative
@@ -182,7 +185,7 @@ async function analyzeLeadAsync({ leadId, conversationId = null }) {
     parsed = {
       ...fallback,
       nextFollowUpDate: new Date(Date.now() + days * 86400000).toISOString().slice(0, 10),
-      nextFollowUpMessage: `Namaste ${lead.name || ''}, aapki property requirement par aage baat karein?`.replace(/\s+,/, ','),
+      nextFollowUpMessage: require('../language').t('followup.analyzer', language || 'Hinglish', { name: require('../language').nameVar(lead) }),
       modelVersion: 'heuristic',
     };
   }

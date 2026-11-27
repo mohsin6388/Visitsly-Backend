@@ -94,8 +94,10 @@ async function weeklyTick() {
     'weeklyReport.phone': { $nin: [null, ''] },
     'weeklyReport.lastSentWeek': { $ne: dateStr },
     status: { $in: ['trialing', 'active', 'past_due'] },
-  }).select('_id name ownerUserId weeklyReport').lean();
+  }).select('_id name ownerUserId weeklyReport plan status featureOverrides').lean();
+  const { hasFeature } = require('../saas/subscription');
   for (const org of orgs) {
+    if (!hasFeature(org, 'weeklyReports')) continue; // Builder Pro+ feature
     try {
       await orgService.runForOrg(org._id, async () => {
         const report = await buildReport(org.ownerUserId, org._id, '7d');

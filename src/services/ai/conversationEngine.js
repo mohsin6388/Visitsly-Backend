@@ -1,0 +1,2142 @@
+const Lead = require("../../models/Lead");
+const Conversation = require("../../models/Conversation");
+const Message = require("../../models/Message");
+const Meeting = require("../../models/Meeting");
+const Notification = require("../../models/Notification");
+const OutboundJob = require("../../models/OutboundJob");
+const Property = require("../../models/Property");
+
+const settingsService = require("../settings/settingsService");
+const metaWhatsappClient = require("../whatsapp/metaWhatsappClient");
+const { recordOutboundMessage } = require("../whatsapp/messageStore");
+const { matchProperties } = require("./propertyMatcher");
+const { generateStructured } = require("./geminiClient");
+const {
+  buildSystemInstruction,
+  REPLY_RESPONSE_SCHEMA,
+  isPitchCompany,
+  toGeminiHistory,
+} = require("./promptBuilder");
+const { analyzeConversationAsync } = require("./leadAnalyzer");
+const replyGuard = require("./replyGuard");
+const { attachSiteBrochure } = require("../sites/siteBrochure");
+const {
+  createCalendarEvent,
+  updateCalendarEvent,
+} = require("../calendar/googleCalendarService");
+const { enqueueLeads } = require("../queue/outboundQueue");
+const env = require("../../config/env");
+const tenantContext = require("../../context/tenantContext");
+const openingTemplateService = require("../whatsapp/openingTemplateService");
+const { emitToUser } = require("../../sockets");
+const logger = require("../../utils/logger");
+
+// Recent messages sent verbatim as context. Older context is carried by the
+// rolling `conversation.memory` + AI summary + collected requirements, so the
+// AI remembers a buyer who comes back days later without blowing the token budget.
+const HISTORY_LIMIT = Number(process.env.AI_HISTORY_LIMIT) || 30;
+
+/* ------------------------------------------------------------------ */
+/* Conversation language (spec E0–E5, services/language)              */
+/* ------------------------------------------------------------------ */
+const languageService = require("../language");
+
+const normalizeLanguage = (value) => languageService.normalize(value);
+
+// How each language must be written (Hindi and Hinglish are separate languages).
+const LANGUAGE_WRITING = {
+  English: 'Write the ENTIRE reply in natural, simple English. Do NOT use Hindi/Hinglish words such as "aap", "hai", "ji", "kya", "haan", "nahi", "bataiye", "karein".',
+  Hindi: "Write the ENTIRE reply in simple Hindi using Devanagari script (हिंदी) — even when the customer types Hindi in Roman letters. Property words like BHK, flat, site visit, RERA and numbers may stay as they are, but every sentence is in Devanagari. Never reply in Roman Hinglish.",
+  Hinglish: "Write the reply in natural Roman-script Hinglish (Hindi + English mix, Roman letters only), like a friendly Indian sales consultant on WhatsApp. Never switch to Devanagari.",
+  Urdu: "Write the ENTIRE reply in Urdu using Urdu (Nastaliq / Arabic) script (اردو). Never use Devanagari Hindi or Roman Urdu.",
+  Arabic: "Write the ENTIRE reply in Arabic script (العربية). Do not switch to English or Hinglish.",
+  Bangla: "Write the ENTIRE reply in Bangla using Bangla script (বাংলা). Do not switch to English, Hindi or Hinglish.",
+  Marathi: "Write the ENTIRE reply in Marathi using Devanagari script (मराठी) — Marathi, not Hindi.",
+  Gujarati: "Write the ENTIRE reply in Gujarati using Gujarati script (ગુજરાતી).",
+  Punjabi: "Write the ENTIRE reply in Punjabi using Gurmukhi script (ਪੰਜਾਬੀ).",
+  Tamil: "Write the ENTIRE reply in Tamil using Tamil script (தமிழ்).",
+  Telugu: "Write the ENTIRE reply in Telugu using Telugu script (తెలుగు).",
+  Kannada: "Write the ENTIRE reply in Kannada using Kannada script (ಕನ್ನಡ).",
+  Malayalam: "Write the ENTIRE reply in Malayalam using Malayalam script (മലയാളം).",
+};
+const EXAMPLES_NOTE = "The Hinglish examples in this prompt only show behaviour, not language.";
+const SWITCH_RULE =
+  'If — and only if — the customer EXPLICITLY asks to change the language in their latest message (e.g. "Hindi mein baat karo", "Speak in English", "Urdu mein jawab do"), reply in the requested language and set language_change_request to that language; otherwise language_change_request = null. A single "ok", "yes", "thanks" or emoji is never a language change.';
+
+/**
+ * The LANGUAGE rule for this turn.
+ *   source 'selected' / 'agent' / old chats → locked until an explicit request
+ *   source 'detected'                       → the language the customer writes in
+ */
+function languageRule(language, defaultLanguage = "", source = null) {
+  if (!language) {
+    return `LANGUAGE: Reply in the same language and script the customer is using in their latest message (Hindi in Devanagari → Hindi in Devanagari; Hindi typed in Roman letters → Hinglish in Roman letters). Never ask which language they prefer. ${SWITCH_RULE}`;
+  }
+  const extra = `${LANGUAGE_WRITING[language] || `Write the ENTIRE reply in ${language}.`}${language === "Hinglish" ? "" : ` ${EXAMPLES_NOTE}`}`;
+  if (source === languageService.SOURCES.DETECTED) {
+    return `LANGUAGE — the customer writes in ${language}; this is their saved chat language. ${extra} Keep using ${language} in every reply. Never ask which language they prefer — it is already saved. ${SWITCH_RULE}`;
+  }
+  return `LANGUAGE LOCK — the customer chose ${language}. ${extra} Keep using ${language} in every reply until the customer clearly asks to change the language. Never ask which language they prefer again. ${SWITCH_RULE}`;
+}
+
+/** One-turn note when the language was just chosen / switched. */
+function languageNoteFor(decision) {
+  if (!decision?.changed || !decision.language) return "";
+  if (decision.reason === "explicit" || decision.reason === "prompt_reply") {
+    return `LANGUAGE JUST ${decision.reason === "explicit" ? "CHOSEN" : "SET"}: from now on the chat is in ${decision.language}. Briefly acknowledge in ${decision.language} (a few words at most), then continue — if the customer's earlier messages asked something that was not answered yet, answer it now in ${decision.language}. Do not ask about the language again.`;
+  }
+  if (decision.reason === "auto_switch") {
+    return `LANGUAGE SWITCH: the customer's last messages are in ${decision.language}, so the chat continues in ${decision.language}. Reply in ${decision.language}; do not mention the switch.`;
+  }
+  return "";
+}
+
+/** Text of a stored message for language reading (media labels stripped in detect.js). */
+function inboundTexts(messages) {
+  return messages.filter((m) => m.direction === "inbound" && m.type !== "reaction").map((m) => String(m.text || ""));
+}
+
+/**
+ * Reads the customer's messages and decides the conversation language (E0–E4).
+ * Saves the result — except the "ask" case, which is saved only once the
+ * question really goes out (see askLanguagePreference).
+ */
+async function trackConversationLanguage({ conversation, recentMessages, message }) {
+  const history = [...recentMessages];
+  if (message?._id && !history.some((m) => String(m._id) === String(message._id))) {
+    history.push({ _id: message._id, direction: "inbound", type: message.type, text: message.text || "" });
+  }
+  let lastOut = -1;
+  history.forEach((m, i) => { if (m.direction === "outbound") lastOut = i; });
+  const batch = inboundTexts(history.slice(lastOut + 1));
+  const earlierInbound = inboundTexts(history.slice(0, lastOut + 1)).length;
+  const firstTurn = earlierInbound === 0 && recentMessages.length < HISTORY_LIMIT;
+  const decision = languageService.decideLanguage({
+    saved: {
+      language: conversation.language,
+      source: conversation.languageSource,
+      promptedAt: conversation.languagePromptedAt,
+      promptAnsweredAt: conversation.languagePromptAnsweredAt,
+    },
+    batch,
+    inbound: inboundTexts(history),
+    firstTurn,
+  });
+  if (!decision.ask) await languageService.applyDecision(conversation, decision);
+  return decision;
+}
+
+/**
+ * E0: the one-time question, in English. Returns true when it was sent (this
+ * turn is then complete). Never sent twice per conversation.
+ */
+async function askLanguagePreference({ conversation, lead, message, settings }) {
+  // A newer customer message is waiting → its run decides (and asks once).
+  if (await replyGuard.hasNewerInbound(conversation._id, message?._id)) return { handled: true };
+  if (!(await languageService.claimLanguagePrompt(conversation._id))) return { handled: false };
+  const bot = String(settings?.assistant?.name || "").trim() || "Monica";
+  const options = ["English", "Hindi", "Arabic"].map((l) => languageService.displayName(l)).join(" · ");
+  const text = `Hi! I'm ${bot} 😊\n${languageService.LANGUAGE_QUESTION}\n\n${options}`;
+  const set = { language: "English", languageSource: languageService.SOURCES.DETECTED, languageLockedAt: new Date() };
+  Object.assign(conversation, set, { languagePromptedAt: new Date() });
+  await Conversation.updateOne({ _id: conversation._id }, { $set: set }).catch(() => {});
+  try {
+    const { messageId } = await metaWhatsappClient.sendToLead({ phone: lead.phone, text });
+    const outbound = await recordOutboundMessage({
+      conversationId: conversation._id,
+      leadId: lead._id,
+      text,
+      sender: "ai",
+      whatsappMessageId: messageId || null,
+      ownerId: conversation.ownerId,
+    });
+    await registerAiReply(conversation, lead);
+    emitToUser(conversation.ownerId, "conversation:aiReply", { conversationId: conversation._id, leadId: lead._id, message: outbound });
+    logger.info(`[language] Asked the language preference (first message was English) for lead ${lead._id}`);
+    return { handled: true, sent: true };
+  } catch (err) {
+    logger.error(`[language] Could not send the language question to lead ${lead._id}`, { error: err.response?.data || err.message });
+    return { handled: false };
+  }
+}
+
+/** Language for backend-written text in this chat (saved language, else company default / region). */
+function chatLanguage(conversation, settings, lead) {
+  const region = require("./promptBuilder").detectRegion(lead?.phone) === "UAE" ? "AE" : "IN";
+  return languageService.languageFor(conversation, { settings, region });
+}
+
+function istNow() {
+  const d = new Date(Date.now() + 330 * 60000);
+  const days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  return { date: d.toISOString().slice(0, 10), day: days[d.getUTCDay()], time: d.toISOString().slice(11, 16) };
+}
+
+function humanGap(ms) {
+  const h = ms / 3600000;
+  if (h < 24) return `${Math.round(h)} ghante`;
+  const d = Math.round(h / 24);
+  return `${d} din`;
+}
+
+/** Extra system-prompt block: today's date, language lock, memory, returning-customer note. */
+/** Site-visit guidance for the chat: invite → collect day/time → booked → confirmation. */
+function visitBlock(visit, { callOn }) {
+  const callLine = callOn
+    ? 'After the visit is booked, tell the customer briefly that our team will give them a short call to confirm the visit (e.g. "Hum aapko visit confirm karne ke liye ek chhoti si call karenge").'
+    : "After the visit is booked, tell the customer the team will confirm it on WhatsApp.";
+  if (!visit) {
+    return [
+      "",
+      "SITE VISIT (main goal of this chat):",
+      "- STEP 1: once the customer's basic need is clear, or they like a property / ask for photos, price or location, invite them with ONE yes/no question only, e.g. \"Kya aap iski site visit karna chahenge?\". Do NOT ask for a day/time in this same message. Do not push; if they say not now, continue helping and invite again later naturally.",
+      "- STEP 2: only when they say yes, ask \"Kaunsa din aur time aapke liye theek rahega?\". Do NOT set wantsSiteVisit yet.",
+      "- STEP 1-2 questions are only examples — always ask them in the customer's chat language and script.",
+      "- STEP 3: when they tell a day/time IN ANY LANGUAGE — even vague like \"kal subah\", \"shaam ko\", \"parso\", \"Sunday\", \"कल शाम\", \"நாளை காலை\", \"بكرة\", \"কাল সকালে\", \"उद्या\", \"రేపు\" — set wantsSiteVisit=true and ALWAYS fill proposedDate + proposedTime (never leave them empty when a day was given). Work out proposedDate as the exact YYYY-MM-DD from TODAY's date given above (kal = tomorrow, parso = day after) and proposedTime as HH:mm 24h (subah=11:00, dopahar=14:00, shaam=17:00; if only a day is given use 11:00). In your reply repeat the exact day, date and time and say the visit is booked.",
+      "- If they give only a time or a vague answer like \"baad mein\", ask for the day once more. NEVER set wantsSiteVisit without a real date.",
+      `- ${callLine}`,
+    ].join("\n");
+  }
+  const when = visit.dateTentative ? "day/time NOT fixed yet" : `${visit.preferredDate} at ${visit.preferredTime}`;
+  const conf = visit.confirmation?.status || "none";
+  const lines = ["", `SITE VISIT ALREADY BOOKED: ${when}${visit.propertyName ? ` — ${visit.propertyName}` : ""}. Confirmation: ${conf}.`];
+  if (visit.dateTentative) {
+    lines.push("- Ask which day and time suits them (one question). When they tell it, set wantsSiteVisit=true with proposedDate/proposedTime.");
+  } else if (conf === "declined") {
+    lines.push(
+      "- The customer said they CANNOT come at that time. Politely ask which other day/time works, or when we should get back to them.",
+      "- If they give a new day/time → wantsSiteVisit=true with proposedDate/proposedTime and tell them it is confirmed for the new time.",
+      "- If they want to be contacted later → acknowledge warmly (we'll get in touch then); do NOT set wantsSiteVisit.",
+    );
+  } else {
+    lines.push(
+      "- Do NOT book it again. Only if the customer asks to change the day/time, set wantsSiteVisit=true with the NEW proposedDate/proposedTime.",
+      conf === "confirmed" ? "- It is confirmed — if they ask, reassure them and share location details." : `- ${callLine}`,
+    );
+  }
+  return lines.join("\n");
+}
+
+function buildContextBlock({ conversation, lead, language, languageSource = null, languageNote = "", recentMessages, visit = null, callOn = true, mediaLine = "", customInstructions = "", defaultLanguage = "" }) {
+  const now = istNow();
+  const inbound = recentMessages.filter((m) => m.direction === "inbound");
+  const prevInbound = inbound.length >= 2 ? inbound[inbound.length - 2] : null;
+  const gapMs = prevInbound ? Date.now() - new Date(prevInbound.timestamp).getTime() : 0;
+  const req = conversation.collectedRequirements || {};
+  const known = [
+    lead.name && !/^whatsapp\s/i.test(lead.name) && `Name: ${lead.name}`,
+    req.bhk && `BHK: ${req.bhk}`,
+    req.propertyType && `Type: ${req.propertyType}`,
+    (req.budgetMin != null || req.budgetMax != null) && `Budget: ${req.budgetMin ?? "?"} - ${req.budgetMax ?? "?"}`,
+    req.city && `City: ${req.city}`,
+    req.location && `Location: ${req.location}`,
+    req.projectName && `Project discussed: ${req.projectName}`,
+    req.purpose && `Purpose: ${req.purpose}`,
+    req.timeline && `Timeline: ${req.timeline}`,
+    conversation.meetingStatus && conversation.meetingStatus !== "none" && `Site visit status: ${conversation.meetingStatus}`,
+  ].filter(Boolean);
+
+  const lines = [];
+  // The company's own instructions (Settings → AI assistant). Added before the
+  // hard rules so the locked core rules always win if anything conflicts.
+  const custom = String(customInstructions || "").trim().slice(0, 1500);
+  if (custom) {
+    lines.push(
+      "",
+      "==================================================",
+      "COMPANY INSTRUCTIONS (written by this company — follow them for tone, what to highlight and offers)",
+      "==================================================",
+      "They NEVER override: using only AVAILABLE PROPERTIES facts, no lies or fake urgency, the conversation language rules (the customer's saved language), the media rules and the JSON output format. If anything here conflicts with those, ignore that part.",
+      "<<<",
+      custom,
+      ">>>",
+    );
+  }
+  lines.push(
+    "",
+    "==================================================",
+    "FINAL HARD RULES (highest priority — override any example above)",
+    "==================================================",
+    `TODAY (India time): ${now.date}, ${now.day}, ${now.time}. Use this to understand "aaj", "kal", "parso", "next Sunday" and NEVER suggest a past date or time.`,
+    languageRule(language, defaultLanguage, languageSource),
+    ...(languageNote ? [languageNote] : []),
+  );
+  const memory = String(conversation.memory || conversation.aiSummary || "").trim();
+  if (memory || known.length) {
+    lines.push(
+      "",
+      "LONG-TERM MEMORY (from earlier chats with this same customer — you already know this, NEVER ask it again):",
+      ...(memory ? [memory.slice(0, 1200)] : []),
+      ...known.map((k) => `- ${k}`),
+    );
+  }
+  if (gapMs > 6 * 3600 * 1000) {
+    lines.push(
+      "",
+      `RETURNING CUSTOMER: their previous message was about ${humanGap(gapMs)} ago. Do NOT restart the conversation, do NOT greet as if new, do NOT ask the language or requirements again. Briefly welcome them back (one short phrase at most) and continue exactly from where the chat left off, answering their latest message.`,
+    );
+  }
+  const callSummary = String(conversation.lastCallSummary || "").trim();
+  if (callSummary) {
+    lines.push(
+      "",
+      `LAST PHONE CALL WITH THIS CUSTOMER${conversation.lastCallAt ? ` (${new Date(conversation.lastCallAt).toISOString().slice(0, 16).replace("T", " ")} UTC)` : ""}: ${callSummary.slice(0, 600)}`,
+      "Use it: do NOT ask again what was already answered on the call; continue from there towards a site visit.",
+    );
+  }
+  if (mediaLine) lines.push("", mediaLine);
+  lines.push(visitBlock(visit, { callOn }));
+  lines.push(
+    "",
+    "STYLE: Short WhatsApp-style replies (1-4 short lines). Ask at most ONE question per reply. Be warm and human.",
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Sends a photo / brochure and records it in the chat, so whatever the AI
+ * sends (property photos, brochures) is visible in the AI inbox too.
+ */
+function mediaSender(conversation, lead) {
+  const record = (type, media, caption, messageId) =>
+    recordOutboundMessage({
+      conversationId: conversation._id,
+      leadId: lead._id,
+      text: caption || "",
+      sender: "ai",
+      type,
+      media,
+      whatsappMessageId: messageId || null,
+      ownerId: conversation.ownerId,
+    }).catch((err) => logger.warn("[ai] could not record media message", { error: err.message }));
+  return {
+    async image({ phone, imageUrl, caption }) {
+      const result = await metaWhatsappClient.sendImageMessage({ phone, imageUrl, caption });
+      await record("image", { url: imageUrl, caption: caption || null }, caption, result.messageId);
+      return result;
+    },
+    async document({ phone, documentUrl, filename, caption }) {
+      const result = await metaWhatsappClient.sendDocumentMessage({ phone, documentUrl, filename, caption });
+      await record("document", { url: documentUrl, filename: filename || null, mimeType: "application/pdf", caption: caption || null }, caption, result.messageId);
+      return result;
+    },
+  };
+}
+
+function isBrochureRequest(text = "") {
+  const normalized = String(text).toLowerCase().trim();
+
+  // "document" alone is NOT a brochure request ("loan ke liye document chahiye").
+  const brochureKeywords = [
+    "brochure",
+    "broucher",
+    "brosher",
+    "brochur",
+    "ब्रोशर",
+    "pdf",
+    "brochure bhejo",
+    "pdf bhejo",
+    "brochure send",
+    "pdf send",
+    "brochure share",
+    "pdf share",
+  ];
+
+  return brochureKeywords.some((keyword) => normalized.includes(keyword));
+}
+
+const MAX_PROPERTY_PHOTOS = 5;
+
+/** What media a property really has (after resolving its site brochure). */
+function mediaKindOf(property) {
+  if (!property) return null;
+  const images = Array.isArray(property.images) && property.images.length > 0;
+  const brochure = Boolean(property.brochureUrl);
+  return images && brochure ? "both" : images ? "images" : brochure ? "brochure" : null;
+}
+
+// A reply that offers photos / a brochure (any of the chat languages).
+const MEDIA_OFFER_RE = /(photo|pics?\b|picture|image|tasveer|brochure|broucher|फ़ोटो|फोटो|तस्वीर|ब्रोशर|ছবি|ব্রোশিওর|ব্রোশার|صور|كتيب|كتيّب|بروشور|بروشر|تصاویر|تصویر|ફોટા|ફોટો|બ્રોશર|ਫੋਟੋ|ਬਰੋਸ਼ਰ|புகைப்பட|ப்ரோஷர்|ఫోటో|బ్రోచర్|ಫೋಟೋ|ಬ್ರೋಷರ್|ഫോട്ടോ|ബ്രോഷ)/i;
+
+// "Shall I send photos / the brochure?" in the chat's language (catalog keys).
+const MEDIA_OFFER_KEY = {
+  both: "media.offerBoth",
+  images: "media.offerImages",
+  brochure: "media.offerBrochure",
+};
+// "send it" in the other chat languages (the English / Hinglish ones are listed below).
+const SEND_WORDS = ["भेजिए", "भेज दो", "पाठवा", "পাঠাও", "পাঠান", "அனுப்பு", "அனுப்புங்கள்", "పంపండి", "ಕಳುಹಿಸಿ", "അയക്കൂ", "મોકલો", "ਭੇਜੋ", "بھیجیں", "بھیج دیں", "أرسل", "ارسل", "ارسلها"];
+
+function isImageRequest(text = "") {
+  const normalized = String(text).toLowerCase().trim();
+
+  const imageKeywords = [
+    "photo",
+    "photos",
+    "photo bhejo",
+    "photos bhejo",
+    "image",
+    "images",
+    "image bhejo",
+    "images bhejo",
+    "pic",
+    "pics",
+    "pics bhejo",
+    "picture",
+    "pictures",
+    "property ki photo",
+    "property ki photos",
+    "property ki image",
+    "property ki images",
+    "property pics",
+    "property photos",
+  ];
+
+  return imageKeywords.some((keyword) => normalized.includes(keyword));
+}
+
+function isSiteVisitRequest(text = "") {
+  const normalized = String(text).toLowerCase().trim();
+
+  // Explicit negative requests should NOT create a visit.
+  const negativePatterns = [
+    "site visit nahi",
+    "visit nahi",
+    "site visit cancel",
+    "visit cancel",
+    "don't want to visit",
+    "do not want to visit",
+    "not interested in visit",
+  ];
+
+  if (negativePatterns.some((pattern) => normalized.includes(pattern))) {
+    return false;
+  }
+
+  const visitPatterns = [
+    "site visit book",
+    "site visit kar",
+    "site visit schedule",
+    "site visit arrange",
+    "site visit chahiye",
+    "site visit lena",
+    "site visit ke liye",
+    "site visit",
+    "visit book",
+    "visit karna hai",
+    "visit karni hai",
+    "visit schedule",
+    "visit arrange",
+    "property dekhne aana",
+    "property dekhne jaana",
+    "property dekhna hai",
+    "ghar dekhne aana",
+    "flat dekhne aana",
+    "i want to visit",
+    "want to visit",
+    "book a visit",
+    "schedule a visit",
+    "arrange a visit",
+    "book site visit",
+  ];
+
+  return visitPatterns.some((pattern) => normalized.includes(pattern));
+}
+
+/**
+ * Counts one "AI conversation" per lead per calendar month against the
+ * company's plan. Returns false when the AI must not reply.
+ */
+async function reserveAiConversation(conversation) {
+  const tenantContext = require("../../context/tenantContext");
+  const orgService = require("../saas/orgService");
+  const { subscriptionState, checkLimit } = require("../saas/subscription");
+  const org = tenantContext.getOrg();
+  if (!org) return true; // legacy single-client mode
+
+  if (!subscriptionState(org).active) {
+    logger.info(
+      `[ai] Subscription inactive for org ${org._id} — AI reply skipped`,
+    );
+    return false;
+  }
+
+  const month = orgService.currentMonthIST();
+  if (conversation.aiBilledMonth === month) return true; // already counted this month
+
+  const usage = orgService.usageFor(org);
+  const limit = checkLimit(org, "aiConversations", usage.aiConversations, 1);
+  if (!limit.ok) {
+    logger.warn(
+      `[ai] AI conversation limit reached for org ${org._id} (${limit.limit})`,
+    );
+    try {
+      const start = new Date(`${month}-01T00:00:00+05:30`);
+      const already = await Notification.findOne({
+        userId: org.ownerUserId,
+        type: "plan_limit",
+        createdAt: { $gte: start },
+      }).lean();
+      if (!already) {
+        await Notification.create({
+          userId: org.ownerUserId,
+          type: "plan_limit",
+          title: "AI conversation limit reached",
+          body: `${limit.message} The AI has stopped replying to new chats; you can still reply by hand.`,
+          link: "/billing",
+        });
+      }
+    } catch (err) {
+      logger.warn("[ai] Could not create plan-limit notification", {
+        error: err.message,
+      });
+    }
+    return false;
+  }
+
+  const res = await Conversation.updateOne(
+    { _id: conversation._id, aiBilledMonth: { $ne: month } },
+    { $set: { aiBilledMonth: month } },
+  );
+  if (res.modifiedCount)
+    await orgService.incrementUsage(org._id, "aiConversations", 1);
+  conversation.aiBilledMonth = month;
+  return true;
+}
+
+/**
+ * Per-contact AI reply cap (plan limit `aiRepliesPerContact`). Once the AI has
+ * sent that many replies to one contact it stays silent — the broker can still
+ * reply by hand — and the owner is told to upgrade (notification + live event;
+ * the chat screen shows the upgrade banner).
+ */
+async function announceAiLimit(conversation, lead, org, info) {
+  try {
+    const res = await Conversation.updateOne(
+      { _id: conversation._id, aiLimitReachedAt: null },
+      { $set: { aiLimitReachedAt: new Date() } },
+    );
+    emitToUser(conversation.ownerId, "conversation:aiLimit", {
+      conversationId: conversation._id,
+      leadId: lead?._id,
+      ...info,
+    });
+    if (!res.modifiedCount) return; // already announced for this chat
+    await Notification.create({
+      userId: org.ownerUserId || conversation.ownerId,
+      type: "ai_reply_limit",
+      title: "AI reply limit reached for this contact",
+      body:
+        `The AI has sent ${info.limit} replies to ${lead?.name || "this contact"} and will not reply again — ` +
+        `open the chat to reply yourself, or upgrade your plan.`,
+      link: `/conversations?id=${conversation._id}`,
+    });
+  } catch (err) {
+    logger.warn("[ai] Could not announce AI reply limit", {
+      error: err.message,
+    });
+  }
+}
+
+/** True when the AI must NOT reply to this contact any more. */
+async function aiReplyLimitReached(conversation, lead) {
+  const org = require("../../context/tenantContext").getOrg();
+  if (!org) return false; // legacy single-client mode
+  const { aiReplyLimitInfo } = require("../saas/subscription");
+  // Read the live count — two quick customer messages must not both slip through.
+  const fresh = await Conversation.findById(conversation._id)
+    .select("aiReplyCount aiLimitReachedAt")
+    .lean();
+  const info = aiReplyLimitInfo(
+    org,
+    fresh?.aiReplyCount ?? conversation.aiReplyCount,
+  );
+  if (info.reached) {
+    logger.info(
+      `[ai] Per-contact AI reply limit (${info.limit}) reached for lead ${lead._id} — AI reply skipped`,
+    );
+    await announceAiLimit(conversation, lead, org, info);
+    return true;
+  }
+  // Limit was raised (plan upgrade) — clear the old marker so it can fire again later.
+  if (fresh?.aiLimitReachedAt) {
+    await Conversation.updateOne(
+      { _id: conversation._id },
+      { $set: { aiLimitReachedAt: null } },
+    );
+  }
+  return false;
+}
+
+/** Counts one AI reply for this contact; announces the limit the moment it is reached. */
+async function registerAiReply(conversation, lead) {
+  try {
+    const updated = await Conversation.findOneAndUpdate(
+      { _id: conversation._id },
+      { $inc: { aiReplyCount: 1 } },
+      { new: true },
+    )
+      .select("aiReplyCount")
+      .lean();
+    const org = require("../../context/tenantContext").getOrg();
+    if (!org || !updated) return;
+    const { aiReplyLimitInfo } = require("../saas/subscription");
+    const info = aiReplyLimitInfo(org, updated.aiReplyCount);
+    if (info.reached) await announceAiLimit(conversation, lead, org, info);
+  } catch (err) {
+    logger.warn("[ai] Could not count AI reply", { error: err.message });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gemini poori tarah fail ho (saare models 503/429) tab bhi buyer ko chup
+// nahi rehna chahiye. Ek chhota "hold" message bhejte hain (per conversation
+// max 1 baar / 2 min) taaki spam na ho. Band karne ke liye:
+//   AI_FALLBACK_REPLY_ENABLED=false
+// ---------------------------------------------------------------------------
+const AI_FALLBACK_REPLY_ENABLED =
+  String(process.env.AI_FALLBACK_REPLY_ENABLED || "true").toLowerCase() !==
+  "false";
+// Optional custom text; used only when it is in the chat's language (else the
+// built-in text in the customer's language — services/language/messages.js).
+const AI_FALLBACK_REPLY_TEXT = process.env.AI_FALLBACK_REPLY_TEXT || "";
+const AI_FALLBACK_COOLDOWN_MS = 2 * 60 * 1000;
+const lastFallbackAt = new Map(); // conversationId -> timestamp
+
+function fallbackReplyText(language) {
+  const custom = AI_FALLBACK_REPLY_TEXT.trim();
+  if (custom && languageService.detectLanguage(custom).language === language) return custom;
+  return languageService.t("ai.hold", language);
+}
+
+async function sendAiFallbackReply({ conversation, lead, language = null }) {
+  if (!AI_FALLBACK_REPLY_ENABLED) return;
+  const text = fallbackReplyText(language || chatLanguage(conversation, null, lead));
+
+  const key = String(conversation._id);
+  const last = lastFallbackAt.get(key) || 0;
+  if (Date.now() - last < AI_FALLBACK_COOLDOWN_MS) return;
+  lastFallbackAt.set(key, Date.now());
+
+  try {
+    const { messageId } = await metaWhatsappClient.sendToLead({
+      phone: lead.phone,
+      text,
+    });
+    await recordOutboundMessage({
+      conversationId: conversation._id,
+      leadId: lead._id,
+      text,
+      sender: "ai",
+      whatsappMessageId: messageId || null,
+    });
+  } catch (err) {
+    logger.error(`[ai] Fallback reply failed for lead ${lead._id}`, {
+      error: err.message,
+    });
+  }
+}
+
+async function handleInbound({ conversation, lead, message }) {
+  // Recent chat, oldest -> newest. Read first: the conversation language is
+  // tracked for every customer message, even when the AI stays silent
+  // (manual takeover, paused AI) — reminders, follow-ups and calls use it.
+  const recentMessages = (
+    await Message.find({ conversationId: conversation._id }).sort({ timestamp: -1 }).limit(HISTORY_LIMIT).lean()
+  ).reverse();
+  let languageDecision = null;
+  try {
+    languageDecision = await trackConversationLanguage({ conversation, recentMessages, message });
+  } catch (err) {
+    logger.warn("[language] language tracking failed", { error: err.message });
+  }
+
+  // Even when the AI does not reply (manual takeover, paused AI, no key),
+  // the customer's reply must still be scored so lead rules keep working.
+  const scoreOnly = () =>
+    analyzeConversationAsync({
+      leadId: lead._id,
+      conversationId: conversation._id,
+    }).catch((err) =>
+      logger.error(`[ai] Lead scoring failed for lead ${lead._id}`, {
+        error: err.message,
+      }),
+    );
+
+  // Manual takeover, closed chat or customer opted out — no AI reply.
+  if (
+    conversation.status === "manual" ||
+    conversation.status === "closed" ||
+    conversation.optedOut
+  )
+    return scoreOnly();
+
+  // Record WHY the AI stayed silent so the inbox can tell the client, instead of failing quietly.
+  const skip = (reason) => {
+    Conversation.updateOne({ _id: conversation._id }, { $set: { aiSkipReason: reason, aiSkipAt: new Date() } }).catch(() => {});
+    return scoreOnly();
+  };
+
+  const settings = await settingsService.getOrCreateSettings();
+  if (settings.aiPaused) return skip("AI is paused. Turn it on in Settings.");
+  if (!settings.autoReplyEnabled) return skip("Auto-reply is off. Turn it on in Settings.");
+  if (settings.whatsappDisconnected) return skip("WhatsApp is disconnected. Reconnect it in WhatsApp → Connect number.");
+
+  const apiKey = await settingsService.getGeminiKey();
+  if (!apiKey) {
+    logger.warn(
+      `[ai] No Gemini API key configured — skipping AI reply for lead ${lead._id}`,
+    );
+    return skip("The AI is not set up for this account. Contact Visitsly support.");
+  }
+
+  // SaaS: per-contact AI reply cap (e.g. trial = 15 replies per contact).
+  // After that the AI stays silent; scoring still happens.
+  if (await aiReplyLimitReached(conversation, lead)) return skip("Your plan’s AI reply limit for this contact is reached. Upgrade your plan.");
+
+  // SaaS: no AI replies when the company's subscription is inactive or its
+  // monthly AI-conversation quota is used up (scoring still happens).
+  if (!(await reserveAiConversation(conversation))) return skip("Your subscription is inactive or the AI conversation limit is reached. Check the Billing page.");
+  if (conversation.aiSkipReason) Conversation.updateOne({ _id: conversation._id }, { $set: { aiSkipReason: null, aiSkipAt: null } }).catch(() => {});
+
+  // E0: the customer's first message is English (or can't be read) → ask the
+  // language preference once, in English, before anything else.
+  if (languageDecision?.ask) {
+    const asked = await askLanguagePreference({ conversation, lead, message, settings });
+    if (asked.handled) {
+      if (asked.sent) scoreOnly();
+      return;
+    }
+    // Already asked by a parallel run → answer normally (in English for now).
+  }
+
+  // Pull in any properties that already look like a fit given what we know
+  // so far, so the model can reference them by name instead of inventing details.
+
+  // const requirements = conversation.collectedRequirements || {};
+  const requirements = conversation.collectedRequirements || {};
+
+  // Internal media-pending context ko Gemini ke customer context mein mat bhejo.
+  const aiRequirements = { ...requirements };
+  delete aiRequirements.__pendingBrochure;
+
+  // The customer may have sent several short messages before we replied
+  // ("me soch rha hoon" + "kal ka rkhlu"). Read all of them as one turn so the
+  // single reply that goes out answers everything.
+  const latestText = message?.text || "";
+  let currentMessage = latestText;
+  {
+    let lastOut = -1;
+    recentMessages.forEach((m, i) => { if (m.direction === "outbound") lastOut = i; });
+    const unanswered = recentMessages
+      .slice(lastOut + 1)
+      .filter((m) => m.direction === "inbound" && m.type !== "reaction" && String(m._id) !== String(message?._id))
+      .map((m) => String(m.text || "").trim())
+      .filter(Boolean);
+    if (unanswered.length) currentMessage = [...unanswered, latestText].filter(Boolean).join("\n");
+  }
+
+  const candidateProperties = await matchProperties({
+    query: currentMessage,
+
+    city: requirements.city || lead.city,
+    location: requirements.location || lead.location,
+
+    projectName: requirements.projectName,
+
+    budgetMin: requirements.budgetMin ?? lead.budgetMin,
+    budgetMax: requirements.budgetMax ?? lead.budgetMax,
+
+    bhk: requirements.bhk,
+    propertyType: requirements.propertyType,
+    amenities: requirements.amenities || [],
+  });
+
+  // Language decided above (services/language): saved language + its source.
+  const lockedLanguage = normalizeLanguage(conversation.language) || (languageDecision?.ask ? "English" : null);
+  const languageSource =
+    conversation.languageSource ||
+    (languageDecision?.ask ? languageService.SOURCES.DETECTED : lockedLanguage ? languageService.SOURCES.SELECTED : null);
+  if (lockedLanguage) aiRequirements.language = lockedLanguage;
+  const replyLanguage = lockedLanguage || chatLanguage(conversation, settings, lead);
+
+  // Show the real brochure availability of each suggested property (each
+  // site keeps its own brochure) so the AI never offers what isn't uploaded.
+  for (const p of candidateProperties) await attachSiteBrochure(p).catch(() => {});
+
+  // Which property is this turn about? 1) named in the message, 2) the one
+  // the chat was already about, 3) the only suggestion.
+  const lowerMsg = currentMessage.toLowerCase();
+  let turnProperty =
+    candidateProperties.find((p) => p?.projectName && lowerMsg.includes(p.projectName.toLowerCase())) || null;
+  if (!turnProperty && conversation.currentPropertyId) {
+    turnProperty =
+      candidateProperties.find((p) => String(p._id) === String(conversation.currentPropertyId)) ||
+      (await Property.findOne({ _id: conversation.currentPropertyId, isActive: { $ne: false } }).catch(() => null));
+    if (turnProperty) await attachSiteBrochure(turnProperty).catch(() => {});
+  }
+  if (!turnProperty && candidateProperties.length === 1) turnProperty = candidateProperties[0];
+
+  const turnMediaKind = mediaKindOf(turnProperty);
+  const mediaLine = turnProperty
+    ? turnMediaKind
+      ? `MEDIA for "${turnProperty.projectName}": ${turnMediaKind === "both" ? "photos and a brochure are" : turnMediaKind === "images" ? "photos are" : "a brochure is"} uploaded. When you share details of this property and the customer has not just received its media, end your reply with this offer${lockedLanguage ? "" : " (in the customer's language)"}: "${languageService.t(MEDIA_OFFER_KEY[turnMediaKind], replyLanguage)}". Offer nothing else (never offer ${turnMediaKind === "images" ? "a brochure" : turnMediaKind === "brochure" ? "photos" : "videos"}).`
+      : `MEDIA for "${turnProperty.projectName}": NO photos or brochure uploaded. Never offer, promise or mention sending photos/brochure for it. If asked, say the team will share them soon.`
+    : "MEDIA: only offer photos/brochure for one specific property from AVAILABLE PROPERTIES whose \"Photos uploaded\" is above 0 or whose \"Brochure\" is available. Otherwise never offer media.";
+
+  const assistant = settings.assistant || {};
+  const pitchAllowed = isPitchCompany();
+  const baseInstruction = buildSystemInstruction({
+    lead,
+    settings,
+    collectedRequirements: aiRequirements,
+    matchedProperties: candidateProperties,
+    currentMessage,
+
+    referralStatus: conversation.referralStatus || "none",
+
+    referralPersonName:
+      settings.referral?.personName || env.referral.personName,
+    botName: assistant.name || "Monica",
+    botGender: assistant.gender || "female",
+    pitchAllowed,
+  });
+  const activeVisit = await Meeting.findOne({ leadId: lead._id, status: { $in: ["scheduled", "rescheduled"] } })
+    .sort({ createdAt: -1 })
+    .populate("propertyId", "projectName")
+    .lean()
+    .catch(() => null);
+  if (activeVisit) activeVisit.propertyName = activeVisit.propertyId?.projectName || "";
+  const callOn = settings?.visitConfirm?.callEnabled !== false && require("../../config/voiceAgents").isConfigured() && require("../saas/subscription").voiceCallingAvailable(require("../../context/tenantContext").getOrg());
+  const systemInstruction = `${baseInstruction}\n${buildContextBlock({
+    conversation,
+    lead,
+    language: lockedLanguage,
+    languageSource,
+    languageNote: languageNoteFor(languageDecision),
+    recentMessages,
+    visit: activeVisit,
+    callOn,
+    mediaLine,
+    customInstructions: assistant.instructions || "",
+    defaultLanguage: assistant.defaultLanguage || "",
+  })}`;
+
+  let result;
+  try {
+    result = await generateStructured({
+      apiKey,
+      systemInstruction,
+      history: toGeminiHistory(recentMessages),
+      responseSchema: REPLY_RESPONSE_SCHEMA,
+    });
+  } catch (err) {
+    logger.error(`[ai] Gemini reply generation failed for lead ${lead._id}`, {
+      error: err.message,
+    });
+    // Saare Gemini models fail — buyer ko "hold" message bhejo, broker
+    // Conversations page se manually bhi reply kar sakta hai.
+    await sendAiFallbackReply({ conversation, lead, language: replyLanguage });
+    return;
+  }
+
+  const { parsed, raw } = result;
+
+  // Merge newly extracted requirements into what we already knew (never overwrite with blanks).
+  const mergedRequirements = mergeRequirements(requirements, {
+    ...(parsed.extractedRequirements || {}),
+    purpose: parsed.purpose || undefined,
+    timeline: parsed.timeline || undefined,
+    budgetText: parsed.budget || undefined,
+    propertyTypeText: parsed.property_type || undefined,
+    locationText: parsed.location_preference || undefined,
+  });
+  // Older chats without a saved language: take the model's reading.
+  if (!conversation.language) {
+    let detected = normalizeLanguage(parsed.preferred_language);
+    // Hindi typed in Roman letters, never chosen explicitly → Hinglish, so
+    // the Devanagari-only Hindi lock doesn't surprise a Roman-script writer.
+    if (detected === "Hindi" && !/[\u0900-\u097F]/.test(currentMessage)) detected = "Hinglish";
+    if (detected) {
+      await languageService.applyDecision(conversation, { language: detected, source: languageService.SOURCES.DETECTED, changed: true, reason: "model" });
+    }
+  }
+  // E3: an explicit request the rules above did not catch ("can we continue in
+  // Telugu?"). Only trusted when the customer really named that language.
+  const requested = normalizeLanguage(parsed.language_change_request);
+  if (requested && requested !== conversation.language && languageService.mentionsLanguage(currentMessage, requested)) {
+    await languageService.applyDecision(conversation, { language: requested, source: languageService.SOURCES.SELECTED, changed: true, reason: "explicit_model", promptAnswered: Boolean(conversation.languagePromptedAt) });
+  }
+  if (conversation.language) mergedRequirements.language = conversation.language;
+  // Better name than the WhatsApp placeholder → update the lead.
+  if (parsed.name && /^whatsapp\s/i.test(lead.name || "") && String(parsed.name).trim().length >= 2) {
+    await Lead.updateOne({ _id: lead._id }, { $set: { name: String(parsed.name).trim().slice(0, 120) } }).catch(() => {});
+  }
+  conversation.collectedRequirements = mergedRequirements;
+  conversation.lastIntent = parsed.intent;
+  conversation.lastSentiment = parsed.sentiment;
+  if (candidateProperties.length) {
+    // Overwrite, not append — recommendedProperties always reflects the
+    // CURRENT recommendation set, not a running history of everything ever
+    // suggested. See Conversation model notes.
+    conversation.recommendedProperties = candidateProperties.map((p) => p._id);
+  }
+
+  // Referral/handoff closing step ("kya aap Monica ko apne kaam ke liye
+  // lena chahenge?"). The AI only ever DECIDES the stage transition
+  // (referralStage) — the actual phone number is appended here, by code,
+  // so it's always the real configured number and never something the LLM
+  // could get wrong or hallucinate.
+  let outboundText = parsed.reply;
+  const referralPersonName =
+    settings.referral?.personName || env.referral.personName;
+  const referralContactNumber =
+    settings.referral?.contactNumber || env.referral.contactNumber;
+  // The "use Monica for your business" step is only for the platform owner's own company.
+  const referralEnabled = pitchAllowed && (settings.referral?.enabled ?? env.referral.enabled);
+
+  if (
+    referralEnabled &&
+    conversation.referralStatus === "none" &&
+    parsed.referralStage === "ask_now"
+  ) {
+    conversation.referralStatus = "asked";
+    conversation.referralAskedAt = new Date();
+  } else if (
+    referralEnabled &&
+    conversation.referralStatus === "asked" &&
+    parsed.referralStage === "accepted"
+  ) {
+    conversation.referralStatus = "accepted";
+    conversation.referralRespondedAt = new Date();
+    if (referralContactNumber) {
+      outboundText = `${parsed.reply}\n\n${languageService.t("referral.number", conversation.language || replyLanguage, { person: referralPersonName, phone: referralContactNumber })}`;
+    } else {
+      logger.warn(
+        `[ai] Referral accepted for lead ${lead._id} but no referral contact number is configured (set REFERRAL_CONTACT_NUMBER or Settings.referral.contactNumber)`,
+      );
+    }
+  } else if (
+    conversation.referralStatus === "asked" &&
+    parsed.referralStage === "declined"
+  ) {
+    conversation.referralStatus = "declined";
+    conversation.referralRespondedAt = new Date();
+  }
+
+  // Mirror the key fields back onto Lead so existing list/filter/CSV export UI stays useful.
+  const leadUpdates = {};
+  if (mergedRequirements.city) leadUpdates.city = mergedRequirements.city;
+  if (mergedRequirements.location)
+    leadUpdates.location = mergedRequirements.location;
+  if (mergedRequirements.budgetMin != null)
+    leadUpdates.budgetMin = mergedRequirements.budgetMin;
+  if (mergedRequirements.budgetMax != null)
+    leadUpdates.budgetMax = mergedRequirements.budgetMax;
+  if (Object.keys(leadUpdates).length) {
+    await Lead.updateOne({ _id: lead._id }, { $set: leadUpdates });
+  }
+
+  // No artificial delay: Gemini + Meta already take a few seconds.
+  // Right before sending, check whether the customer wrote again while the
+  // reply was being made. If so, drop this reply — the run for the newest
+  // message reads all unanswered messages and sends ONE reply for them.
+  if (await replyGuard.hasNewerInbound(conversation._id, message?._id)) {
+    logger.info(`[ai] Newer customer message arrived — reply for lead ${lead._id} skipped (the newest message will be answered)`);
+    return;
+  }
+
+  // Send the reply out through the Meta WhatsApp Cloud API. This is always a
+  // free-text send here — an inbound customer message is exactly what opens
+  // the 24h customer service window in the first place, so we're always
+  // inside it at this point.
+  let outbound;
+  let currentPropertyAfter = null;
+  try {
+    const { messageId } = await metaWhatsappClient.sendToLead({
+      phone: lead.phone,
+      text: outboundText,
+    });
+
+    outbound = await recordOutboundMessage({
+      conversationId: conversation._id,
+      leadId: lead._id,
+      text: outboundText,
+      sender: "ai",
+      whatsappMessageId: messageId || null,
+      aiPrompt: systemInstruction,
+      aiResponseRaw: raw,
+      intent: parsed.intent,
+      sentiment: parsed.sentiment,
+      ownerId: conversation.ownerId,
+    });
+
+    // Count this reply against the per-contact cap (15th reply => upgrade prompt).
+    await registerAiReply(conversation, lead);
+
+    // A photo/PDF the CUSTOMER sent is not a request for our brochure/photos.
+    const customerSentMedia = ["image", "video", "audio", "document", "sticker", "location", "contacts"].includes(message?.type);
+    let wantsBrochure = !customerSentMedia && isBrochureRequest(currentMessage);
+    let wantsImages = !customerSentMedia && isImageRequest(currentMessage);
+
+    const normalizedCurrentMessage = String(currentMessage)
+      .toLowerCase()
+      .trim();
+    // "haan / ok / bhejo" is judged on the latest message only.
+    const normalizedLatest = String(latestText || currentMessage)
+      .toLowerCase()
+      .replace(/[,،]/g, " ")
+      .replace(/[.!🙂😊👍🙏]+$/gu, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    /*
+     * Positive confirmation:
+     * Example:
+     * "haan"
+     * "yes"
+     * "haan bhejo"
+     * "send it"
+     * "send"
+     */
+    const isPositiveConfirmation = [
+      "haan",
+      "ha",
+      "yes",
+      "y",
+      "ok",
+      "okay",
+      "sure",
+      "send",
+      "send it",
+      "bhejo",
+      "bhej do",
+      "share",
+      "share it",
+      "yes please",
+      "haan bhejo",
+      "haan send karo",
+      "haan share karo",
+      "ji",
+      "haan ji",
+      "ha ji",
+      "jee",
+      "please",
+      "pls",
+      "bilkul",
+      "zaroor",
+      "हाँ",
+      "हां",
+      "जी",
+      "भेजो",
+      "ঠিক আছে",
+      "হ্যাঁ",
+      "نعم",
+      ...SEND_WORDS,
+    ].some((phrase) => {
+      return (
+        normalizedLatest === phrase ||
+        normalizedLatest.startsWith(`${phrase} `)
+      );
+    }) || (normalizedLatest.length <= 40 && languageService.startsWithYes(normalizedLatest));
+
+    /*
+     * The property this chat is about right now (decided before the reply,
+     * see turnProperty). Used instead of "the last recommended property",
+     * which was simply the lowest-ranked one of the suggestion list.
+     */
+    const lastRecommendedProperty = turnProperty;
+
+    /*
+     * The customer said "haan / ok / bhejo" right after we offered media for
+     * a property → send exactly what was offered (code-checked availability).
+     */
+    const offer = conversation.mediaOffer;
+    // Only an offer made in OUR LAST reply counts — a "haan" to a later
+    // question (e.g. "visit karenge?") must not send old photos.
+    const lastOutbound = [...recentMessages].reverse().find((m) => m.direction === "outbound");
+    const offerInLastReply = Boolean(lastOutbound && MEDIA_OFFER_RE.test(String(lastOutbound.text || "")) && /\?|؟/.test(String(lastOutbound.text || "")));
+    const offerFresh = offerInLastReply && offer?.propertyId && offer?.kind && offer.at && Date.now() - new Date(offer.at).getTime() < 24 * 3600 * 1000;
+    let offerProperty = null;
+    if (isPositiveConfirmation && offerFresh && !wantsBrochure && !wantsImages && !requirements.__pendingBrochure) {
+      offerProperty = await Property.findById(offer.propertyId).catch(() => null);
+      if (offerProperty) {
+        wantsImages = offer.kind === "both" || offer.kind === "images";
+        wantsBrochure = offer.kind === "both" || offer.kind === "brochure";
+      }
+      conversation.mediaOffer = { propertyId: null, kind: null, at: null };
+    }
+
+    /*
+     * Try to identify property from current message.
+     *
+     * Priority:
+     * 1. Gemini property_reference
+     * 2. Exact project name mentioned in message
+     * 3. Last recommended property
+     */
+    let requestedProperty = offerProperty || null;
+
+    /*
+     * 1. Gemini structured property reference
+     */
+    if (parsed?.property_reference) {
+      const propertyReference = String(parsed.property_reference)
+        .trim()
+        .toLowerCase();
+
+      requestedProperty =
+        candidateProperties.find(
+          (property) =>
+            property?.projectName &&
+            property.projectName.toLowerCase() === propertyReference,
+        ) || null;
+    }
+
+    /*
+     * 2. Exact project name from current message
+     */
+    if (!requestedProperty && normalizedCurrentMessage) {
+      requestedProperty =
+        candidateProperties.find((property) => {
+          if (!property?.projectName) return false;
+
+          return normalizedCurrentMessage.includes(
+            property.projectName.toLowerCase(),
+          );
+        }) || null;
+    }
+
+    /*
+     * Also check all candidate properties in case the requested
+     * property isn't inside the current top-ranked result.
+     */
+    if (!requestedProperty && normalizedCurrentMessage) {
+      try {
+        requestedProperty =
+          (await Property.findOne({
+            isActive: true,
+            projectName: {
+              $regex: normalizedCurrentMessage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+              $options: "i",
+            },
+          })) || null;
+      } catch (err) {
+        logger.warn("[ai] Failed to find property by project name", {
+          error: err.message,
+        });
+      }
+    }
+
+    /*
+     * 3. If user didn't explicitly mention a property,
+     * use the property the chat is currently about.
+     */
+    if (!requestedProperty && lastRecommendedProperty) {
+      requestedProperty = lastRecommendedProperty;
+    }
+
+    // Each site keeps its own brochure (Properties → Sites & brochures):
+    // make sure we send this project's brochure, not a stale unit-row copy.
+    if (requestedProperty) await attachSiteBrochure(requestedProperty);
+
+    /*
+     * Pending brochure context.
+     *
+     * This is used when:
+     *
+     * User:
+     * "Ivory ka brochure bhejo"
+     *
+     * Ivory brochure unavailable.
+     *
+     * Assistant:
+     * "Mere paas Palm Premiere ka brochure available hai.
+     *  Chahiye?"
+     *
+     * User:
+     * "haan"
+     *
+     * Then we send Palm Premiere brochure.
+     */
+    const pendingBrochure = requirements.__pendingBrochure || null;
+
+    /*
+     * ---------------------------------------------------------
+     * HANDLE POSITIVE CONFIRMATION FOR PENDING BROCHURE
+     * ---------------------------------------------------------
+     */
+    if (isPositiveConfirmation && pendingBrochure?.propertyId) {
+      try {
+        const pendingProperty = await Property.findById(
+          pendingBrochure.propertyId,
+        );
+        if (pendingProperty) await attachSiteBrochure(pendingProperty);
+
+        if (pendingProperty?.brochureUrl) {
+          try {
+            const brochureResult = await mediaSender(conversation, lead).document(
+              {
+                phone: lead.phone,
+                documentUrl: pendingProperty.brochureUrl,
+                filename:
+                  pendingProperty.brochureName ||
+                  `${pendingProperty.projectName || "property"}-brochure.pdf`,
+                caption: languageService.t("media.brochureCaption", conversation.language || replyLanguage, { project: pendingProperty.projectName || "Property" }),
+              },
+            );
+
+            logger.info(`[ai] Pending brochure sent to lead ${lead._id}`, {
+              propertyId: pendingProperty._id,
+              projectName: pendingProperty.projectName,
+              messageId: brochureResult.messageId,
+            });
+          } catch (err) {
+            logger.error(
+              `[ai] Failed to send pending brochure to lead ${lead._id}`,
+              {
+                propertyId: pendingProperty._id,
+                error: err.metaError || err.response?.data || err.message,
+              },
+            );
+          }
+        } else {
+          logger.info(`[ai] Pending brochure is no longer available`, {
+            leadId: lead._id,
+            propertyId: pendingBrochure.propertyId,
+          });
+        }
+      } catch (err) {
+        logger.error(`[ai] Failed to load pending brochure property`, {
+          leadId: lead._id,
+          propertyId: pendingBrochure.propertyId,
+          error: err.message,
+        });
+      }
+
+      /*
+       * Clear pending brochure after confirmation.
+       */
+      const updatedRequirements = {
+        ...(conversation.collectedRequirements || requirements),
+      };
+
+      delete updatedRequirements.__pendingBrochure;
+
+      conversation.collectedRequirements = updatedRequirements;
+
+      await conversation.save();
+    } else if (wantsBrochure || wantsImages) {
+      /*
+       * ---------------------------------------------------------
+       * HANDLE EXPLICIT MEDIA REQUEST
+       * ---------------------------------------------------------
+       */
+      /*
+       * If no property could be identified,
+       * don't randomly send another property's media.
+       */
+      if (!requestedProperty) {
+        logger.info(
+          `[ai] Media requested but property could not be identified`,
+          {
+            leadId: lead._id,
+            wantsBrochure,
+            wantsImages,
+          },
+        );
+      } else {
+        const property = requestedProperty;
+
+        const hasImages =
+          Array.isArray(property.images) && property.images.length > 0;
+
+        const hasBrochure = !!property.brochureUrl;
+
+        /*
+         * -------------------------------------------------------
+         * BOTH BROCHURE + IMAGES REQUESTED
+         * -------------------------------------------------------
+         */
+        if (wantsBrochure && wantsImages) {
+          /*
+           * Send images if available.
+           */
+          if (hasImages) {
+            for (let i = 0; i < Math.min(property.images.length, MAX_PROPERTY_PHOTOS); i++) {
+              try {
+                const imageResult = await mediaSender(conversation, lead).image({
+                  phone: lead.phone,
+                  imageUrl: property.images[i],
+                  caption:
+                    i === 0
+                      ? languageService.t("media.photosCaption", conversation.language || replyLanguage, { project: property.projectName || "Property" })
+                      : undefined,
+                });
+
+                logger.info(`[ai] Property image sent to lead ${lead._id}`, {
+                  propertyId: property._id,
+                  projectName: property.projectName,
+                  imageNumber: i + 1,
+                  messageId: imageResult.messageId,
+                });
+              } catch (err) {
+                logger.error(
+                  `[ai] Failed to send property image to lead ${lead._id}`,
+                  {
+                    propertyId: property._id,
+                    imageNumber: i + 1,
+                    error: err.metaError || err.response?.data || err.message,
+                  },
+                );
+              }
+            }
+          }
+
+          /*
+           * Send brochure only if it actually exists.
+           */
+          if (hasBrochure) {
+            try {
+              const brochureResult =
+                await mediaSender(conversation, lead).document({
+                  phone: lead.phone,
+                  documentUrl: property.brochureUrl,
+                  filename:
+                    property.brochureName ||
+                    `${property.projectName || "property"}-brochure.pdf`,
+                  caption: languageService.t("media.brochureCaption", conversation.language || replyLanguage, { project: property.projectName || "Property" }),
+                });
+
+              logger.info(`[ai] Brochure sent to lead ${lead._id}`, {
+                propertyId: property._id,
+                projectName: property.projectName,
+                messageId: brochureResult.messageId,
+              });
+            } catch (err) {
+              logger.error(`[ai] Failed to send brochure to lead ${lead._id}`, {
+                propertyId: property._id,
+                error: err.metaError || err.response?.data || err.message,
+              });
+            }
+          }
+
+          /*
+           * Nothing available.
+           */
+          if (!hasImages && !hasBrochure) {
+            logger.info(`[ai] Neither images nor brochure available`, {
+              leadId: lead._id,
+              propertyId: property._id,
+              projectName: property.projectName,
+            });
+          }
+        } else if (wantsImages) {
+          /*
+           * -------------------------------------------------------
+           * ONLY IMAGES REQUESTED
+           * -------------------------------------------------------
+           */
+          /*
+           * IMPORTANT:
+           * No brochure fallback here.
+           */
+          if (hasImages) {
+            for (let i = 0; i < Math.min(property.images.length, MAX_PROPERTY_PHOTOS); i++) {
+              try {
+                const imageResult = await mediaSender(conversation, lead).image({
+                  phone: lead.phone,
+                  imageUrl: property.images[i],
+                  caption:
+                    i === 0
+                      ? languageService.t("media.photosCaption", conversation.language || replyLanguage, { project: property.projectName || "Property" })
+                      : undefined,
+                });
+
+                logger.info(`[ai] Property image sent to lead ${lead._id}`, {
+                  propertyId: property._id,
+                  projectName: property.projectName,
+                  imageNumber: i + 1,
+                  messageId: imageResult.messageId,
+                });
+              } catch (err) {
+                logger.error(
+                  `[ai] Failed to send property image to lead ${lead._id}`,
+                  {
+                    propertyId: property._id,
+                    imageNumber: i + 1,
+                    error: err.metaError || err.response?.data || err.message,
+                  },
+                );
+              }
+            }
+          } else {
+            logger.info(`[ai] Images requested but not available`, {
+              leadId: lead._id,
+              propertyId: property._id,
+              projectName: property.projectName,
+            });
+          }
+        } else if (wantsBrochure) {
+          /*
+           * -------------------------------------------------------
+           * ONLY BROCHURE REQUESTED
+           * -------------------------------------------------------
+           */
+          /*
+           * Brochure exists -> send it.
+           */
+          if (hasBrochure) {
+            try {
+              const brochureResult =
+                await mediaSender(conversation, lead).document({
+                  phone: lead.phone,
+                  documentUrl: property.brochureUrl,
+                  filename:
+                    property.brochureName ||
+                    `${property.projectName || "property"}-brochure.pdf`,
+                  caption: languageService.t("media.brochureCaption", conversation.language || replyLanguage, { project: property.projectName || "Property" }),
+                });
+
+              logger.info(`[ai] Brochure sent to lead ${lead._id}`, {
+                propertyId: property._id,
+                projectName: property.projectName,
+                messageId: brochureResult.messageId,
+              });
+            } catch (err) {
+              logger.error(`[ai] Failed to send brochure to lead ${lead._id}`, {
+                propertyId: property._id,
+                projectName: property.projectName,
+                error: err.metaError || err.response?.data || err.message,
+              });
+            }
+          } else {
+            /*
+             * Requested property's brochure is NOT available.
+             *
+             * IMPORTANT:
+             * Do NOT send another property's brochure automatically.
+             *
+             * Instead find an alternate property with brochure
+             * and ask the user first.
+             */
+            let alternateProperty = null;
+
+            try {
+              alternateProperty =
+                (await Property.findOne({
+                  isActive: true,
+                  brochureUrl: {
+                    $exists: true,
+                    $ne: null,
+                  },
+                  _id: {
+                    $ne: property._id,
+                  },
+                })) || null;
+            } catch (err) {
+              logger.warn(`[ai] Failed to find alternate brochure property`, {
+                error: err.message,
+              });
+            }
+
+            // Also look at sites that have their own brochure.
+            if (!alternateProperty) {
+              try {
+                const PropertySite = require("../../models/PropertySite");
+                const site = await PropertySite.findOne({
+                  "brochures.0": { $exists: true },
+                  nameKey: { $ne: PropertySite.keyFor(property.projectName) },
+                  ...(property.ownerId ? { ownerId: property.ownerId } : {}),
+                }).lean();
+                if (site) {
+                  const escaped = site.name.replace(
+                    /[.*+?^${}()|[\]\\]/g,
+                    "\\$&",
+                  );
+                  alternateProperty = await Property.findOne({
+                    isActive: true,
+                    projectName: new RegExp(`^\\s*${escaped}\\s*$`, "i"),
+                  });
+                }
+              } catch (err) {
+                logger.warn(`[ai] Failed to find alternate site brochure`, {
+                  error: err.message,
+                });
+              }
+            }
+
+            if (alternateProperty) {
+              const mergedRequirements = {
+                ...(conversation.collectedRequirements || requirements),
+              };
+
+              mergedRequirements.__pendingBrochure = {
+                propertyId: alternateProperty._id,
+                projectName: alternateProperty.projectName,
+                requestedPropertyId: property._id,
+                requestedPropertyName: property.projectName,
+                createdAt: new Date().toISOString(),
+              };
+
+              conversation.collectedRequirements = mergedRequirements;
+
+              await conversation.save();
+
+              /*
+               * Send asking message.
+               */
+              const alternateMessage = languageService.t("media.altBrochure", conversation.language || replyLanguage, {
+                project: property.projectName || "—",
+                other: alternateProperty.projectName || "—",
+              });
+
+              try {
+                const textResult = await metaWhatsappClient.sendToLead({
+                  phone: lead.phone,
+                  text: alternateMessage,
+                });
+
+                await recordOutboundMessage({
+                  conversationId: conversation._id,
+                  leadId: lead._id,
+                  text: alternateMessage,
+                  sender: "ai",
+                  whatsappMessageId: textResult?.messageId || null,
+                  ownerId: conversation.ownerId,
+                });
+
+                logger.info(
+                  `[ai] Asked permission before sending alternate brochure`,
+                  {
+                    leadId: lead._id,
+                    requestedPropertyId: property._id,
+                    requestedPropertyName: property.projectName,
+                    alternatePropertyId: alternateProperty._id,
+                    alternatePropertyName: alternateProperty.projectName,
+                  },
+                );
+              } catch (err) {
+                logger.error(
+                  `[ai] Failed to ask permission for alternate brochure`,
+                  {
+                    leadId: lead._id,
+                    error: err.metaError || err.response?.data || err.message,
+                  },
+                );
+              }
+            } else {
+              logger.info(
+                `[ai] Requested brochure unavailable and no alternate brochure found`,
+                {
+                  leadId: lead._id,
+                  propertyId: property._id,
+                  projectName: property.projectName,
+                },
+              );
+            }
+          }
+        }
+      }
+    }
+
+    // Remember which property the chat is about now, and whether the reply
+    // offered its media — the next "haan / ok / bhejo" then sends exactly that.
+    try {
+      const ref = String(parsed?.property_reference || parsed?.extractedRequirements?.projectName || "").trim().toLowerCase();
+      currentPropertyAfter =
+        (ref && candidateProperties.find((p) => p?.projectName && p.projectName.toLowerCase() === ref)) ||
+        requestedProperty ||
+        turnProperty ||
+        null;
+      if (currentPropertyAfter) conversation.currentPropertyId = currentPropertyAfter._id;
+      const sentMediaNow = Boolean(wantsImages || wantsBrochure);
+      const kindAfter = currentPropertyAfter ? mediaKindOf(currentPropertyAfter) : null;
+      const offered =
+        kindAfter &&
+        !sentMediaNow &&
+        /\?|؟/.test(outboundText) &&
+        MEDIA_OFFER_RE.test(outboundText);
+      if (offered) {
+        conversation.mediaOffer = { propertyId: currentPropertyAfter._id, kind: kindAfter, at: new Date() };
+      } else if (sentMediaNow) {
+        conversation.mediaOffer = { propertyId: null, kind: null, at: null };
+      }
+    } catch (err) {
+      logger.warn("[ai] could not update current property / media offer", { error: err.message });
+    }
+
+  } catch (err) {
+    logger.error(
+      `[ai] Failed to send AI reply for lead ${lead._id} via Meta WhatsApp Cloud API`,
+      { error: err.response?.data || err.message },
+    );
+    await Notification.create({
+      userId: conversation.ownerId,
+      type: "whatsapp_send_failed",
+      title: `Couldn't message ${lead.name || "lead"} — WhatsApp send failed`,
+      body: `Sending via WhatsApp failed for ${lead.phone}: ${err.message}`,
+      link: `/leads/${lead._id}`,
+    });
+    emitToUser(conversation.ownerId, "notification:new", { leadId: lead._id });
+    return;
+  }
+
+  // Buyer just agreed to a site visit — create it automatically.
+  const llmWantsVisit =
+    parsed.wantsSiteVisit ||
+    parsed.intent === "ready_to_visit" ||
+    (!["image", "video", "audio", "document", "sticker"].includes(message?.type) && isSiteVisitRequest(currentMessage));
+  // Safety net: the model sometimes forgets wantsSiteVisit even though the customer just answered
+  // "which day/time?" (the reply then promises a confirmation call that never gets scheduled).
+  const visitInference = require("./visitInference");
+  let inferredVisit = null;
+  if (!llmWantsVisit) {
+    try {
+      inferredVisit = visitInference.inferVisitFromChat({ recentMessages, currentMessage, messageType: message?.type });
+      if (inferredVisit) logger.info("[ai] Site visit inferred from chat (LLM did not flag it)", { leadId: lead._id, ...inferredVisit });
+    } catch (err) {
+      logger.warn("[ai] visit inference failed", { error: err.message });
+    }
+  }
+  const wantsSiteVisit = llmWantsVisit || Boolean(inferredVisit);
+
+  if (wantsSiteVisit) {
+    // "kal subah" / "shaam ko" / "parso" → exact date + time computed here (IST), not guessed by the model.
+    const said = visitInference.parseWhen(currentMessage);
+    const visitDate = said.date || inferredVisit?.date || parsed.proposedDate || null;
+    const visitTime = said.time || inferredVisit?.time || parsed.proposedTime || null;
+    const hasOpenVisit = await Meeting.exists({ leadId: lead._id, status: { $in: ["scheduled", "rescheduled"] } });
+    if (!visitDate && !hasOpenVisit) {
+      // Customer is interested but has not given a day yet → the AI asks for it; no booking / call until then.
+      logger.info("[ai] Visit interest without a date — waiting for day/time", { leadId: lead._id });
+    } else {
+      const visitProperty =
+        currentPropertyAfter ||
+        candidateProperties[0] ||
+        (conversation.recommendedProperties?.length
+          ? await Property.findById(
+              conversation.recommendedProperties[
+                conversation.recommendedProperties.length - 1
+              ],
+            )
+          : null);
+
+      await createSiteVisit({
+        lead,
+        conversation,
+        date: visitDate,
+        time: visitTime,
+        property: visitProperty,
+      });
+    }
+  }
+
+  conversation.requirementsComplete = !!parsed.readyForPropertyRecommendation;
+  await conversation.save();
+
+  emitToUser(conversation.ownerId, "conversation:aiReply", {
+    conversationId: conversation._id,
+    leadId: lead._id,
+    message: outbound,
+  });
+
+  // Lead scoring + follow-up planning runs as a separate Gemini pass, fired
+  // async so the buyer isn't kept waiting on a second model call.
+  analyzeConversationAsync({
+    leadId: lead._id,
+    conversationId: conversation._id,
+  }).catch((err) =>
+    logger.error(`[ai] Async lead analysis failed for lead ${lead._id}`, {
+      error: err.message,
+    }),
+  );
+}
+
+/**
+ * Sends the very first outbound WhatsApp message to a lead.
+ *
+ * Ab yeh function queue worker (services/queue/bulkWorker.js) ke liye
+ * banaya gaya hai, isliye:
+ *   - Success par        -> { sent: true, usedTemplate }
+ *   - Skip karna pade to -> { skipped: true, reason }
+ *       reasons: not_ai_active | already_started | ai_paused | whatsapp_disconnected
+ *   - Koi bhi ERROR par  -> THROW karta hai (err.code / err.metaError ke saath),
+ *       taaki worker retry ya fail decide kar sake. Yahan koi error nigla nahi jata.
+ *
+ * Idempotent: agar outbound message pehle se ja chuka hai to dobara nahi bhejta
+ * (isse retry par double message nahi jayega).
+ */
+async function startConversation({
+  lead,
+  conversation,
+  templateOverride = null,
+  outboundJobId = null,
+}) {
+  if (!templateOverride && conversation.status !== "ai_active") {
+    return { skipped: true, reason: "not_ai_active" };
+  }
+
+  // Campaign template messages are intentionally allowed for previously-contacted leads.
+  // Use the durable job ID for idempotency instead of blocking every lead that ever had a message.
+  const alreadyStarted =
+    templateOverride && outboundJobId
+      ? await Message.exists({ outboundJobId })
+      : !templateOverride
+        ? await Message.exists({
+            conversationId: conversation._id,
+            direction: "outbound",
+          })
+        : false;
+  if (alreadyStarted)
+    return { skipped: true, reason: "already_started", sent: true };
+
+  if (!env.metaWhatsapp.accessToken || !env.metaWhatsapp.phoneNumberId) {
+    const err = new Error(
+      "Meta WhatsApp Cloud API is not configured (META_WHATSAPP_ACCESS_TOKEN / META_WHATSAPP_PHONE_NUMBER_ID)",
+    );
+    err.code = "META_NOT_CONFIGURED";
+    throw err;
+  }
+
+  const settings = await settingsService.getOrCreateSettings();
+  if (!templateOverride && (settings.aiPaused || !settings.autoReplyEnabled)) {
+    return { skipped: true, reason: "ai_paused" };
+  }
+  if (settings.whatsappDisconnected) {
+    return { skipped: true, reason: "whatsapp_disconnected" };
+  }
+
+  let openingText =
+    settings.openingText ||
+    env.metaWhatsapp.openingText ||
+    settings.greetingMessage ||
+    "Hi! Thanks for your interest. I'm here to help you find the right property 🙂";
+  // E5: a chat whose language is already saved gets the opening in that language.
+  const savedLanguage = normalizeLanguage(conversation.language);
+  if (savedLanguage && !templateOverride) openingText = await languageService.translateText(openingText, savedLanguage);
+
+  let outbound = null;
+  let usedTemplate = false;
+
+  try {
+    const lastInboundAt = conversation.lastInboundAt
+      ? new Date(conversation.lastInboundAt)
+      : null;
+
+    const isWindowOpen =
+      lastInboundAt &&
+      !Number.isNaN(lastInboundAt.getTime()) &&
+      Date.now() - lastInboundAt.getTime() < 24 * 60 * 60 * 1000;
+
+    if (templateOverride?.name) {
+      const variables = Array.isArray(templateOverride.variables)
+        ? templateOverride.variables
+        : [];
+      const maxIndex = variables.reduce(
+        (max, item) => Math.max(max, Number(item.index) || 0),
+        0,
+      );
+      const parameters = [];
+      for (let index = 1; index <= maxIndex; index += 1) {
+        const variable = variables.find((item) => Number(item.index) === index);
+        let value = "";
+        if (variable?.source === "name") value = lead.name || "";
+        else if (variable?.source === "phone") value = lead.phone || "";
+        else if (variable?.source === "email") value = lead.email || "";
+        else value = variable?.value || "";
+        parameters.push({
+          type: "text",
+          text: String(value || "Customer").slice(0, 1024),
+        });
+      }
+      const components = [];
+      if (parameters.length) components.push({ type: "body", parameters });
+      if (templateOverride.headerImageUrl) {
+        components.unshift({
+          type: "header",
+          parameters: [
+            { type: "image", image: { link: templateOverride.headerImageUrl } },
+          ],
+        });
+      }
+      const { messageId } = await metaWhatsappClient.sendTemplateMessage({
+        phone: lead.phone,
+        templateName: templateOverride.name,
+        languageCode: templateOverride.language || "en_US",
+        components,
+      });
+      // Store the actual message body in CRM history instead of the internal
+      // template key. This lets brokers understand what the customer received.
+      const fillVars = (text) =>
+        String(text || "").replace(/\{\{\s*(\d+)\s*\}\}/g, (_match, number) => {
+          const parameter = parameters[Number(number) - 1];
+          return parameter?.text || "";
+        });
+      const bodyPreview = fillVars(templateOverride.body);
+      // Full message as the customer sees it: header, body, footer and buttons
+      // (WhatsApp *bold* / _italic_ markers are rendered by the chat screen).
+      const messagePreview = bodyPreview.trim()
+        ? [
+            templateOverride.header
+              ? `*${fillVars(templateOverride.header).trim()}*`
+              : "",
+            bodyPreview.trim(),
+            templateOverride.footer
+              ? `_${templateOverride.footer.trim()}_`
+              : "",
+            (templateOverride.buttons || [])
+              .filter(Boolean)
+              .map((label) => `[ ${label} ]`)
+              .join("\n"),
+          ]
+            .filter(Boolean)
+            .join("\n\n")
+        : `Template sent: ${templateOverride.name}`;
+      outbound = await recordOutboundMessage({
+        conversationId: conversation._id,
+        leadId: lead._id,
+        text: messagePreview,
+        sender: "ai",
+        whatsappMessageId: messageId || null,
+        outboundJobId,
+      });
+      usedTemplate = true;
+      logger.info(
+        `[campaign] Approved WhatsApp template sent for lead ${lead._id}`,
+        {
+          templateName: templateOverride.name,
+          templateLanguage: templateOverride.language,
+          campaignJobId: outboundJobId ? String(outboundJobId) : null,
+        },
+      );
+    } else if (isWindowOpen) {
+      // Customer ne last 24 hours mein message kiya hai: normal text allowed.
+      const { messageId } = await metaWhatsappClient.sendTextMessage({
+        phone: lead.phone,
+        text: openingText,
+      });
+
+      outbound = await recordOutboundMessage({
+        conversationId: conversation._id,
+        leadId: lead._id,
+        text: openingText,
+        sender: "ai",
+        whatsappMessageId: messageId || null,
+      });
+
+      logger.info(
+        `[ai] Opening text sent via Meta Cloud API for lead ${lead._id}`,
+        { phone: lead.phone, reason: "24h-window-open" },
+      );
+    } else {
+      // New lead / closed 24-hour window: WhatsApp requires an approved
+      // template. It comes ONLY from this lead's organization (selected in its
+      // WhatsApp settings and re-validated against its own Meta account).
+      // There is deliberately no env / other-tenant / plain-text fallback.
+      const resolved = await openingTemplateService.resolveForSend({ lead, language: savedLanguage });
+
+      let messageId;
+      try {
+        ({ messageId } = await metaWhatsappClient.sendTemplateMessage({
+          phone: lead.phone,
+          templateName: resolved.templateName,
+          languageCode: resolved.languageCode,
+          components: resolved.components,
+        }));
+      } catch (sendErr) {
+        throw openingTemplateService.translateSendError(
+          sendErr,
+          resolved.templateName,
+        );
+      }
+
+      outbound = await recordOutboundMessage({
+        conversationId: conversation._id,
+        leadId: lead._id,
+        text: resolved.preview,
+        sender: "ai",
+        whatsappMessageId: messageId || null,
+      });
+
+      usedTemplate = true;
+
+      logger.info(`[ai] Opening WhatsApp template sent for lead ${lead._id}`, {
+        organizationId: resolved.organizationId,
+        templateName: resolved.templateName,
+        templateLanguage: resolved.languageCode,
+        reason: "24h-window-closed",
+      });
+    }
+  } catch (err) {
+    logger.error(
+      `[ai] Failed to send opening WhatsApp message for lead ${lead._id}`,
+      {
+        error: err.metaError || err.response?.data || err.message,
+        code: err.code,
+        organizationId: tenantContext.orgId() ? String(tenantContext.orgId()) : null,
+        phone: lead.phone,
+      },
+    );
+    // IMPORTANT: error ko nigalna nahi hai — worker ko pata chalna chahiye.
+    throw err;
+  }
+
+  conversation.templateSent = usedTemplate;
+  conversation.templateSentAt = usedTemplate ? new Date() : null;
+  conversation.lastMessageAt = new Date();
+  await conversation.save();
+
+  emitToUser(conversation.ownerId, "conversation:aiReply", {
+    conversationId: conversation._id,
+    leadId: lead._id,
+    message: outbound,
+  });
+
+  return { sent: true, usedTemplate };
+}
+
+/**
+ * Broker ke woh leads dhundhta hai jinka conversation ai_active hai lekin
+ * abhi tak koi message nahi gaya, aur unhe QUEUE mein daal deta hai.
+ * (Ab seedha message nahi bhejta — isse 100+ leads par parallel burst nahi hoga.)
+ *
+ * Skip karta hai:
+ *   - jinka message pehle se ja chuka hai
+ *   - jinka job pehle 'failed' ya 'cancelled' ho chuka hai
+ *     (warna har server restart par woh dobara queue mein aa jate)
+ *   - jinka job abhi pending/processing/paused hai (enqueueLeads khud handle karta hai)
+ */
+async function catchUpPendingConversations(brokerId) {
+  const pending = await Conversation.find({
+    ownerId: brokerId,
+    status: "ai_active",
+  })
+    .select("_id leadId")
+    .lean();
+  if (!pending.length) return;
+
+  const conversationIds = pending.map((c) => c._id);
+  const leadIds = pending.map((c) => c.leadId);
+
+  const [withMessages, blockedLeadIds] = await Promise.all([
+    Message.distinct("conversationId", {
+      conversationId: { $in: conversationIds },
+    }),
+    // failed/cancelled jobs, ya koi bhi campaign job: campaign leads ka schedule
+    // campaign khud sambhalta hai (e.g. email-only campaign ki lead ko
+    // restart par WhatsApp nahi jana chahiye).
+    OutboundJob.distinct("leadId", {
+      leadId: { $in: leadIds },
+      $or: [
+        { status: { $in: ["failed", "cancelled"] } },
+        { campaignId: { $ne: null } },
+      ],
+    }),
+  ]);
+
+  const hasMessageSet = new Set(withMessages.map(String));
+  const blockedSet = new Set(blockedLeadIds.map(String));
+
+  const toQueue = pending
+    .filter(
+      (c) =>
+        !hasMessageSet.has(String(c._id)) && !blockedSet.has(String(c.leadId)),
+    )
+    .map((c) => c.leadId);
+
+  if (!toQueue.length) return;
+
+  const { queued } = await enqueueLeads({
+    ownerId: brokerId,
+    leadIds: toQueue,
+  });
+
+  if (queued) {
+    logger.info(
+      `[ai] Catch-up: ${queued} pending conversation(s) queued for broker ${brokerId}`,
+    );
+  }
+}
+
+function mergeRequirements(existing, incoming = {}) {
+  const merged = { ...existing };
+  for (const [key, value] of Object.entries(incoming)) {
+    if (value === undefined || value === null || value === "") continue;
+    if (Array.isArray(value) && value.length === 0) continue;
+    merged[key] = value;
+  }
+  return merged;
+}
+
+/**
+ * Keeps one active booking per lead + property. Re-confirming/rescheduling the
+ * same property's active visit updates that visit; booking a different property
+ * creates a separate Meeting row, so a lead can have multiple site visits.
+ */
+async function createSiteVisit({ lead, conversation, date, time, property }) {
+  const today = istNow().date;
+  const givenDate = /^\d{4}-\d{2}-\d{2}$/.test(String(date || "")) && String(date) >= today ? String(date) : null;
+  const givenTime = /^\d{1,2}:\d{2}$/.test(String(time || "")) ? String(time).padStart(5, "0") : null;
+
+  const propertyMatch = property?._id
+    ? { propertyId: property._id }
+    : { $or: [{ propertyId: null }, { propertyId: { $exists: false } }] };
+  let meeting = await Meeting.findOne({
+    leadId: lead._id,
+    ...propertyMatch,
+    status: { $in: ["scheduled", "rescheduled"] },
+  }).sort({ createdAt: -1 });
+  // A visit already being confirmed for this lead (any property) is the same visit.
+  if (!meeting && !property?._id) {
+    meeting = await Meeting.findOne({ leadId: lead._id, status: { $in: ["scheduled", "rescheduled"] } }).sort({ createdAt: -1 });
+  }
+
+  let isNew = false;
+  let changed = false;
+  if (meeting) {
+    const prevConf = meeting.confirmation?.toObject?.() || meeting.confirmation || {};
+    const newDate = givenDate || meeting.preferredDate;
+    const newTime = givenTime || (givenDate && meeting.dateTentative ? "11:00" : meeting.preferredTime);
+    changed = newDate !== meeting.preferredDate || newTime !== meeting.preferredTime || (meeting.dateTentative && Boolean(givenDate));
+    const reopened = prevConf.status === "declined" && Boolean(givenDate || givenTime);
+    if (!changed && !reopened) {
+      // Same visit mentioned again ("haan main aa raha hoon") — nothing to change,
+      // and the confirmation already running must NOT start over (no repeat call).
+      if (property?._id && !meeting.propertyId) {
+        meeting.propertyId = property._id;
+        await meeting.save();
+      }
+      conversation.meetingStatus = "scheduled";
+      return meeting;
+    }
+    meeting.preferredDate = newDate;
+    meeting.preferredTime = newTime;
+    if (givenDate) meeting.dateTentative = false;
+    if (property?._id) meeting.propertyId = property._id;
+    const confirmationRan = Boolean(prevConf.calledAt || prevConf.sentAt || ["pending", "declined", "confirmed"].includes(prevConf.status));
+    if (confirmationRan && givenDate) {
+      // The customer picked the new day/time themselves in the chat (after the
+      // call / WhatsApp confirmation) → that IS their confirmation.
+      meeting.status = "rescheduled";
+      meeting.confirmation = { ...prevConf, status: "confirmed", confirmedVia: "whatsapp", repliedAt: new Date(), error: null };
+    } else {
+      meeting.status = "scheduled";
+      meeting.confirmation = { status: "none" };
+    }
+    meeting.markModified("confirmation");
+    await meeting.save();
+    if (meeting.confirmation?.status === "confirmed") {
+      require("../visits/visitConfirmation").notifyOwner(meeting.ownerId, lead, meeting, "confirmed", "whatsapp").catch(() => {});
+    }
+  } else {
+    isNew = true;
+    meeting = await Meeting.create({
+      leadId: lead._id,
+      ownerId: conversation.ownerId,
+      propertyId: property?._id || null,
+      preferredDate: givenDate || new Date(Date.now() + 330 * 60000 + 2 * 86400000).toISOString().slice(0, 10), // placeholder until the customer picks a day
+      preferredTime: givenTime || "11:00",
+      dateTentative: !givenDate,
+      status: "scheduled",
+      source: "whatsapp_ai",
+      conversationId: conversation._id,
+    });
+  }
+  const preferredDate = meeting.preferredDate;
+  const preferredTime = meeting.preferredTime;
+
+  // Cached copy on Conversation for quick UI reads — Meeting model remains
+  // the source of truth. Keep this in sync any time Meeting.status changes
+  // elsewhere too (e.g. a broker marking a visit as done/cancelled).
+  conversation.meetingStatus = "scheduled";
+  await Lead.updateOne({ _id: lead._id }, { $set: { status: "site_visit" } });
+
+  // Book/update the real calendar event. Best-effort: a Calendar failure
+  // must never block the WhatsApp conversation or lose the Meeting record.
+  try {
+    if (meeting.googleEventId) {
+      const event = await updateCalendarEvent({
+        eventId: meeting.googleEventId,
+        date: preferredDate,
+        time: preferredTime,
+      });
+      if (event) {
+        meeting.googleEventLink = event.eventLink;
+        await meeting.save();
+      }
+    } else if (!meeting.dateTentative) {
+      const event = await createCalendarEvent({
+        summary: `Site Visit — ${lead.name || lead.phone}${property ? ` (${property.projectName})` : ""}`,
+        description: [
+          `Lead: ${lead.name || "N/A"} (${lead.phone})`,
+          property
+            ? `Property: ${property.projectName}, ${property.city || ""}`
+            : null,
+          "Booked automatically by the AI WhatsApp assistant.",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        date: preferredDate,
+        time: preferredTime,
+      });
+      if (event) {
+        meeting.googleEventId = event.eventId;
+        meeting.googleEventLink = event.eventLink;
+        await meeting.save();
+      }
+    }
+  } catch (err) {
+    logger.error(
+      `[calendar] Failed to sync Google Calendar event for lead ${lead._id}`,
+      { error: err.message },
+    );
+  }
+
+  if (isNew) {
+    await Notification.create({
+      userId: conversation.ownerId,
+      type: "site_visit_scheduled",
+      title: `Site visit scheduled — ${lead.name}`,
+      body: `${meeting.dateTentative ? "Day and time still to be agreed" : `${preferredDate} at ${preferredTime}`}${property ? ` for ${property.projectName}` : ""}`,
+      link: `/site-visits`,
+    });
+    // Instant WhatsApp alert to the owner: a booked visit = hot lead.
+    try {
+      const settings = await settingsService.getOrCreateSettings();
+      if (settings.alertOn?.visitBooked !== false) {
+        const { sendOwnerAlert } = require("../alerts/ownerAlerts");
+        await sendOwnerAlert({
+          kind: "visit_booked",
+          title: `📅 SITE VISIT BOOK HUI — ${lead.name || "Buyer"}`,
+          lines: [
+            `📞 ${lead.phone || "-"}`,
+            `🗓 ${preferredDate} · ${preferredTime}`,
+            property ? `🏠 ${property.projectName}${property.city ? `, ${property.city}` : ""}` : "",
+            meeting.dateTentative ? "Customer ne visit ke liye haan kaha — din/time AI call par fix hoga." : "AI ne WhatsApp par visit book ki hai. Confirmation call/WhatsApp apne aap jayega.",
+          ],
+          link: "/site-visits",
+          templateValues: [lead.name || "Lead", lead.phone || "-", `${preferredDate} ${preferredTime}`, property?.projectName || "-", "Site visit booked"],
+        });
+      }
+    } catch (err) {
+      logger.warn("[ai] visit-booked owner alert failed", { error: err.message });
+    }
+  }
+
+  emitToUser(conversation.ownerId, isNew ? "meeting:created" : "meeting:updated", { meeting });
+
+  // Automatic confirmation call right after booking (client's toggle ON).
+  if ((isNew || changed) && meeting.confirmation?.status === "none") {
+    require("../visits/visitConfirmation").onVisitBooked(meeting);
+  }
+
+  return meeting;
+}
+
+module.exports = {
+  handleInbound,
+  createSiteVisit,
+  startConversation,
+  catchUpPendingConversations,
+};

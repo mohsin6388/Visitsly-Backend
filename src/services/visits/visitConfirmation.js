@@ -1,0 +1,725 @@
+/**
+ * Site visit confirmation (one simple flow).
+ *
+ *  AI calling ON (default — the client's main toggle on the Visit confirmation page)
+ *    Customer says "yes" to a site visit in the WhatsApp chat → the visit is
+ *    booked → within ~1 minute (inside calling hours) the AI calls the buyer
+ *    (Plivo + ElevenLabs voice): "your visit to <project> on <date/time> — will you come?".
+ *      yes            → visit confirmed (owner alerted, WhatsApp note to the buyer)
+ *      new day/time   → visit moved + confirmed
+ *      no             → AI asks for another day or when to follow up
+ *    Call not answered / failed / unclear → WhatsApp right away:
+ *      "Humne call kiya tha… kya aap aa rahe hain?"  [Haan, confirm ✅] [Nahi / date badlo]
+ *      Haan → confirmed.  Nahi → bot asks for a new date or a follow-up time.
+ *
+ *  AI calling OFF
+ *    No calls. Only WhatsApp "kya aap aa rahe hain? YES / NO" `hoursBefore` the visit.
+ */
+const Settings = require("../../models/Settings");
+const Meeting = require("../../models/Meeting");
+const Lead = require("../../models/Lead");
+const Conversation = require("../../models/Conversation");
+const Notification = require("../../models/Notification");
+const CallLog = require("../../models/CallLog");
+const Organization = require("../../models/Organization");
+const metaWhatsappClient = require("../whatsapp/metaWhatsappClient");
+const { recordOutboundMessage } = require("../whatsapp/messageStore");
+const settingsService = require("../settings/settingsService");
+const orgService = require("../saas/orgService");
+const tenantContext = require("../../context/tenantContext");
+const { withLock } = require("../../utils/distributedLock");
+const platformVoice = require("../../config/voiceAgents");
+const lang = require("../language");
+const logger = require("../../utils/logger");
+
+const TZ_OFFSET = "+05:30";
+const TICK_MS = 2 * 60 * 1000;
+const JUST_BOOKED_MS = 3 * 60 * 60 * 1000; // whatsapp_first: don't ask right after booking
+const CALL_FAIL = ["no-answer", "busy", "failed", "canceled", "cancelled", "error", "call-disconnected", "stopped"];
+const CALL_STALE_MS = 8 * 60 * 1000; // no hang-up result 8 min after dialing (call limit is 5 min) = treat as finished
+
+const YES_RE = /^\s*(yes|yep|yup|y|haan|han|haa|ha|hanji|haan ji|ji haan|ok|okay|k|confirm|confirmed|done|sure|pakka|theek hai|thik hai|aa raha|aa rahi|aa rahe|aaunga|aaungi|aunga|aayenge|aenge|zaroor|bilkul|1)\b|^\s*(👍|✅|👌)/i;
+const NO_RE = /^\s*(no|nope|n|nahi|nahin|nhi|na|cancel|cancelled|nahi aa|nahi aa paunga|nahi aa sakte|can'?t|cannot|reschedule|postpone|2)\b|\b(reschedule|postpone|cancel|nahi aa paunga|nahi aa paungi|nahi aa payenge)\b/i;
+// The same yes / no in every chat language (हाँ, ہاں, نعم, হ্যাঁ, ஆம், అవును, ಹೌದು, അതെ, હા, ਹਾਂ, हो …).
+const isYesReply = (text) => YES_RE.test(text) || lang.startsWithYes(text);
+const isNoReply = (text) => NO_RE.test(text) || lang.startsWithNo(text);
+
+function visitDate(meeting) {
+  const d = new Date(`${meeting.preferredDate}T${meeting.preferredTime}:00${TZ_OFFSET}`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function istDay(offsetDays = 0) {
+  return new Date(Date.now() + 330 * 60000 + offsetDays * 86400000).toISOString().slice(0, 10);
+}
+
+function istHour() {
+  return new Date(Date.now() + 330 * 60000).getUTCHours();
+}
+
+/** Owner-facing labels (notifications / alerts) — always English. */
+function labels(meeting) {
+  const date = meeting.preferredDate;
+  const dateLabel = date === istDay(0) ? "today" : date === istDay(1) ? "tomorrow" : lang.fullDate(date, "English");
+  return { dateLabel, dateFull: lang.fullDate(date, "English"), timeLabel: lang.timeLabel(meeting.preferredTime, "English") };
+}
+
+/** The customer's saved chat language (E5), else the company default / region. */
+async function customerLanguage(conversation, lead) {
+  if (lang.normalize(conversation?.language)) return lang.normalize(conversation.language);
+  const settings = await settingsService.getOrCreateSettings().catch(() => null);
+  const region = require("../voice/callPolicy").regionForPhone(lead?.phone, tenantContext.getOrg()?.country);
+  return lang.fallbackLanguage({ settings, region });
+}
+
+function buildText(lead, meeting, project, { afterMissedCall = false, language = "English" } = {}) {
+  const vars = { name: lang.nameVar(lead), projectParen: lang.projectParen(project), ...lang.visitWhen(meeting, language) };
+  const intro = lang.t(afterMissedCall ? "visit.introMissedCall" : "visit.intro", language, vars);
+  return intro + lang.t(meeting.dateTentative ? "visit.askDay" : "visit.scheduled", language, vars);
+}
+
+function buttonsFor(language) {
+  return [
+    { id: "visit_yes", title: lang.t("visit.btnYes", language) },
+    { id: "visit_no", title: lang.t("visit.btnNo", language) },
+  ];
+}
+
+/** Platform voice (Plivo + ElevenLabs) is configured by us, not by the client. */
+async function voiceReady() {
+  if (!platformVoice.isConfigured()) return false;
+  // AI calling is a paid-plan feature, and needs minutes left: without either, the WhatsApp confirmation runs instead.
+  return require("../saas/subscription").voiceCallingAvailable(tenantContext.getOrg());
+}
+
+/** Sends the WhatsApp confirmation (tenant context required). */
+async function sendConfirmation(meetingId, { force = false, afterMissedCall = false } = {}) {
+  const meeting = await Meeting.findById(meetingId).populate("propertyId", "projectName");
+  if (!meeting) throw new Error("Site visit not found");
+  if (!["scheduled", "rescheduled"].includes(meeting.status)) throw new Error("Confirmation can only be sent for scheduled visits");
+  const current = meeting.confirmation?.status;
+  if (!force && !afterMissedCall && current && current !== "none") return { skipped: true };
+  if (["confirmed", "declined"].includes(current) && !force) return { skipped: true };
+
+  const lead = await Lead.findById(meeting.leadId);
+  if (!lead?.phone) throw new Error("Lead has no WhatsApp number");
+  const conversation = await Conversation.findOne({ leadId: lead._id });
+  if (conversation?.optedOut) throw new Error("Customer opted out (STOP)");
+  const settings = await settingsService.getOrCreateSettings();
+  const cfg = settings.visitConfirm || {};
+  const project = meeting.propertyId?.projectName || "";
+
+  const lastInbound = conversation?.lastInboundAt ? new Date(conversation.lastInboundAt).getTime() : 0;
+  const windowOpen = Date.now() - lastInbound < 24 * 60 * 60 * 1000;
+
+  let sentId = null;
+  const language = await customerLanguage(conversation, lead);
+  let shownText = buildText(lead, meeting, project, { afterMissedCall, language });
+  const prev = meeting.confirmation?.toObject?.() || meeting.confirmation || {};
+  try {
+    if (windowOpen) {
+      ({ messageId: sentId } = meeting.dateTentative
+        ? await metaWhatsappClient.sendTextMessage({ phone: lead.phone, text: shownText })
+        : await metaWhatsappClient.sendButtonsMessage({ phone: lead.phone, text: shownText, buttons: buttonsFor(language) }));
+    } else if (cfg.templateName && !meeting.dateTentative) {
+      // The approved translation of the template in the customer's language when
+      // the company has one; its date/time values are written in that language.
+      const sent = await lang.sendTemplateInLanguage({
+        phone: lead.phone,
+        templateName: cfg.templateName,
+        configuredLanguage: cfg.templateLanguage || "en_US",
+        language: lang.normalize(conversation?.language), // saved language only; else the configured template
+        buildComponents: (templateLang) => {
+          const when = lang.visitWhen(meeting, templateLang || "English");
+          const values = [String(lead.name || "").trim().split(/\s+/)[0] || "Customer", project || "—", when.day, when.time];
+          const count = Math.min(Math.max(Number(cfg.templateVariableCount) || 0, 0), values.length);
+          return count ? [{ type: "body", parameters: values.slice(0, count).map((text) => ({ type: "text", text })) }] : [];
+        },
+      });
+      sentId = sent.messageId;
+      shownText = `[Visit confirmation template: ${cfg.templateName} · ${sent.languageCode}] ${shownText}`;
+    } else {
+      throw new Error("Customer has not messaged in 24 hours, so a direct WhatsApp is not allowed. Choose an approved template in AI calling → Settings.");
+    }
+  } catch (err) {
+    meeting.confirmation = { ...prev, status: prev.status || "none", error: String(err.metaError?.message || err.message).slice(0, 300), lastAttemptAt: new Date() };
+    meeting.markModified("confirmation");
+    await meeting.save();
+    throw err;
+  }
+
+  if (conversation) {
+    await recordOutboundMessage({ conversationId: conversation._id, leadId: lead._id, text: shownText, sender: "ai", whatsappMessageId: sentId, ownerId: conversation.ownerId }).catch(() => {});
+  }
+  meeting.confirmation = {
+    ...prev,
+    status: "pending",
+    sentAt: new Date(),
+    repliedAt: null,
+    error: null,
+    lastAttemptAt: new Date(),
+    ...(afterMissedCall ? { whatsappFallbackAt: new Date() } : {}),
+  };
+  meeting.markModified("confirmation");
+  await meeting.save();
+  return { sent: true };
+}
+
+async function notifyOwner(ownerId, lead, meeting, kind, via) {
+  const { dateLabel, timeLabel } = labels(meeting);
+  await Notification.create({
+    userId: ownerId,
+    type: kind === "confirmed" ? "site_visit_confirmed" : "site_visit_declined",
+    title: kind === "confirmed" ? `${lead.name || "Lead"} confirmed the visit${via === "call" ? " (on the AI call)" : ""}` : `${lead.name || "Lead"} can’t make the visit`,
+    body: `${dateLabel} ${timeLabel}${kind === "declined" ? " — contact them to reschedule." : ""}`,
+    link: "/site-visits",
+  }).catch(() => {});
+  try {
+    const settings = await settingsService.getOrCreateSettings();
+    if (settings.alertOn?.visitConfirmed === false) return;
+    const { sendOwnerAlert } = require("../alerts/ownerAlerts");
+    await sendOwnerAlert({
+      kind: kind === "confirmed" ? "visit_confirmed" : "visit_declined",
+      title: kind === "confirmed" ? `✅ VISIT CONFIRMED — ${lead.name || "Buyer"}` : `⚠️ VISIT CANCELLED — ${lead.name || "Buyer"}`,
+      lines: [`📞 ${lead.phone || "-"}`, `🗓 ${meeting.preferredDate} · ${meeting.preferredTime}`, via === "call" ? "AI call par jawab mila." : "WhatsApp par jawab mila.", kind === "declined" ? "Call the customer to set a new time." : ""],
+      link: "/site-visits",
+      templateValues: [lead.name || "Lead", lead.phone || "-", `${meeting.preferredDate} ${meeting.preferredTime}`, kind === "confirmed" ? "Visit confirmed" : "Visit declined", via || "-"],
+    });
+  } catch (err) {
+    logger.warn("[visit-confirm] owner alert failed", { error: err.message });
+  }
+}
+
+/**
+ * Inbound WhatsApp reply check. Returns true when we answered this message
+ * ourselves (so the AI must not reply again). Tenant context required.
+ */
+async function handleReply({ lead, conversation, text, buttonId = null }) {
+  const body = String(text || "").trim();
+  const tapped = buttonId === "visit_yes" ? "yes" : buttonId === "visit_no" ? "no" : null;
+  if (!tapped && (!body || body.length > 60)) return false; // long message = normal chat, AI handles it
+
+  const meeting = await Meeting.findOne({
+    leadId: lead._id,
+    status: { $in: ["scheduled", "rescheduled"] },
+    "confirmation.status": "pending",
+    preferredDate: { $gte: istDay(-1) },
+  }).sort({ preferredDate: 1, preferredTime: 1 });
+  if (!meeting || meeting.dateTentative) return false; // a date is being collected → the AI chat handles it
+
+  const isNo = tapped ? tapped === "no" : isNoReply(body);
+  const isYes = tapped ? tapped === "yes" : !isNo && isYesReply(body);
+  if (!isYes && !isNo) return false;
+
+  meeting.confirmation.status = isYes ? "confirmed" : "declined";
+  meeting.confirmation.repliedAt = new Date();
+  meeting.confirmation.confirmedVia = "whatsapp";
+  meeting.markModified("confirmation");
+  await meeting.save();
+  emitMeeting(meeting);
+
+  const language = await customerLanguage(conversation, lead);
+  const reply = lang.t(isYes ? "visit.ackYes" : "visit.ackNo", language, lang.visitWhen(meeting, language));
+  try {
+    const { messageId } = await metaWhatsappClient.sendTextMessage({ phone: lead.phone, text: reply });
+    await recordOutboundMessage({ conversationId: conversation._id, leadId: lead._id, text: reply, sender: "ai", whatsappMessageId: messageId, ownerId: conversation.ownerId });
+  } catch (err) {
+    logger.warn("[visit-confirm] Ack message failed", { error: err.message });
+  }
+  await notifyOwner(meeting.ownerId, lead, meeting, isYes ? "confirmed" : "declined", "whatsapp");
+  return true;
+}
+
+function emitMeeting(meeting) {
+  try {
+    require("../../sockets").emitToUser(meeting.ownerId, "meeting:updated", { meetingId: String(meeting._id), confirmation: meeting.confirmation, status: meeting.status });
+  } catch { /* socket not initialised */ }
+}
+
+/** Places the AI confirmation call (tenant context required). */
+async function callConfirmation(meetingId) {
+  const meeting = await Meeting.findById(meetingId).populate("propertyId", "projectName builderName location city bhk propertyType budgetMin budgetMax possession amenities");
+  if (!meeting) throw new Error("Site visit not found");
+  if (!["scheduled", "rescheduled"].includes(meeting.status)) throw new Error("Calls can only be placed for scheduled visits");
+  const lead = await Lead.findById(meeting.leadId);
+  if (!lead?.phone) throw new Error("Lead has no phone number");
+  const conversation = await Conversation.findOne({ leadId: lead._id }).select("optedOut").lean();
+  if (conversation?.optedOut) throw new Error("Customer opted out (STOP)");
+  const prev = meeting.confirmation?.toObject?.() || meeting.confirmation || {};
+  try {
+    const log = await require("../voice/voiceService").placeCall(lead, { trigger: "visit_confirmation", meeting });
+    await Meeting.updateOne(
+      { _id: meeting._id },
+      {
+        $set: {
+          "confirmation.status": prev.status && prev.status !== "none" ? prev.status : "pending",
+          "confirmation.calledAt": new Date(),
+          "confirmation.callStatus": log.status || "queued",
+          "confirmation.callAttempts": (prev.callAttempts || 0) + 1,
+          "confirmation.callLogId": log._id,
+          "confirmation.lastAttemptAt": new Date(),
+          "confirmation.error": null,
+        },
+      },
+    );
+    emitMeeting(await Meeting.findById(meeting._id).lean());
+    return log;
+  } catch (err) {
+    await Meeting.updateOne(
+      { _id: meeting._id },
+      {
+        $set: {
+          "confirmation.calledAt": new Date(),
+          "confirmation.callStatus": "failed",
+          "confirmation.callAttempts": (prev.callAttempts || 0) + 1,
+          "confirmation.error": String(err.message).slice(0, 300),
+          "confirmation.lastAttemptAt": new Date(),
+        },
+      },
+    );
+    throw err;
+  }
+}
+
+/**
+ * First confirmation call for a visit — claimed atomically so the instant
+ * trigger and the scheduler (or two servers) never call the customer twice.
+ * Not reachable → WhatsApp fallback straight away. Tenant context required.
+ */
+/**
+ * Can the call agent speak this customer's saved chat language (E5)? When it
+ * can't, the visit is confirmed on WhatsApp in their language instead of a
+ * call in another language.
+ */
+async function callLanguageOk(leadId) {
+  const lead = await Lead.findById(leadId).select("phone").lean();
+  const conv = await Conversation.findOne({ leadId }).select("language").lean();
+  const policy = require("../voice/callPolicy");
+  const region = policy.regionForPhone(lead?.phone, tenantContext.getOrg()?.country);
+  return policy.callLanguageInfo(region, conv?.language).supported;
+}
+
+async function firstCall(meetingId) {
+  const meeting = await Meeting.findById(meetingId).select("status preferredDate preferredTime confirmation dateTentative leadId").lean();
+  if (!meeting || !["scheduled", "rescheduled"].includes(meeting.status)) return { skipped: "not_scheduled" };
+  if (!(await callLanguageOk(meeting.leadId))) {
+    const last = meeting.confirmation?.lastAttemptAt ? new Date(meeting.confirmation.lastAttemptAt).getTime() : 0;
+    if (Date.now() - last < 30 * 60 * 1000) return { skipped: "language_whatsapp_recent" };
+    try {
+      await sendConfirmation(meetingId, { force: true });
+      await Meeting.updateOne({ _id: meetingId }, { $set: { "confirmation.flow": "whatsapp_first" } });
+      return { skipped: "language", whatsapp: true };
+    } catch (err) {
+      logger.warn("[visit-confirm] customer language can't be spoken on calls; WhatsApp confirmation failed", { meeting: String(meetingId), error: err.message });
+      return { skipped: "language", whatsapp: false, error: err.message };
+    }
+  }
+  const at = visitDate(meeting);
+  if (!meeting.dateTentative && (!at || at.getTime() - Date.now() < 45 * 60 * 1000)) return { skipped: "too_close" };
+  const claimed = await Meeting.findOneAndUpdate(
+    {
+      _id: meetingId,
+      status: { $in: ["scheduled", "rescheduled"] },
+      "confirmation.calledAt": null,
+      "confirmation.status": { $nin: ["confirmed", "declined"] },
+    },
+    { $set: { "confirmation.calledAt": new Date(), "confirmation.flow": "call_first" } },
+    { new: true },
+  );
+  if (!claimed) return { skipped: "already_called" };
+  try {
+    const log = await callConfirmation(meetingId);
+    return { called: true, callId: String(log._id) };
+  } catch (err) {
+    logger.warn("[visit-confirm] call could not be placed → WhatsApp", { meeting: String(meetingId), error: err.message });
+    await sendConfirmation(meetingId, { afterMissedCall: true, force: true }).catch((e) => logger.warn("[visit-confirm] fallback failed", { error: e.message }));
+    return { called: false, error: err.message };
+  }
+}
+
+/**
+ * Called right after a visit is booked / moved (tenant context). When AI
+ * calling is ON, the confirmation call goes out within ~1 minute instead of
+ * waiting for the next scheduler tick.
+ */
+function onVisitBooked(meeting) {
+  try {
+    const org = tenantContext.getOrg();
+    const meetingId = meeting?._id;
+    if (!meetingId) return;
+    const run = async () => {
+      if (!(await voiceReady())) return; // no calling → WhatsApp scheduler handles it
+      const settings = await settingsService.getOrCreateSettings();
+      const cfg = settings.visitConfirm || {};
+      if (cfg.callEnabled === false) return; // client switched AI calls OFF
+      if (org && !require("../saas/subscription").subscriptionState(org).active) return;
+      if (!inCallingHours(cfg)) return; // the scheduler calls when calling hours start
+      const res = await firstCall(meetingId);
+      logger.info("[visit-confirm] instant confirmation call", { meeting: String(meetingId), ...res });
+    };
+    settingsService.getOrCreateSettings().then((settings) => {
+      const minutes = Number.isFinite(settings.visitConfirm?.callDelayMinutes) ? settings.visitConfirm.callDelayMinutes : 1;
+      if (minutes > 10) return; // longer delays are handled by the scheduler
+      const delay = Math.max(20 * 1000, minutes * 60 * 1000);
+      const t = setTimeout(() => {
+        (org ? orgService.runForOrg(org._id, run) : run()).catch((err) => logger.warn("[visit-confirm] instant call failed", { error: err.message }));
+      }, delay);
+      t.unref?.();
+    }).catch(() => {});
+  } catch (err) {
+    logger.warn("[visit-confirm] onVisitBooked failed", { error: err.message });
+  }
+}
+
+/** Sends a WhatsApp text inside the 24h window and records it in the inbox. Best-effort. */
+async function sendChat(lead, text) {
+  const conversation = await Conversation.findOne({ leadId: lead._id });
+  if (!conversation || conversation.optedOut) return false;
+  const lastInbound = conversation.lastInboundAt ? new Date(conversation.lastInboundAt).getTime() : 0;
+  if (Date.now() - lastInbound >= 24 * 60 * 60 * 1000) return false;
+  const { messageId } = await metaWhatsappClient.sendTextMessage({ phone: lead.phone, text });
+  await recordOutboundMessage({ conversationId: conversation._id, leadId: lead._id, text, sender: "ai", whatsappMessageId: messageId, ownerId: conversation.ownerId }).catch(() => {});
+  return true;
+}
+
+/**
+ * What the customer decided ON the call → a short WhatsApp note so the chat
+ * stays in sync (and, after a "no", the bot asks for a new date / follow-up).
+ */
+async function afterCallOutcome(meeting, lead, outcome, extracted = {}) {
+  if (!lead?.phone) return;
+  const conversation = await Conversation.findOne({ leadId: lead._id }).select("language").lean();
+  const language = await customerLanguage(conversation, lead);
+  let project = "";
+  if (meeting?.propertyId) {
+    const p = meeting.propertyId.projectName ? meeting.propertyId : await require("../../models/Property").findById(meeting.propertyId).select("projectName mapsLink location city").lean();
+    project = p?.projectName ? `${p.projectName}${p.location || p.city ? `, ${[p.location, p.city].filter(Boolean).join(", ")}` : ""}${p.mapsLink ? `\n📍 ${p.mapsLink}` : ""}` : "";
+  }
+  const vars = { ...(meeting ? lang.visitWhen(meeting, language) : {}), projectLine: project ? `\n🏠 ${project}` : "" };
+  let text = null;
+  if (outcome === "reschedule" && meeting && !meeting.dateTentative) {
+    // New date agreed on the call: confirm it once more on WhatsApp (YES / NO buttons).
+    try {
+      await sendConfirmation(meeting._id, { force: true });
+      return;
+    } catch (err) {
+      logger.warn("[visit-confirm] reschedule WhatsApp confirmation failed, sending plain message", { error: err.message });
+      text = lang.t("visit.callMoved", language, vars);
+    }
+  } else if ((outcome === "confirmed" || outcome === "reschedule") && meeting) {
+    text = lang.t("visit.callConfirmed", language, vars);
+  } else if (outcome === "follow_up" && extracted.follow_up_date) {
+    text = lang.t("visit.callFollowUp", language, { date: lang.shortDate(extracted.follow_up_date, language) });
+  } else if (outcome === "declined") {
+    text = lang.t("visit.callDeclined", language);
+  }
+  if (!text) return;
+  let sent = await sendChat(lead, text).catch((err) => {
+    logger.warn("[visit-confirm] post-call WhatsApp failed", { error: err.message });
+    return false;
+  });
+  // Customer never messaged / 24-hour window closed (e.g. a contact from Upload
+  // Data who booked the visit on the call): Meta only allows an approved
+  // template now → send it through the follow-up template.
+  if (!sent) {
+    const res = await require("../voice/postCall").sendAfterCall(lead, text).catch(() => ({ sent: false }));
+    sent = Boolean(res.sent);
+    if (!res.sent && res.reason) logger.info("[visit-confirm] post-call WhatsApp not sent", { lead: String(lead._id), reason: res.reason });
+  }
+  if (sent && meeting && outcome === "declined") {
+    await Meeting.updateOne({ _id: meeting._id }, { $set: { "confirmation.sentAt": new Date() } }).catch(() => {});
+  }
+}
+
+/**
+ * Called once a confirmation call has ended (tenant context).
+ * Not answered / failed / unclear → WhatsApp fallback right away.
+ */
+async function afterCallResult(meeting, { status, answered }) {
+  emitMeeting(meeting);
+  const s = String(status || "").toLowerCase();
+  const final = s === "completed" || CALL_FAIL.includes(s);
+  if (!final) return;
+  const fresh = await Meeting.findById(meeting._id);
+  if (!fresh) return;
+  if (["confirmed", "declined"].includes(fresh.confirmation?.status)) {
+    const lead = await Lead.findById(fresh.leadId).select("name phone");
+    if (lead && fresh.confirmation.confirmedVia === "call") await notifyOwner(fresh.ownerId, lead, fresh, fresh.confirmation.status, "call");
+    return;
+  }
+  if (fresh.status === "cancelled" || fresh.confirmation?.whatsappFallbackAt) return; // nothing to ask / already sent
+  const settings = await settingsService.getOrCreateSettings();
+  const retries = Number(settings.visitConfirm?.callRetries) || 0;
+  if (!answered && (fresh.confirmation?.callAttempts || 0) <= retries) return; // the tick will retry the call first
+  try {
+    await sendConfirmation(fresh._id, { afterMissedCall: true, force: true });
+    logger.info("[visit-confirm] Call not confirmed → WhatsApp fallback sent", { meeting: String(fresh._id), status: s, answered });
+  } catch (err) {
+    logger.warn("[visit-confirm] WhatsApp fallback failed", { meeting: String(fresh._id), error: err.message });
+  }
+}
+
+function inCallingHours(cfg) {
+  const h = istHour();
+  const start = Number.isFinite(cfg.callStartHour) ? cfg.callStartHour : 10;
+  const end = Number.isFinite(cfg.callEndHour) ? cfg.callEndHour : 19;
+  return h >= start && h < end;
+}
+
+async function runCallFirst(cfg, horizonDays) {
+  const inHours = inCallingHours(cfg); // only phone calls wait for calling hours; WhatsApp can go any time
+  const delayMs = (Number.isFinite(cfg.callDelayMinutes) ? cfg.callDelayMinutes : 1) * 60000;
+  const retries = Number(cfg.callRetries) || 0;
+
+  // 1) New visits → first call (claimed atomically inside firstCall)
+  const fresh = !inHours ? [] : await Meeting.find({
+    status: { $in: ["scheduled", "rescheduled"] },
+    "confirmation.calledAt": null,
+    "confirmation.status": { $nin: ["confirmed", "declined"] },
+    "confirmation.flow": { $ne: "whatsapp_first" }, // customer's language can't be spoken → confirmed on WhatsApp
+    preferredDate: { $gte: istDay(0), $lte: istDay(horizonDays) },
+    updatedAt: { $lte: new Date(Date.now() - delayMs) },
+  }).select("_id").limit(40).lean();
+  for (const meeting of fresh) {
+    await firstCall(meeting._id).catch((err) => logger.warn("[visit-confirm] first call failed", { meeting: String(meeting._id), error: err.message }));
+  }
+
+  // 2) Calls that ended without a confirmation → retry (if configured) or WhatsApp.
+  //    Also closes calls whose hang-up result never arrived (stale).
+  const pendingCalls = await Meeting.find({
+    status: { $in: ["scheduled", "rescheduled"] },
+    "confirmation.calledAt": { $ne: null },
+    "confirmation.whatsappFallbackAt": null,
+    "confirmation.status": { $nin: ["confirmed", "declined"] },
+    preferredDate: { $gte: istDay(-1), $lte: istDay(horizonDays) },
+  }).limit(60);
+  for (const meeting of pendingCalls) {
+    const c = meeting.confirmation || {};
+    const st = String(c.callStatus || "").toLowerCase();
+    const age = Date.now() - new Date(c.calledAt).getTime();
+    const ended = CALL_FAIL.includes(st) || st === "completed";
+    // A WhatsApp fallback that failed (e.g. 24h window closed, no template) is retried at most every 30 min.
+    if (c.error && c.lastAttemptAt && Date.now() - new Date(c.lastAttemptAt).getTime() < 30 * 60 * 1000 && age > CALL_STALE_MS) continue;
+    try {
+      if (!ended) {
+        if (age < CALL_STALE_MS) continue; // call still ringing / in progress
+        // No hang-up callback arrived → close the call ourselves (this also sends the WhatsApp fallback).
+        const log = c.callLogId ? await CallLog.findById(c.callLogId) : null;
+        if (log && !log.finalizedAt) {
+          await require("../voice/voiceService").finalizeCall(log, { status: log.answeredAt ? "completed" : "no-answer", hangupCause: "no_callback" });
+          continue;
+        }
+        await sendConfirmation(meeting._id, { afterMissedCall: true, force: true });
+        continue;
+      }
+      if (age < 2 * 60 * 1000) continue; // give the hang-up handler a moment to do it first
+      const at = visitDate(meeting);
+      // No calling minutes left: skip the call retry and go straight to the WhatsApp fallback.
+      const noMinutes = require("../saas/subscription").voiceMinutesExhausted(tenantContext.getOrg());
+      if (!noMinutes && st !== "completed" && inHours && (c.callAttempts || 0) <= retries && age > 60 * 60 * 1000 && at && at.getTime() - Date.now() > 45 * 60 * 1000) {
+        await callConfirmation(meeting._id);
+      } else if (st === "completed" || noMinutes || (c.callAttempts || 0) > retries) {
+        await sendConfirmation(meeting._id, { afterMissedCall: true, force: true });
+      }
+    } catch (err) {
+      logger.warn("[visit-confirm] retry/fallback failed", { meeting: String(meeting._id), error: err.message });
+    }
+  }
+}
+
+async function runWhatsappOnly(cfg) {
+  const hours = Math.min(Math.max(Number(cfg.hoursBefore) || 24, 1), 72);
+  const horizon = Date.now() + hours * 3600 * 1000;
+  const candidates = await Meeting.find({
+    status: { $in: ["scheduled", "rescheduled"] },
+    dateTentative: { $ne: true }, // date still being agreed in the chat
+    $or: [{ "confirmation.status": "none" }, { "confirmation.status": { $exists: false } }],
+    preferredDate: { $gte: istDay(0), $lte: istDay(Math.ceil(hours / 24) + 1) },
+  }).limit(200);
+  for (const meeting of candidates) {
+    const at = visitDate(meeting);
+    if (!at || at.getTime() <= Date.now() || at.getTime() > horizon) continue;
+    if (Date.now() - new Date(meeting.createdAt).getTime() < JUST_BOOKED_MS) continue;
+    const last = meeting.confirmation?.lastAttemptAt ? new Date(meeting.confirmation.lastAttemptAt).getTime() : 0;
+    if (Date.now() - last < 60 * 60 * 1000) continue;
+    try {
+      await Meeting.updateOne({ _id: meeting._id }, { $set: { "confirmation.flow": "whatsapp_first" } });
+      await sendConfirmation(meeting._id);
+    } catch (err) {
+      logger.warn("[visit-confirm] Could not send", { meeting: String(meeting._id), error: err.message });
+    }
+  }
+}
+
+/** Scheduler: every company (WhatsApp confirmation is always on; AI call when the client has it switched on). */
+async function tick() {
+  const companies = await Settings.find({ $or: [{ "visitConfirm.enabled": { $ne: false } }, { "visitConfirm.callEnabled": { $ne: false } }] }).select("orgId visitConfirm").lean();
+  const voiceOk = await voiceReady();
+  for (const s of companies) {
+    const cfg = s.visitConfirm || {};
+    const run = async () => {
+      const org = tenantContext.getOrg();
+      if (org && !require("../saas/subscription").subscriptionState(org).active) return; // expired / suspended company
+      // No AI calling on the plan, or all calling minutes used → WhatsApp confirmation only (calls resume after a recharge).
+      const aiCalls = cfg.callEnabled !== false && voiceOk && require("../saas/subscription").voiceCallingAvailable(org);
+      if (aiCalls) await runCallFirst(cfg, 7);
+      else if (cfg.enabled !== false) await runWhatsappOnly(cfg);
+    };
+    try {
+      if (s.orgId) await orgService.runForOrg(s.orgId, run);
+      else await run();
+    } catch (err) {
+      logger.error("[visit-confirm] Company tick failed", { error: err.message });
+    }
+  }
+}
+
+/** Numbers for the Visit confirmation page. */
+async function stats({ days = 30 } = {}) {
+  const ownerId = tenantContext.ownerId();
+  const since = istDay(-days);
+  const match = { preferredDate: { $gte: since }, ...(ownerId ? { ownerId } : {}) };
+  const [visits, calls] = await Promise.all([
+    Meeting.find(match).select("confirmation status preferredDate").lean(),
+    CallLog.find({ trigger: "visit_confirmation", createdAt: { $gte: new Date(Date.now() - days * 86400000) }, ...(ownerId ? { ownerId } : {}) }).select("status durationSec billedMinutes").lean(),
+  ]);
+  const out = {
+    days,
+    visits: visits.length,
+    upcoming: visits.filter((v) => v.preferredDate >= istDay(0) && ["scheduled", "rescheduled"].includes(v.status)).length,
+    callsPlaced: calls.length,
+    callsAnswered: calls.filter((c) => String(c.status).toLowerCase() === "completed" && (c.durationSec || 0) > 5).length,
+    callsNotAnswered: calls.filter((c) => CALL_FAIL.includes(String(c.status).toLowerCase())).length,
+    callsMissed: calls.filter((c) => CALL_FAIL.includes(String(c.status).toLowerCase()) || (String(c.status).toLowerCase() === "completed" && (c.durationSec || 0) <= 5)).length,
+    callMinutes: calls.reduce((n, c) => n + (c.billedMinutes || 0), 0),
+    callsInProgress: calls.filter((c) => !CALL_FAIL.includes(String(c.status).toLowerCase()) && String(c.status).toLowerCase() !== "completed").length,
+    whatsappSent: visits.filter((v) => v.confirmation?.sentAt).length,
+    whatsappFallbacks: visits.filter((v) => v.confirmation?.whatsappFallbackAt).length,
+    confirmed: visits.filter((v) => v.confirmation?.status === "confirmed").length,
+    confirmedByCall: visits.filter((v) => v.confirmation?.status === "confirmed" && v.confirmation?.confirmedVia === "call").length,
+    confirmedByWhatsapp: visits.filter((v) => v.confirmation?.status === "confirmed" && v.confirmation?.confirmedVia !== "call").length,
+    declined: visits.filter((v) => v.confirmation?.status === "declined").length,
+    waiting: visits.filter((v) => v.confirmation?.status === "pending").length,
+  };
+  return out;
+}
+
+/**
+ * Every AI confirmation call (who was called, who picked up, who did not) for the
+ * "AI calls" list on the Visit confirmation page. Tenant context required.
+ */
+const SECTION_TRIGGERS = {
+  visits: ["visit_confirmation", "visit_reminder"],
+  leads: ["manual", "auto_new_lead", "bulk"],
+};
+
+async function callsList({ days = 30, result = "all", limit = 100, section = "visits" } = {}) {
+  const ownerId = tenantContext.ownerId();
+  const rows = await CallLog.find({
+    trigger: { $in: SECTION_TRIGGERS[section] || SECTION_TRIGGERS.visits },
+    createdAt: { $gte: new Date(Date.now() - days * 86400000) },
+    ...(ownerId ? { ownerId } : {}),
+  })
+    .sort({ createdAt: -1 })
+    .limit(300)
+    .populate("leadId", "name phone")
+    .populate({ path: "meetingId", select: "preferredDate preferredTime status confirmation propertyId", populate: { path: "propertyId", select: "projectName" } })
+    .lean();
+
+  const items = rows.map((c) => {
+    const st = String(c.status || "").toLowerCase();
+    const stale = !CALL_FAIL.includes(st) && st !== "completed" && Date.now() - new Date(c.createdAt).getTime() > CALL_STALE_MS;
+    const picked = st === "completed" && (c.durationSec || 0) > 5;
+    const status = picked ? "answered" : CALL_FAIL.includes(st) || st === "completed" || stale ? "missed" : "in_progress";
+    const m = c.meetingId || {};
+    const conf = m.confirmation || {};
+    let outcome = null; // what the customer decided on this call
+    if (status === "answered") {
+      if (c.outcome === "reschedule") outcome = "confirmed";
+      else if (["follow_up", "not_interested", "declined"].includes(c.outcome)) outcome = "declined";
+      else if (c.outcome === "confirmed") outcome = "confirmed";
+      else outcome = conf.confirmedVia === "call" && ["confirmed", "declined"].includes(conf.status) ? conf.status : "unclear";
+    }
+    // Lead calls: what came out of the call.
+    let leadResult = null;
+    if (section === "leads" && status === "answered") {
+      leadResult = c.visitBooked || c.outcome === "reschedule" ? "visit_booked"
+        : c.outcome === "follow_up" ? "follow_up"
+        : c.outcome === "callback_later" ? "callback_later"
+        : c.outcome === "not_interested" ? "not_interested"
+        : c.outcome === "declined" ? "declined"
+        : "unclear";
+    }
+    return {
+      id: String(c._id),
+      kind: c.trigger === "visit_reminder" ? "reminder" : c.trigger === "visit_confirmation" ? "confirmation" : c.trigger === "bulk" ? "queue" : c.trigger === "auto_new_lead" ? "auto" : "manual",
+      leadId: c.leadId?._id ? String(c.leadId._id) : null,
+      leadResult,
+      rating: section === "leads" ? c.extracted?.rating || null : null, // hot / warm / cold
+      // Visit confirmed on (one of) the AI calls.
+      confirmedByCall: conf.status === "confirmed" && conf.confirmedVia === "call",
+      meetingId: m._id ? String(m._id) : null,
+      meetingStatus: m.status || null,
+      at: c.createdAt,
+      lead: { name: c.leadId?.name || c.context?.name || "Deleted contact", phone: c.leadId?.phone || c.toNumber || "" },
+      project: m.propertyId?.projectName || "",
+      visitDate: m.preferredDate || null,
+      visitTime: m.preferredTime || null,
+      status,
+      outcome,
+      durationSec: c.durationSec || 0,
+      minutes: c.billedMinutes || 0,
+      language: c.language || null,
+      whatsappFallback: Boolean(conf.whatsappFallbackAt),
+      attempts: conf.callAttempts || 1,
+      summary: c.summary || "",
+      result: c.outcome || null, // confirmed / reschedule / follow_up / declined / callback_later / not_interested / unclear
+      transcript: (c.turns || []).slice(0, 20).map((t) => ({ role: t.role, text: t.text })),
+      recordingUrl: c.recordingUrl || null,
+      // Plain reason for a call that didn't go through (DND, number busy, wrong number, balance…).
+      error: c.error || (status === "missed" ? require("../voice/callPolicy").friendlyCallError({ status: c.status, hangupCause: c.hangupCause }) : null) || null,
+      // Why the WhatsApp message after the call could not go out (24h window / no template).
+      whatsappNote: c.whatsappNote || null,
+    };
+  });
+  const summary = {
+    total: items.length,
+    answered: items.filter((i) => i.status === "answered").length,
+    missed: items.filter((i) => i.status === "missed").length,
+    inProgress: items.filter((i) => i.status === "in_progress").length,
+  };
+  const filtered = result === "all" ? items : items.filter((i) => i.status === result);
+  return { summary, items: filtered.slice(0, Math.min(Math.max(Number(limit) || 100, 1), 300)) };
+}
+
+let handle = null;
+function startVisitConfirmationScheduler() {
+  if (handle) return;
+  const run = () => withLock("visit-confirmation", TICK_MS - 10000, tick).catch((err) => logger.error("[visit-confirm] tick failed", { error: err.message }));
+  handle = setInterval(run, TICK_MS);
+  setTimeout(run, 30000).unref?.();
+  logger.info("[visit-confirm] Scheduler started (every 2 min)");
+}
+
+module.exports = {
+  labels,
+  buildText,
+  customerLanguage,
+  callsList,
+  sendConfirmation,
+  callConfirmation,
+  firstCall,
+  callLanguageOk,
+  onVisitBooked,
+  afterCallResult,
+  afterCallOutcome,
+  notifyOwner,
+  handleReply,
+  startVisitConfirmationScheduler,
+  tick,
+  stats,
+  inCallingHours,
+  YES_RE,
+  NO_RE,
+  CALL_FAIL,
+};

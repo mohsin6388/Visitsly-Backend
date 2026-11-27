@@ -1,0 +1,1016 @@
+const OutboundJob = require("../../models/OutboundJob");
+const Lead = require("../../models/Lead");
+const Conversation = require("../../models/Conversation");
+const Notification = require("../../models/Notification");
+const Campaign = require("../../models/Campaign");
+
+const conversationEngine = require("../ai/conversationEngine");
+const settingsService = require("../settings/settingsService");
+const EmailMessage = require("../../models/EmailMessage");
+const crypto = require("crypto");
+const {
+  CHANNELS,
+  getCampaignStats,
+  getBatchStats,
+  recoverStuckJobs,
+} = require("./outboundQueue");
+const { emitToUser } = require("../../sockets");
+const logger = require("../../utils/logger");
+const orgService = require("../saas/orgService");
+const tenantContext = require("../../context/tenantContext");
+const {
+  subscriptionState,
+  bulkMessagesRemaining,
+} = require("../saas/subscription");
+
+/**
+ * Bulk outreach worker (WhatsApp + Email).
+ *
+ * - One loop, ONE message at a time, so the frontend shows the same
+ *   "one finishes, the next starts" flow.
+ * - For jobs on the same day, WhatsApp runs first, then email
+ *   (claim sort: nextRunAt -> priority -> seq).
+ * - Per-day scheduling: job tabhi uthta hai jab `nextRunAt <= now`.
+ * - Jobs DB mein hain, isliye restart/crash par kuch nahi khota.
+ * - Har channel ka apna pause hai: WhatsApp rate-limit ho to Email chalta rahega.
+ *
+ * Error kinds:
+ *     rate_limit  -> channel 1 min rukta hai, attempt burn nahi
+ *     quota       -> channel 1 ghanta rukta hai (e.g. provider daily limit)
+ *     fatal_pause -> token/auth/config problem: channel 10 min rukta hai
+ *     retry       -> temporary problem: backoff ke saath retry (attempt burn hota hai)
+ *     permanent   -> number/email invalid etc: job seedha 'failed'
+ *
+ * Tuning (.env, optional):
+ *   BULK_SEND_INTERVAL_MS=1000        WhatsApp: do messages ke beech ka gap
+ *   BULK_EMAIL_INTERVAL_MS=2000       Email: do emails ke beech ka gap
+ */
+
+const SEND_INTERVAL_MS = {
+  whatsapp: parseInt(process.env.BULK_SEND_INTERVAL_MS || "1000", 10),
+  email: parseInt(process.env.BULK_EMAIL_INTERVAL_MS || "2000", 10),
+};
+const IDLE_POLL_MS = 2000;
+const PAUSE_MS = {
+  rate_limit: 60 * 1000,
+  fatal_pause: 10 * 60 * 1000,
+  quota: 60 * 60 * 1000,
+};
+const RETRY_BACKOFF_MS = [60 * 1000, 5 * 60 * 1000, 15 * 60 * 1000];
+const RECOVER_EVERY_MS = 60 * 1000;
+
+// Meta error codes (https://developers.facebook.com/docs/whatsapp/cloud-api/support/error-codes)
+const RATE_LIMIT_CODES = new Set(["130429", "131056", "80007", "4"]);
+const FATAL_PAUSE_CODES = new Set([
+  "190", // access token invalid/expired
+  "102", // session/token problem
+  "10", // permission denied
+  "131042", // payment / business eligibility problem
+  "131031", // account locked
+  "131048", // spam rate limit hit
+  "133010", // phone number not registered
+  "META_NOT_CONFIGURED",
+  "OPENING_TEMPLATE_MISSING",
+  "OPENING_TEMPLATE_UNAVAILABLE",
+  "OPENING_TEMPLATE_VARIABLES_MISSING",
+  "OPENING_TEMPLATE_MEDIA_MISSING",
+  "WHATSAPP_NOT_CONNECTED",
+  "TENANT_MISMATCH",
+  "TENANT_CONTEXT_MISSING",
+]);
+// Config / account problems that retrying will NEVER fix (card missing, template
+// missing, token dead...). These jobs are marked FAILED immediately with the
+// exact reason so the campaign screen is honest, instead of sitting in
+// "Queued" forever. The user fixes the problem and uses "Retry".
+const FAIL_FAST_CODES = new Set([
+  "190",
+  "102",
+  "10",
+  "131042", // no payment method on the Meta account
+  "131031",
+  "133010",
+  "META_NOT_CONFIGURED",
+  "OPENING_TEMPLATE_MISSING",
+  "OPENING_TEMPLATE_UNAVAILABLE",
+  "OPENING_TEMPLATE_VARIABLES_MISSING",
+  "OPENING_TEMPLATE_MEDIA_MISSING",
+  "WHATSAPP_NOT_CONNECTED",
+  "TENANT_MISMATCH",
+  "TENANT_CONTEXT_MISSING",
+]);
+const TEMP_RETRY_CODES = new Set(["131000", "131016", "131057"]);
+const NETWORK_ERROR_CODES = new Set([
+  "ECONNABORTED",
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ECONNECTION",
+  "ESOCKET",
+  "ECONNREFUSED",
+  "EDNS",
+]);
+
+let running = false;
+let lastRecoverAt = 0;
+// SaaS: every company sends from its OWN WhatsApp number, so WhatsApp
+// pauses and the send gap are tracked per company (ownerId). Email goes
+// through the company's own verified sender, so its pause is per company too.
+const ownerPausedUntil = new Map(); // `${channel}:${ownerId}` -> ts (pause for that company)
+const ownerNextAt = new Map(); // `${channel}:${ownerId}` -> ts (per-company send gap)
+const busyOwners = new Set(); // `${channel}:${ownerId}` currently being processed
+const lastPauseNotifyAt = new Map(); // `${channel}:${ownerId}` -> ts
+const CONCURRENCY = Math.max(
+  1,
+  parseInt(process.env.BULK_WORKER_CONCURRENCY || "4", 10),
+);
+let claimLock = Promise.resolve();
+const notifiedBatches = new Set(); // purane (campaign-less) batches ke liye
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/* ------------------------------------------------------------------ */
+/* Error classification                                                */
+/* ------------------------------------------------------------------ */
+
+function classifyWhatsAppError(err) {
+  const code = String(err?.metaError?.code ?? err?.code ?? "");
+  const status = err?.response?.status;
+
+  if (RATE_LIMIT_CODES.has(code) || status === 429) return "rate_limit";
+  if (FAIL_FAST_CODES.has(code)) return "fail_fast";
+  if (FATAL_PAUSE_CODES.has(code)) return "fatal_pause";
+  if (TEMP_RETRY_CODES.has(code)) return "retry";
+  if (NETWORK_ERROR_CODES.has(code)) return "retry";
+  if (status >= 500) return "retry";
+  if (!err?.response && !err?.metaError && !code) return "retry"; // unknown/network type error
+  return "permanent";
+}
+
+function classifyEmailError(err) {
+  const code = String(err?.code ?? "");
+  const status = Number(
+    err?.status || err?.response?.status || err?.responseCode || 0,
+  );
+  const msg = String(
+    err?.response?.data?.message || err?.message || err?.response || "",
+  ).toLowerCase();
+  const smtp = Number(err?.responseCode || 0);
+
+  if (code === "EMAIL_DAILY_LIMIT") return "daily"; // our own per-day cap reached
+  if (
+    ["EMAIL_NOT_CONNECTED", "BREVO_NOT_CONFIGURED", "BREVO_AUTH_ERROR"].includes(code) ||
+    status === 401 ||
+    status === 403
+  ) {
+    return "fatal_pause";
+  }
+  if (code === "BREVO_INVALID_RECIPIENT" || code === "BREVO_INVALID_RESPONSE")
+    return "permanent";
+  // Provider says "you sent too much" — every provider words it differently
+  // (Gmail 5.4.5, Outlook 4.7.x / 5.7.x throttling, Zoho / Hostinger / cPanel "ratelimit", SES "Maximum sending rate").
+  const QUOTA_RE =
+    /quota|rate.?limit|too many|daily (user )?sending|sending limit|limit exceeded|exceeded.*(limit|quota|rate)|message submission rate|throttl|maximum sending|sending rate|slow down|try again later|5\.4\.5|4\.7\.[0-9]|too fast/;
+  if (status === 429 || code === "BREVO_RATE_LIMIT" || QUOTA_RE.test(msg)) {
+    return "quota";
+  }
+  if (smtp === 421) return "rate_limit"; // "service not available / try later" — brief pause, attempt not burnt
+  // SMTP reply codes: 4xx temporary (retry / greylisting), 5xx permanent (bad mailbox etc.)
+  if (smtp >= 400 && smtp < 500) return "retry";
+  if (["EENVELOPE", "EMESSAGE"].includes(code)) return "permanent";
+  if (smtp >= 500) return "permanent";
+  if (status >= 500) return "retry";
+  if (status >= 400) return status === 408 ? "retry" : "permanent";
+  if (NETWORK_ERROR_CODES.has(code) || code.startsWith("E")) return "retry";
+  return "retry";
+}
+
+function shortError(err) {
+  const msg = err?.metaError?.message || err?.message || "Unknown error";
+  return String(msg).slice(0, 500);
+}
+
+const errCode = (err) =>
+  String(err?.metaError?.code ?? err?.code ?? "") || null;
+
+/* ------------------------------------------------------------------ */
+/* Job state helpers                                                   */
+/* ------------------------------------------------------------------ */
+
+/** Atomic claim: do worker kabhi same job nahi uthayenge */
+function blockedOwners(channel, now = Date.now()) {
+  const out = new Set();
+  for (const key of busyOwners)
+    if (key.startsWith(`${channel}:`)) out.add(key.slice(channel.length + 1));
+  for (const [key, ts] of ownerNextAt)
+    if (ts > now && key.startsWith(`${channel}:`))
+      out.add(key.slice(channel.length + 1));
+  // WhatsApp aur Email dono ka pause company-wise hai (har client ka apna number/email)
+  for (const [key, ts] of ownerPausedUntil)
+    if (ts > now && key.startsWith(`${channel}:`))
+      out.add(key.slice(channel.length + 1));
+  return [...out];
+}
+
+async function claimNext(channels) {
+  const now = Date.now();
+  const or = channels.map((channel) => {
+    const blocked = blockedOwners(channel, now);
+    return blocked.length
+      ? { channel, ownerId: { $nin: blocked } }
+      : { channel };
+  });
+  return OutboundJob.findOneAndUpdate(
+    {
+      status: "pending",
+      $or: or,
+      nextRunAt: { $lte: new Date() },
+    },
+    {
+      $set: { status: "processing", lockedAt: new Date() },
+      $inc: { attempts: 1 },
+    },
+    { sort: { nextRunAt: 1, priority: 1, seq: 1 }, new: true },
+  );
+}
+
+async function markSent(job) {
+  await OutboundJob.updateOne(
+    { _id: job._id },
+    {
+      $set: {
+        status: "sent",
+        sentAt: new Date(),
+        lockedAt: null,
+        lastError: null,
+        lastErrorCode: null,
+      },
+    },
+  );
+}
+
+async function markFailed(job, err, reason) {
+  await OutboundJob.updateOne(
+    { _id: job._id },
+    {
+      $set: {
+        status: "failed",
+        lockedAt: null,
+        lastError: reason || shortError(err),
+        lastErrorCode: err ? errCode(err) : null,
+      },
+    },
+  );
+}
+
+async function markCancelled(job, reason) {
+  await OutboundJob.updateOne(
+    { _id: job._id },
+    { $set: { status: "cancelled", lockedAt: null, lastError: reason } },
+  );
+}
+
+/** Job ko dobara pending karta hai (retry / channel pause ke liye) */
+async function requeue(job, err, delayMs, { burnAttempt }) {
+  await OutboundJob.updateOne(
+    { _id: job._id },
+    {
+      $set: {
+        status: "pending",
+        lockedAt: null,
+        nextRunAt: new Date(Date.now() + delayMs),
+        lastError: shortError(err),
+        lastErrorCode: errCode(err),
+      },
+      // claim par attempts +1 ho chuka hai; pause wale errors mein wapas kam kar do
+      ...(burnAttempt ? {} : { $inc: { attempts: -1 } }),
+    },
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Realtime events + notifications                                     */
+/* ------------------------------------------------------------------ */
+
+/** Frontend ko batata hai ki ye job abhi kis state mein hai (ek-ek karke) */
+function emitJob(job, lead) {
+  emitToUser(job.ownerId, "outreach:job", {
+    jobId: String(job._id),
+    campaignId: job.campaignId ? String(job.campaignId) : null,
+    leadId: String(job.leadId),
+    channel: job.channel || "whatsapp",
+    status: job.status,
+    attempts: job.attempts,
+    sentAt: job.sentAt || null,
+    nextRunAt: job.nextRunAt,
+    lastError: job.lastError || null,
+    ...(lead
+      ? { name: lead.name, phone: lead.phone, email: lead.email || "" }
+      : {}),
+  });
+}
+
+async function emitCampaignProgress(job) {
+  if (!job.campaignId) return null;
+  try {
+    const stats = await getCampaignStats(job.campaignId);
+    emitToUser(job.ownerId, "outreach:progress", {
+      campaignId: String(job.campaignId),
+      stats,
+    });
+    return stats;
+  } catch (err) {
+    logger.warn("[queue] Could not emit campaign progress", {
+      error: err.message,
+    });
+    return null;
+  }
+}
+
+async function notify(ownerId, payload) {
+  try {
+    await Notification.create({ userId: ownerId, ...payload });
+    emitToUser(ownerId, "notification:new", {});
+  } catch (err) {
+    logger.warn("[queue] Could not create notification", {
+      error: err.message,
+    });
+  }
+}
+
+const isFinished = (s) => s.pending + s.processing + s.paused === 0;
+
+/** Campaign (ya purana batch) poora khatam ho jaye to ek summary notification */
+async function checkCompletion(job, stats) {
+  if (job.campaignId) {
+    if (!stats) return;
+    if (!CHANNELS.every((ch) => isFinished(stats[ch]))) return;
+
+    // Atomic: sirf ek hi baar 'active' -> 'completed' hoga (restart-safe)
+    const done = await Campaign.findOneAndUpdate(
+      { _id: job.campaignId, status: "active" },
+      { $set: { status: "completed", completedAt: new Date() } },
+      { new: true },
+    );
+    if (!done) return;
+
+    const sent = stats.whatsapp.sent + stats.email.sent;
+    const failed = stats.whatsapp.failed + stats.email.failed;
+    emitToUser(job.ownerId, "outreach:campaign", {
+      campaignId: String(done._id),
+      status: "completed",
+    });
+    await notify(job.ownerId, {
+      type: "bulk_batch_done",
+      title: `Campaign "${done.name}" complete — ${sent} sent`,
+      body:
+        `WhatsApp: ${stats.whatsapp.sent}/${stats.whatsapp.total}, ` +
+        `Email: ${stats.email.sent}/${stats.email.total}.` +
+        (failed ? ` ${failed} failed — you can retry.` : ""),
+      link: "/outreach/whatsapp",
+    });
+    return;
+  }
+
+  // Purana batch (single lead / manual start)
+  if (notifiedBatches.has(job.batchId)) return;
+  const s = await getBatchStats(job.batchId);
+  if (s.pending > 0 || s.processing > 0 || s.paused > 0) return;
+  notifiedBatches.add(job.batchId);
+  await notify(job.ownerId, {
+    type: "bulk_batch_done",
+    title: `Bulk messaging complete — ${s.sent}/${s.total} sent`,
+    body: s.failed
+      ? `${s.failed} lead(s) failed. Retry from the Campaigns page.`
+      : "All messages sent successfully.",
+    link: "/outreach/whatsapp",
+  });
+}
+
+async function notifyPause(job, err, channel, kind, pauseMs) {
+  // 10 min mein ek hi baar per channel per company, warna notification spam ho jayega
+  const key = `${channel}:${job.ownerId}`;
+  const throttle = kind === "daily" ? 6 * 60 * 60 * 1000 : PAUSE_MS.fatal_pause;
+  if (Date.now() - (lastPauseNotifyAt.get(key) || 0) < throttle) return;
+  lastPauseNotifyAt.set(key, Date.now());
+
+  const minutes = Math.round((pauseMs || PAUSE_MS[kind]) / 60000);
+  const label = channel === "email" ? "Email" : "WhatsApp";
+  if (kind === "daily") {
+    await notify(job.ownerId, {
+      type: "whatsapp_send_failed",
+      title: "Daily email limit reached",
+      body:
+        `${err.limit} emails sent today. Remaining emails are safe and resume automatically tomorrow morning ` +
+        `(~${Math.round(minutes / 60)} h). Your daily limit protects your sender reputation.`,
+      link: "/email/setup",
+    });
+    return;
+  }
+  await notify(job.ownerId, {
+    type: "whatsapp_send_failed",
+    title: `Bulk ${label} paused — ${label} problem`,
+    body:
+      `${label} error: ${shortError(err)}. ${label} sending is paused for ${minutes} min; ` +
+      `jobs are safe.` +
+      (channel === "email"
+        ? " Check your sender setup in Email → Setup."
+        : " Check token, payment method and template."),
+    link: channel === "email" ? "/email/setup" : "/whatsapp",
+  });
+}
+
+/** One notification per company per 10 min when sends fail for a fixable reason. */
+async function notifyFailFast(job, err) {
+  const key = `failfast:${job.ownerId}`;
+  if (Date.now() - (lastPauseNotifyAt.get(key) || 0) < PAUSE_MS.fatal_pause) return;
+  lastPauseNotifyAt.set(key, Date.now());
+  const { explainSendError } = require("../../utils/metaErrors");
+  const reason = explainSendError(shortError(err)).message;
+  await notify(job.ownerId, {
+    type: "whatsapp_send_failed",
+    title: "WhatsApp messages are failing",
+    body: `${reason} After fixing it, click "Retry" on the campaign.`,
+    link: "/whatsapp",
+  });
+}
+
+/**
+ * Plan ki bulk-message limit poori ho gayi: is company ke saare pending jobs
+ * 'paused' kar do (delete nahi — upgrade ke baad campaign resume ho sakta hai)
+ * aur owner ko ek baar notification do.
+ */
+async function pauseForBulkLimit(job, org) {
+  const { limitsFor } = require("../../config/plans");
+  const limit = limitsFor(org).bulkMessages;
+  const reason = "Bulk message limit reached — upgrade your plan";
+  await OutboundJob.updateOne(
+    { _id: job._id },
+    {
+      $set: { status: "paused", lockedAt: null, lastError: reason },
+      $inc: { attempts: -1 },
+    },
+  );
+  await OutboundJob.updateMany(
+    { ownerId: job.ownerId, status: "pending" },
+    { $set: { status: "paused", lastError: reason } },
+  );
+  const key = `bulklimit:${job.ownerId}`;
+  if (Date.now() - (lastPauseNotifyAt.get(key) || 0) < 60 * 60 * 1000) return;
+  lastPauseNotifyAt.set(key, Date.now());
+  await notify(org.ownerUserId || job.ownerId, {
+    type: "plan_limit",
+    title: "Bulk message limit reached",
+    body:
+      `Your plan’s ${Number(limit).toLocaleString("en-IN")} bulk messages are used up. ` +
+      `Remaining messages are paused (safe). Upgrade to continue.`,
+    link: "/billing",
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Channel processors                                                  */
+/* ------------------------------------------------------------------ */
+
+async function processWhatsApp(job, lead) {
+  const conversation = lead
+    ? await Conversation.findOne({ leadId: job.leadId })
+    : null;
+
+  if (!lead || !conversation) {
+    await markFailed(job, null, "Contact or chat was deleted before this message was sent");
+    return;
+  }
+
+  // Customer asked us to STOP — never send campaigns to them (Meta policy).
+  if (lead.optedOut || conversation.optedOut) {
+    await markCancelled(job, "Skipped: customer opted out (STOP)");
+    return;
+  }
+
+  const campaign = job.campaignId
+    ? await Campaign.findOne({
+        _id: job.campaignId,
+        ownerId: job.ownerId,
+      }).lean()
+    : null;
+  const template = campaign?.whatsappTemplate?.name
+    ? {
+        name: campaign.whatsappTemplate.name,
+        language: campaign.whatsappTemplate.language,
+        variables: campaign.whatsappTemplate.variables || [],
+        headerImageUrl: campaign.whatsappTemplate.headerImageUrl || "",
+        body: campaign.whatsappTemplate.body || "",
+        header: campaign.whatsappTemplate.header || "",
+        footer: campaign.whatsappTemplate.footer || "",
+        buttons: campaign.whatsappTemplate.buttons || [],
+      }
+    : null;
+
+  const result = await conversationEngine.startConversation({
+    lead,
+    conversation,
+    templateOverride: template,
+    outboundJobId: template ? job._id : null,
+  });
+
+  if (result?.sent || result?.reason === "already_started") {
+    await markSent(job);
+    return;
+  }
+
+  if (result?.skipped) {
+    // AI pause ya WhatsApp disconnect: job 'paused' kar do, broker resume kar lega
+    if (
+      result.reason === "ai_paused" ||
+      result.reason === "whatsapp_disconnected"
+    ) {
+      await OutboundJob.updateOne(
+        { _id: job._id },
+        {
+          $set: {
+            status: "paused",
+            lockedAt: null,
+            lastError: `Skipped: ${result.reason}`,
+          },
+          $inc: { attempts: -1 },
+        },
+      );
+      return;
+    }
+    // not_ai_active (manual/closed): ab message bhejna sahi nahi
+    await markCancelled(job, `Skipped: ${result.reason}`);
+    return;
+  }
+
+  await markSent(job);
+}
+
+// "Today" for daily caps = India time (UTC+5:30), so the cap resets at midnight IST.
+const emailSafety = require("../email/emailSafety");
+const emailWallet = require("../email/emailWallet");
+const emailSenders = require("../email/emailSenderService");
+const EmailSender = require("../../models/EmailSender");
+const msUntilNextIstDay = () => emailSafety.istDayStart().getTime() + 24 * 60 * 60 * 1000 - Date.now() + 2 * 60 * 1000;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/** Failures that are OUR / the provider's fault (not the recipient's): the wallet is refunded. */
+function isOurSideEmailFailure(err) {
+  const code = String(err?.code || "");
+  const status = Number(err?.status || err?.response?.status || 0);
+  if (["BREVO_AUTH_ERROR", "BREVO_NOT_CONFIGURED", "BREVO_RATE_LIMIT", "BREVO_INVALID_RESPONSE", "EMAIL_NOT_CONNECTED", "EMAIL_DAILY_LIMIT"].includes(code)) return true;
+  if (code === "BREVO_INVALID_RECIPIENT") return false;
+  if (status === 401 || status === 403 || status === 429 || status >= 500) return true;
+  if (!status) return true; // network / timeout: nothing reached the recipient
+  return false;
+}
+
+/** Wallet is empty: pause (do NOT fail) every pending e-mail job of the company and tell the Owner once. */
+async function pauseForEmptyWallet(job, orgId) {
+  const reason = emailWallet.WALLET_PAUSE_REASON;
+  await OutboundJob.updateOne({ _id: job._id }, { $set: { status: "paused", lockedAt: null, lastError: reason }, $inc: { attempts: -1 } });
+  await OutboundJob.updateMany({ ownerId: job.ownerId, channel: "email", status: "pending" }, { $set: { status: "paused", lastError: reason } });
+  const key = `emailwallet:${job.ownerId}`;
+  if (Date.now() - (lastPauseNotifyAt.get(key) || 0) < 60 * 60 * 1000) return;
+  lastPauseNotifyAt.set(key, Date.now());
+  await notify(job.ownerId, {
+    type: "plan_limit",
+    title: "Email wallet is empty",
+    body: "Your email campaign is paused (nothing is lost). Recharge your email wallet and it resumes automatically.",
+    link: "/email/setup",
+  });
+}
+
+async function processEmail(job, lead) {
+  if (!lead) {
+    await markFailed(job, null, "Contact was deleted before this email was sent");
+    return;
+  }
+  if (!lead.email) {
+    await markFailed(job, null, "This lead has no email address");
+    return;
+  }
+  // Unsubscribed (email link) or told us to STOP — never email them again.
+  if (lead.emailOptedOut || lead.optedOut) {
+    await markCancelled(job, "Skipped: customer unsubscribed");
+    return;
+  }
+  // Invalid address: skip, never charge.
+  if (!EMAIL_RE.test(String(lead.email).trim())) {
+    await markCancelled(job, "Skipped: invalid email address");
+    return;
+  }
+
+  const campaign = job.campaignId
+    ? await Campaign.findById(job.campaignId).lean()
+    : null;
+  if (!campaign || !campaign.email?.subject || !campaign.email?.body) {
+    await markFailed(job, null, "Campaign email subject/body is missing");
+    return;
+  }
+  if (campaign.status === "cancelled") {
+    await markCancelled(job, "Campaign cancelled");
+    return;
+  }
+
+  // Address that already hard-bounced / complained for this company: don't hurt the reputation again.
+  const badBefore = await EmailMessage.countDocuments({
+    ownerId: job.ownerId, direction: "outbound", to: String(lead.email).trim().toLowerCase(),
+    status: { $in: ["bounced", "complained", "suppressed"] }, outboundJobId: { $ne: job._id },
+  });
+  if (badBefore > 0) {
+    await markCancelled(job, "Skipped: this address bounced or complained before");
+    return;
+  }
+
+  const settings = await settingsService.getOrCreateSettings();
+  const mailer = require("../email/mailer");
+  // Sender: the company's verified official address (platform Brevo sends on its behalf).
+  await emailSafety.check(job.ownerId).catch(() => {});
+  const sender = await EmailSender.findOne({ ownerId: job.ownerId }).lean();
+  const ready = emailSenders.readiness(sender);
+  if (!ready.ready) {
+    const err = new Error(ready.reason || "Email sender is not ready. Open Email → Setup.");
+    err.code = "EMAIL_NOT_CONNECTED";
+    throw err;
+  }
+  let tracked = await EmailMessage.findOne({ outboundJobId: job._id });
+  if (tracked?.status === "cancelled") {
+    await markCancelled(job, "Campaign email cancelled");
+    return;
+  }
+  if (
+    tracked &&
+    [
+      "sent",
+      "delivered",
+      "delivery_delayed",
+      "bounced",
+      "complained",
+      "suppressed",
+    ].includes(tracked.status)
+  ) {
+    // Provider already accepted this idempotent job. Don't send it again after
+    // a worker restart/webhook race.
+    await markSent(job);
+    return;
+  }
+  // Per-company daily cap (IST day).
+  const dailyCap = emailSafety.dailyCap();
+  if (dailyCap > 0) {
+    const used = await emailSafety.sentToday(job.ownerId);
+    if (used >= dailyCap) {
+      const err = new Error(`Daily email limit (${dailyCap}) reached`);
+      err.code = "EMAIL_DAILY_LIMIT";
+      err.limit = dailyCap;
+      err.pauseMs = msUntilNextIstDay();
+      throw err;
+    }
+  }
+
+  // Wallet: take the money for THIS job first (idempotent per job, never below zero).
+  const orgId = tenantContext.getOrg()?._id;
+  if (orgId) {
+    const paid = await emailWallet.debitForJob(orgId, job._id);
+    if (!paid.ok) {
+      await pauseForEmptyWallet(job, orgId);
+      return;
+    }
+  }
+
+  if (!tracked) {
+    tracked = new EmailMessage({
+      ownerId: job.ownerId,
+      leadId: lead._id,
+      campaignId: campaign._id,
+      outboundJobId: job._id,
+      direction: "outbound",
+      kind: "campaign",
+      trackingId: crypto.randomBytes(16).toString("hex"),
+      from: sender.email,
+      to: lead.email,
+      subject: campaign.email.subject,
+      text: campaign.email.body,
+      status: "queued",
+      replyStatus: "waiting",
+    });
+    await tracked.save();
+    tracked.threadId = tracked._id;
+    await tracked.save();
+  }
+
+  try {
+    tracked.status = "sending";
+    tracked.errorCode = null;
+    tracked.errorMessage = null;
+    await tracked.save();
+
+    const mergeVars = {
+      name: lead.name,
+      firstName: String(lead.name || "").trim().split(/\s+/)[0],
+      phone: lead.phone || "",
+      city: lead.city || "",
+      company: settings.companyName || "",
+    };
+    const unsubscribeUrl = require("../../utils/emailUnsub").unsubscribeUrl(lead._id);
+    // From = verified sender (display name = company), Reply-To = the same address.
+    const r = await mailer.sendCampaignEmail({
+      to: lead.email,
+      subject: campaign.email.subject,
+      body: campaign.email.body,
+      imageUrl: campaign.email.imageUrl || "",
+      companyName: settings.companyName || "",
+      vars: mergeVars,
+      sender: { email: sender.email, name: sender.displayName || settings.companyName || "" },
+      unsubscribeUrl,
+      idempotencyKey: `job-${job._id}`,
+      tags: [`propai_message_id_${tracked._id}`, `propai_job_id_${job._id}`],
+    });
+    const sent = { messageId: r.messageId };
+
+    // Do not overwrite a faster delivery webhook (delivered/bounced/etc).
+    await EmailMessage.updateOne(
+      { _id: tracked._id },
+      {
+        $set: {
+          providerMessageId: sent.messageId,
+          rfcMessageId: sent.messageId,
+          sentAt: tracked.sentAt || new Date(),
+          from: sender.email,
+        },
+      },
+    );
+    await EmailMessage.updateOne(
+      { _id: tracked._id, status: { $in: ["queued", "sending"] } },
+      { $set: { status: "sent" } },
+    );
+    await markSent(job);
+  } catch (err) {
+    await EmailMessage.updateOne(
+      { _id: tracked._id, status: { $in: ["queued", "sending"] } },
+      {
+        $set: {
+          status: "failed",
+          errorCode: String(err.code || "EMAIL_SEND_FAILED"),
+          errorMessage: String(err.message || "Email send failed").slice(
+            0,
+            500,
+          ),
+        },
+      },
+    ).catch((saveErr) =>
+      logger.error("[email] Could not persist failed send", {
+        error: saveErr.message,
+      }),
+    );
+    // Failure on our / the provider's side: give the money back (idempotent per job).
+    if (orgId && isOurSideEmailFailure(err)) {
+      await emailWallet.refundJob(orgId, job._id).catch((e) => logger.error("[email] refund failed", { error: e.message }));
+    }
+    throw err;
+  }
+}
+
+/** Ek job process karta hai. Lead return karta hai (events mein naam bhejne ke liye). */
+async function processJob(job) {
+  return orgService.runForOwner(job.ownerId, async () => {
+    // Multi-number: campaign's chosen number, else the number this buyer already talks to.
+    let numberId = null;
+    if ((job.channel || "whatsapp") === "whatsapp") {
+      const campaign = job.campaignId
+        ? await Campaign.findById(job.campaignId).select("phoneNumberId").lean()
+        : null;
+      numberId =
+        campaign?.phoneNumberId ||
+        (
+          await Conversation.findOne({ leadId: job.leadId })
+            .select("phoneNumberId")
+            .lean()
+        )?.phoneNumberId ||
+        null;
+    }
+    return tenantContext.runWithNumber(numberId, () => processJobInTenant(job));
+  });
+}
+
+async function processJobInTenant(job) {
+  const channel = job.channel || "whatsapp";
+
+  // Trial khatam / payment fail / suspended: jobs safe rakho, bhejo mat.
+  const org = tenantContext.getOrg();
+  const sub = subscriptionState(org);
+  if (org && !sub.active) {
+    await OutboundJob.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          status: "paused",
+          lockedAt: null,
+          lastError: "Subscription inactive",
+        },
+        $inc: { attempts: -1 },
+      },
+    );
+    return Lead.findById(job.leadId);
+  }
+
+  // Plan no longer includes this campaign channel (e.g. downgraded): keep the
+  // job, don't send. Single-lead WhatsApp openers (lead capture, no campaign)
+  // are part of the core AI agent and are never blocked here.
+  const featureKey = channel === "email" ? "emailCampaigns" : job.campaignId ? "bulkWhatsapp" : null;
+  if (org && featureKey && !require("../saas/subscription").hasFeature(org, featureKey)) {
+    await OutboundJob.updateOne(
+      { _id: job._id },
+      {
+        $set: {
+          status: "paused",
+          lockedAt: null,
+          lastError: `Plan does not include ${channel === "email" ? "email campaigns" : "bulk WhatsApp"} — upgrade to resume`,
+        },
+        $inc: { attempts: -1 },
+      },
+    );
+    return Lead.findById(job.leadId);
+  }
+
+  // Plan ki bulk-message limit: hard stop (launch-time check ke baad bhi safety).
+  if (org && bulkMessagesRemaining(org) <= 0) {
+    await pauseForBulkLimit(job, org);
+    return Lead.findById(job.leadId);
+  }
+
+  const lead = await Lead.findById(job.leadId);
+
+  // Frontend: "now sending this lead" (spinner)
+  emitJob(job, lead);
+
+  try {
+    if (channel === "email") await processEmail(job, lead);
+    else await processWhatsApp(job, lead);
+  } catch (err) {
+    await handleError(job, err, channel);
+  }
+  return lead;
+}
+
+async function handleError(job, err, channel) {
+  const kind =
+    channel === "email" ? classifyEmailError(err) : classifyWhatsAppError(err);
+
+  if (kind === "fail_fast") {
+    await markFailed(job, err);
+    logger.warn(`[queue] ${channel} job failed (not retryable)`, {
+      error: shortError(err),
+      code: errCode(err),
+    });
+    await notifyFailFast(job, err);
+    return;
+  }
+
+  const pauseMs = err?.pauseMs || PAUSE_MS[kind];
+  if (pauseMs) {
+    ownerPausedUntil.set(`${channel}:${job.ownerId}`, Date.now() + pauseMs);
+    logger.warn(
+      `[queue] ${channel} ${kind} — channel ${Math.round(pauseMs / 60000)} min pause`,
+      { error: shortError(err), code: errCode(err) },
+    );
+    // delay 0: order bacha rehta hai; pausedUntil is channel ko rok ke rakhta hai
+    await requeue(job, err, 0, { burnAttempt: false });
+    if (kind !== "rate_limit") await notifyPause(job, err, channel, kind, pauseMs);
+    return;
+  }
+
+  if (kind === "retry") {
+    if (job.attempts >= job.maxAttempts) {
+      await markFailed(job, err, `Max attempts reached: ${shortError(err)}`);
+      return;
+    }
+    const delay =
+      RETRY_BACKOFF_MS[Math.min(job.attempts - 1, RETRY_BACKOFF_MS.length - 1)];
+    await requeue(job, err, delay, { burnAttempt: true });
+    return;
+  }
+
+  // permanent
+  await markFailed(job, err);
+}
+
+/* ------------------------------------------------------------------ */
+/* Main loop                                                           */
+/* ------------------------------------------------------------------ */
+
+async function claimSerialized(allowed) {
+  // Claims are serialized so two parallel loops never pick the same
+  // company's next message at the same moment (keeps its send gap).
+  let release;
+  const prev = claimLock;
+  claimLock = new Promise((r) => (release = r));
+  await prev;
+  try {
+    const job = await claimNext(allowed);
+    if (job) busyOwners.add(`${job.channel || "whatsapp"}:${job.ownerId}`);
+    return job;
+  } finally {
+    release();
+  }
+}
+
+async function loop(workerNo) {
+  while (running) {
+    try {
+      // Periodically stuck jobs recover karo (sirf pehla loop)
+      if (workerNo === 0 && Date.now() - lastRecoverAt > RECOVER_EVERY_MS) {
+        lastRecoverAt = Date.now();
+        const recovered = await recoverStuckJobs();
+        if (recovered)
+          logger.warn(`[queue] ${recovered} stuck job(s) reset to pending`);
+      }
+
+      // Pause company-wise hai (blockedOwners me handle hota hai)
+      const allowed = CHANNELS;
+
+      const job = await claimSerialized(allowed);
+      if (!job) {
+        await sleep(IDLE_POLL_MS);
+        continue;
+      }
+
+      const channel = job.channel || "whatsapp";
+      const key = `${channel}:${job.ownerId}`;
+      try {
+        const lead = await processJob(job);
+
+        // Final state (sent / failed / retry / paused) ek event mein
+        const fresh = await OutboundJob.findById(job._id).lean();
+        if (fresh) {
+          emitJob(fresh, lead);
+          const stats = await emitCampaignProgress(fresh);
+          await checkCompletion(fresh, stats);
+          if (fresh.status === "sent") {
+            const org = await orgService
+              .getSnapshotForOwner(job.ownerId)
+              .catch(() => null);
+            if (org)
+              orgService
+                .incrementUsage(
+                  org._id,
+                  channel === "email" ? "emailsSent" : "messagesSent",
+                  1,
+                )
+                .catch(() => {});
+          }
+        }
+      } finally {
+        // Do messages ke beech gap (+ thoda random jitter, bot jaisa na lage) — per company
+        const gap = SEND_INTERVAL_MS[channel];
+        ownerNextAt.set(
+          key,
+          Date.now() + gap + Math.floor(Math.random() * 300),
+        );
+        busyOwners.delete(key);
+      }
+    } catch (err) {
+      logger.error("[queue] Worker loop error", { error: err.message });
+      await sleep(5000); // crash-loop se bachne ke liye
+    }
+  }
+  logger.info(`[queue] Bulk worker ${workerNo} stopped`);
+}
+
+async function startBulkWorker() {
+  if (running) return;
+  running = true;
+
+  try {
+    // Pre-campaign jobs ko 'whatsapp' channel de do (naye claim query ke liye)
+    const migrated = await OutboundJob.updateMany(
+      { channel: { $exists: false } },
+      { $set: { channel: "whatsapp", priority: 0 } },
+    );
+    if (migrated.modifiedCount)
+      logger.info(
+        `[queue] ${migrated.modifiedCount} old job(s) set to channel=whatsapp`,
+      );
+
+    const recovered = await recoverStuckJobs(0); // boot par saare 'processing' jobs purane hain
+    if (recovered)
+      logger.warn(
+        `[queue] Boot recovery: ${recovered} job(s) reset to pending`,
+      );
+  } catch (err) {
+    logger.error("[queue] Boot recovery failed", { error: err.message });
+  }
+
+  lastRecoverAt = Date.now();
+  logger.info(
+    `[queue] Bulk worker started x${CONCURRENCY} (per company: whatsapp ~${SEND_INTERVAL_MS.whatsapp}ms, email ~${SEND_INTERVAL_MS.email}ms)`,
+  );
+  // Kai companies ek saath bhej sakein, isliye CONCURRENCY parallel loops.
+  for (let i = 0; i < CONCURRENCY; i += 1) loop(i); // background (await nahi)
+}
+
+function stopBulkWorker() {
+  running = false;
+}
+
+module.exports = { startBulkWorker, stopBulkWorker, _test: { classifyEmailError, processEmail, isOurSideEmailFailure } };

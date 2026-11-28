@@ -6,7 +6,9 @@ const { assertOfficialEmail } = require("../../config/emailDomains");
  * Company sender setup:  official email → OTP verify → domain authentication → ready.
  * All state lives in EmailSender; Brevo is only called through brevoSenders.js.
  */
-const requireDomainAuth = () => String(process.env.EMAIL_REQUIRE_DOMAIN_AUTH ?? "true").toLowerCase() !== "false";
+const requireDomainAuth = () =>
+  String(process.env.EMAIL_REQUIRE_DOMAIN_AUTH ?? "true").toLowerCase() !==
+  "false";
 
 function appError(message, code, extra = {}) {
   const err = new Error(message);
@@ -19,18 +21,51 @@ const getSender = (ownerId) => EmailSender.findOne({ ownerId });
 
 /** Why a campaign can / cannot launch. `ready` is the single yes/no used by launch + worker. */
 function readiness(sender) {
-  if (!sender) return { ready: false, step: "email", reason: "Set up your official sender email first." };
-  if (sender.paused) return { ready: false, step: "paused", reason: sender.pausedReason || "Email sending is paused for your account. Contact support." };
-  if (sender.status === "awaiting_domain") return { ready: false, step: "domain", reason: "Add the DNS records first. We will then email the verification code." };
-  if (sender.status !== "verified") return { ready: false, step: "verify", reason: "Verify your sender email with the code we sent." };
+  if (!sender)
+    return {
+      ready: false,
+      step: "email",
+      reason: "Set up your official sender email first.",
+    };
+  if (sender.paused)
+    return {
+      ready: false,
+      step: "paused",
+      reason:
+        sender.pausedReason ||
+        "Email sending is paused for your account. Contact support.",
+    };
+  if (sender.status === "awaiting_domain")
+    return {
+      ready: false,
+      step: "domain",
+      reason:
+        "Add the DNS records first. We will then email the verification code.",
+    };
+  if (sender.status !== "verified")
+    return {
+      ready: false,
+      step: "verify",
+      reason: "Verify your sender email with the code we sent.",
+    };
   if (requireDomainAuth() && sender.domainAuthStatus !== "authenticated") {
-    return { ready: false, step: "domain", reason: "Authenticate your domain (add the DNS records) before sending." };
+    return {
+      ready: false,
+      step: "domain",
+      reason: "Authenticate your domain (add the DNS records) before sending.",
+    };
   }
   return { ready: true, step: "ready", reason: null };
 }
 
 function publicView(sender) {
-  if (!sender) return { exists: false, ready: false, step: "email", requireDomainAuth: requireDomainAuth() };
+  if (!sender)
+    return {
+      exists: false,
+      ready: false,
+      step: "email",
+      requireDomainAuth: requireDomainAuth(),
+    };
   const r = readiness(sender);
   return {
     exists: true,
@@ -39,7 +74,13 @@ function publicView(sender) {
     domain: sender.domain,
     status: sender.status,
     domainAuthStatus: sender.domainAuthStatus,
-    dnsRecords: (sender.dnsRecords || []).map((x) => ({ label: x.key, type: x.type, host: x.host, value: x.value, ok: Boolean(x.ok) })),
+    dnsRecords: (sender.dnsRecords || []).map((x) => ({
+      label: x.key,
+      type: x.type,
+      host: x.host,
+      value: x.value,
+      ok: Boolean(x.ok),
+    })),
     lastError: sender.lastError || null,
     paused: Boolean(sender.paused),
     pausedReason: sender.pausedReason || null,
@@ -53,13 +94,30 @@ function publicView(sender) {
 
 /** Step 1: register the address; Brevo e-mails a 6-digit code to it. */
 async function start({ org, ownerId, email, displayName, guidelinesAccepted }) {
-  if (guidelinesAccepted !== true) throw appError("Please read and accept the email sending guidelines first.", "EMAIL_GUIDELINES_REQUIRED");
+  if (guidelinesAccepted !== true)
+    throw appError(
+      "Please read and accept the email sending guidelines first.",
+      "EMAIL_GUIDELINES_REQUIRED",
+    );
   const { email: addr, domain } = assertOfficialEmail(email); // blocks gmail/yahoo/disposable etc.
-  const name = String(displayName || org?.name || "").trim().slice(0, 100);
-  if (!name) throw appError("Enter the sender name (your company name).", "EMAIL_BAD_NAME");
+  const name = String(displayName || org?.name || "")
+    .trim()
+    .slice(0, 100);
+  if (!name)
+    throw appError(
+      "Enter the sender name (your company name).",
+      "EMAIL_BAD_NAME",
+    );
 
-  const taken = await EmailSender.findOne({ email: addr, ownerId: { $ne: ownerId } }).lean();
-  if (taken) throw appError("This email address is already used by another company on Visitsly.", "EMAIL_ALREADY_USED");
+  const taken = await EmailSender.findOne({
+    email: addr,
+    ownerId: { $ne: ownerId },
+  }).lean();
+  if (taken)
+    throw appError(
+      "This email address is already used by another company on Visitsly.",
+      "EMAIL_ALREADY_USED",
+    );
 
   const existing = await getSender(ownerId);
   if (existing && existing.email === addr && existing.status === "verified") {
@@ -67,22 +125,38 @@ async function start({ org, ownerId, email, displayName, guidelinesAccepted }) {
     await existing.save();
     return existing; // nothing to redo
   }
-  if (existing?.brevoSenderId && existing.email !== addr) await brevo.deleteSender(existing.brevoSenderId).catch(() => {});
+  if (existing?.brevoSenderId && existing.email !== addr)
+    await brevo.deleteSender(existing.brevoSenderId).catch(() => {});
 
   let made;
   try {
     made = await brevo.createSender({ email: addr, name });
   } catch (err) {
     // Strict-DMARC domains: Brevo refuses a sender until the domain is authenticated → domain first, sender later.
-    if (err.code === "BREVO_BAD_REQUEST" && /dmarc|authenticat/i.test(`${err.providerMessage || ""} ${err.message || ""}`)) {
-      if (existing?.brevoSenderId) await brevo.deleteSender(existing.brevoSenderId).catch(() => {});
+    if (
+      err.code === "BREVO_BAD_REQUEST" &&
+      /dmarc|authenticat/i.test(
+        `${err.providerMessage || ""} ${err.message || ""}`,
+      )
+    ) {
+      if (existing?.brevoSenderId)
+        await brevo.deleteSender(existing.brevoSenderId).catch(() => {});
       const pendingDoc = await EmailSender.findOneAndUpdate(
         { ownerId },
         {
           $set: {
-            orgId: org._id, ownerId, email: addr, displayName: name, brevoSenderId: null, domain,
-            status: "awaiting_domain", verifiedAt: null,
-            domainAuthStatus: "not_started", dnsRecords: [], lastError: null, guidelinesAcceptedAt: new Date(),
+            orgId: org._id,
+            ownerId,
+            email: addr,
+            displayName: name,
+            brevoSenderId: null,
+            domain,
+            status: "awaiting_domain",
+            verifiedAt: null,
+            domainAuthStatus: "not_started",
+            dnsRecords: [],
+            lastError: null,
+            guidelinesAcceptedAt: new Date(),
           },
         },
         { upsert: true, new: true, setDefaultsOnInsert: true },
@@ -96,10 +170,18 @@ async function start({ org, ownerId, email, displayName, guidelinesAccepted }) {
     { ownerId },
     {
       $set: {
-        orgId: org._id, ownerId, email: addr, displayName: name, brevoSenderId: made.id, domain,
+        orgId: org._id,
+        ownerId,
+        email: addr,
+        displayName: name,
+        brevoSenderId: made.id,
+        domain,
         status: alreadyActive ? "verified" : "pending_verification",
         verifiedAt: alreadyActive ? new Date() : null,
-        domainAuthStatus: "not_started", dnsRecords: [], lastError: null, guidelinesAcceptedAt: new Date(),
+        domainAuthStatus: "not_started",
+        dnsRecords: [],
+        lastError: null,
+        guidelinesAcceptedAt: new Date(),
       },
     },
     { upsert: true, new: true, setDefaultsOnInsert: true },
@@ -111,8 +193,13 @@ async function start({ org, ownerId, email, displayName, guidelinesAccepted }) {
 /** Step 2: the client types the 6-digit code from the Brevo e-mail. */
 async function verifyOtp(ownerId, otp) {
   const sender = await getSender(ownerId);
-  if (!sender) throw appError("Set up your sender email first.", "EMAIL_NO_SENDER");
-  if (sender.status === "awaiting_domain") throw appError("Authenticate your domain first. We will email the code right after.", "EMAIL_DOMAIN_FIRST");
+  if (!sender)
+    throw appError("Set up your sender email first.", "EMAIL_NO_SENDER");
+  if (sender.status === "awaiting_domain")
+    throw appError(
+      "Authenticate your domain first. We will email the code right after.",
+      "EMAIL_DOMAIN_FIRST",
+    );
   if (sender.status === "verified") return sender;
   try {
     await brevo.validateSender(sender.brevoSenderId, otp);
@@ -135,11 +222,24 @@ async function verifyOtp(ownerId, otp) {
 /** Brevo has no documented "resend code" call: delete the pending sender and create it again. */
 async function resendOtp(ownerId) {
   const sender = await getSender(ownerId);
-  if (!sender) throw appError("Set up your sender email first.", "EMAIL_NO_SENDER");
-  if (sender.status === "awaiting_domain") throw appError("Authenticate your domain first. We will email the code right after.", "EMAIL_DOMAIN_FIRST");
-  if (sender.status === "verified") throw appError("This sender is already verified.", "EMAIL_ALREADY_VERIFIED");
-  if (sender.brevoSenderId) await brevo.deleteSender(sender.brevoSenderId).catch(() => {});
-  const made = await brevo.createSender({ email: sender.email, name: sender.displayName });
+  if (!sender)
+    throw appError("Set up your sender email first.", "EMAIL_NO_SENDER");
+  if (sender.status === "awaiting_domain")
+    throw appError(
+      "Authenticate your domain first. We will email the code right after.",
+      "EMAIL_DOMAIN_FIRST",
+    );
+  if (sender.status === "verified")
+    throw appError(
+      "This sender is already verified.",
+      "EMAIL_ALREADY_VERIFIED",
+    );
+  if (sender.brevoSenderId)
+    await brevo.deleteSender(sender.brevoSenderId).catch(() => {});
+  const made = await brevo.createSender({
+    email: sender.email,
+    name: sender.displayName,
+  });
   sender.brevoSenderId = made.id;
   sender.status = "pending_verification";
   sender.lastError = null;
@@ -148,11 +248,18 @@ async function resendOtp(ownerId) {
 }
 
 function applyDomain(sender, d) {
-  sender.dnsRecords = d.records.map((r) => ({ key: r.label || r.key, type: r.type, host: r.host, value: r.value, ok: r.ok }));
+  sender.dnsRecords = d.records.map((r) => ({
+    key: r.label || r.key,
+    type: r.type,
+    host: r.host,
+    value: r.value,
+    ok: r.ok,
+  }));
   if (d.authenticated) {
     sender.domainAuthStatus = "authenticated";
     sender.domainAuthenticatedAt = sender.domainAuthenticatedAt || new Date();
-  } else if (sender.domainAuthStatus === "not_started") sender.domainAuthStatus = "pending";
+  } else if (sender.domainAuthStatus === "not_started")
+    sender.domainAuthStatus = "pending";
 }
 
 /** Step 3a: add the domain in Brevo and keep the DNS records to show the client. */
@@ -172,9 +279,15 @@ async function startDomain(sender) {
 /** Step 3b ("Check DNS"): re-read the records; when all are in place ask Brevo to authenticate. */
 async function checkDns(ownerId) {
   const sender = await getSender(ownerId);
-  if (!sender) throw appError("Set up your sender email first.", "EMAIL_NO_SENDER");
-  if (sender.status !== "verified" && sender.status !== "awaiting_domain") throw appError("Verify your sender email first.", "EMAIL_NOT_VERIFIED");
-  if (sender.domainAuthStatus === "not_started" || sender.domainAuthStatus === "failed" || !sender.dnsRecords?.length) {
+  if (!sender)
+    throw appError("Set up your sender email first.", "EMAIL_NO_SENDER");
+  if (sender.status !== "verified" && sender.status !== "awaiting_domain")
+    throw appError("Verify your sender email first.", "EMAIL_NOT_VERIFIED");
+  if (
+    sender.domainAuthStatus === "not_started" ||
+    sender.domainAuthStatus === "failed" ||
+    !sender.dnsRecords?.length
+  ) {
     await startDomain(sender);
   }
   try {
@@ -191,11 +304,26 @@ async function checkDns(ownerId) {
         }
       }
     }
-    sender.lastError = sender.domainAuthStatus === "authenticated" ? null : "We could not find all DNS records yet. DNS changes can take up to a few hours.";
-    if (sender.domainAuthStatus === "failed") sender.domainAuthStatus = "pending";
+    const allFound =
+      (sender.dnsRecords || []).length > 0 &&
+      sender.dnsRecords.every((r) => r.ok);
+    sender.lastError =
+      sender.domainAuthStatus === "authenticated"
+        ? null
+        : allFound
+          ? "All records are found, but the email service has not confirmed them yet. Wait a few minutes and click Check DNS again."
+          : "Some DNS records are still missing (see the Status column). DNS changes can take up to a few hours.";
+    if (sender.domainAuthStatus === "failed")
+      sender.domainAuthStatus = "pending";
     // Domain-first flow: now that the domain is authenticated, create the sender (Brevo emails the OTP).
-    if (sender.status === "awaiting_domain" && sender.domainAuthStatus === "authenticated") {
-      const made = await brevo.createSender({ email: sender.email, name: sender.displayName });
+    if (
+      sender.status === "awaiting_domain" &&
+      sender.domainAuthStatus === "authenticated"
+    ) {
+      const made = await brevo.createSender({
+        email: sender.email,
+        name: sender.displayName,
+      });
       sender.brevoSenderId = made.id;
       if (made.existing && made.active) {
         sender.status = "verified";
@@ -217,24 +345,50 @@ async function remove(ownerId) {
   const sender = await getSender(ownerId);
   if (!sender) return false;
   // Never pull the sender from under a running campaign.
-  const running = await require("../../models/OutboundJob").countDocuments({ ownerId, channel: "email", status: { $in: ["pending", "processing"] } });
-  if (running > 0) throw appError("An email campaign is still running. Cancel or finish it before removing the sender.", "EMAIL_CAMPAIGN_RUNNING");
-  if (sender.brevoSenderId) await brevo.deleteSender(sender.brevoSenderId).catch(() => {});
+  const running = await require("../../models/OutboundJob").countDocuments({
+    ownerId,
+    channel: "email",
+    status: { $in: ["pending", "processing"] },
+  });
+  if (running > 0)
+    throw appError(
+      "An email campaign is still running. Cancel or finish it before removing the sender.",
+      "EMAIL_CAMPAIGN_RUNNING",
+    );
+  if (sender.brevoSenderId)
+    await brevo.deleteSender(sender.brevoSenderId).catch(() => {});
   await EmailSender.deleteOne({ ownerId });
   return true;
 }
 
 /** Light background re-check: senders whose DNS was not ready yet are re-read every so often. */
 async function recheckPending(limit = 50) {
-  const list = await EmailSender.find({ status: { $in: ["verified", "awaiting_domain"] }, domainAuthStatus: { $in: ["pending", "failed"] } }).limit(limit);
+  const list = await EmailSender.find({
+    status: { $in: ["verified", "awaiting_domain"] },
+    domainAuthStatus: { $in: ["pending", "failed"] },
+  }).limit(limit);
   let done = 0;
   for (const s of list) {
     try {
       await checkDns(s.ownerId);
       done += 1;
-    } catch (_) { /* next */ }
+    } catch (_) {
+      /* next */
+    }
   }
   return done;
 }
 
-module.exports = { recheckPending, requireDomainAuth, getSender, readiness, publicView, start, verifyOtp, resendOtp, startDomain, checkDns, remove };
+module.exports = {
+  recheckPending,
+  requireDomainAuth,
+  getSender,
+  readiness,
+  publicView,
+  start,
+  verifyOtp,
+  resendOtp,
+  startDomain,
+  checkDns,
+  remove,
+};

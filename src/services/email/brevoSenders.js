@@ -91,11 +91,21 @@ async function createSender({ email, name }) {
       data: { email, name },
       fallback: "Could not create the sender",
     });
+    const id = Number(data?.id);
+    // On an already authenticated domain Brevo activates the sender at once and sends NO code.
+    let active = false;
+    try {
+      const found = (await listSenders()).find((s) => Number(s.id) === id);
+      active = Boolean(found && found.active);
+    } catch {
+      /* unknown → treat as "needs a code" */
+    }
     return {
-      id: Number(data?.id),
+      id,
       spfError: Boolean(data?.spfError),
       dkimError: Boolean(data?.dkimError),
       existing: false,
+      active,
     };
   } catch (err) {
     if (

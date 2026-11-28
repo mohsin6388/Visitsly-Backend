@@ -165,7 +165,7 @@ async function start({ org, ownerId, email, displayName, guidelinesAccepted }) {
     }
     throw err;
   }
-  const alreadyActive = made.existing && made.active;
+  const alreadyActive = Boolean(made.active); // existing sender, or new one on an authenticated domain (no code needed)
   const doc = await EmailSender.findOneAndUpdate(
     { ownerId },
     {
@@ -241,9 +241,11 @@ async function resendOtp(ownerId) {
     name: sender.displayName,
   });
   sender.brevoSenderId = made.id;
-  sender.status = "pending_verification";
+  sender.status = made.active ? "verified" : "pending_verification";
+  sender.verifiedAt = made.active ? new Date() : null;
   sender.lastError = null;
   await sender.save();
+  if (made.active) await startDomain(sender);
   return sender;
 }
 
@@ -325,7 +327,7 @@ async function checkDns(ownerId) {
         name: sender.displayName,
       });
       sender.brevoSenderId = made.id;
-      if (made.existing && made.active) {
+      if (made.active) {
         sender.status = "verified";
         sender.verifiedAt = new Date();
       } else {

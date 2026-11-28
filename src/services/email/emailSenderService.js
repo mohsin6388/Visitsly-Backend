@@ -92,6 +92,36 @@ function publicView(sender) {
   };
 }
 
+/**
+ * Creates the Brevo sender. A sender left over from an earlier attempt (exists, not active) never gets a
+ * new code, so it is deleted and created again; on an authenticated domain Brevo activates it at once.
+ */
+async function createFreshSender({ email, name }) {
+  let made = await brevo.createSender({ email, name });
+  if (made.existing && !made.active) {
+    await brevo.deleteSender(made.id).catch(() => {});
+    made = await brevo.createSender({ email, name });
+  }
+  return made;
+}
+
+/** A "pending code" sender that Brevo has meanwhile activated (no code is ever sent for those) becomes verified. */
+async function syncActive(sender) {
+  if (
+    !sender ||
+    sender.status !== "pending_verification" ||
+    !sender.brevoSenderId
+  )
+    return false;
+  if ((await brevo.isSenderActive(sender.brevoSenderId)) !== true) return false;
+  sender.status = "verified";
+  sender.verifiedAt = new Date();
+  sender.lastError = null;
+  await sender.save();
+  await startDomain(sender);
+  return true;
+}
+
 /** Step 1: register the address; Brevo e-mails a 6-digit code to it. */
 async function start({ org, ownerId, email, displayName, guidelinesAccepted }) {
   if (guidelinesAccepted !== true)
@@ -130,11 +160,13 @@ async function start({ org, ownerId, email, displayName, guidelinesAccepted }) {
 
   let made;
   try {
-    made = await brevo.createSender({ email: addr, name });
+    made = await createFreshSender({ email: addr, name });
   } catch (err) {
     // Strict-DMARC domains: Brevo refuses a sender until the domain is authenticated → domain first, sender later.
     if (
-      err.code === "BREVO_BAD_REQUEST" &&
+      err.code !== "BREVO_AUTH_ERROR" &&
+      err.code !== "BREVO_RATE_LIMIT" &&
+      err.code !== "BREVO_NOT_CONFIGURED" &&
       /dmarc|authenticat/i.test(
         `${err.providerMessage || ""} ${err.message || ""}`,
       )
@@ -201,6 +233,7 @@ async function verifyOtp(ownerId, otp) {
       "EMAIL_DOMAIN_FIRST",
     );
   if (sender.status === "verified") return sender;
+  if (await syncActive(sender)) return sender; // Brevo already activated it: no code needed
   try {
     await brevo.validateSender(sender.brevoSenderId, otp);
   } catch (err) {
@@ -234,9 +267,10 @@ async function resendOtp(ownerId) {
       "This sender is already verified.",
       "EMAIL_ALREADY_VERIFIED",
     );
+  if (await syncActive(sender)) return sender; // already active in Brevo: nothing to resend
   if (sender.brevoSenderId)
     await brevo.deleteSender(sender.brevoSenderId).catch(() => {});
-  const made = await brevo.createSender({
+  const made = await createFreshSender({
     email: sender.email,
     name: sender.displayName,
   });
@@ -322,7 +356,7 @@ async function checkDns(ownerId) {
       sender.status === "awaiting_domain" &&
       sender.domainAuthStatus === "authenticated"
     ) {
-      const made = await brevo.createSender({
+      const made = await createFreshSender({
         email: sender.email,
         name: sender.displayName,
       });
@@ -382,6 +416,7 @@ async function recheckPending(limit = 50) {
 }
 
 module.exports = {
+  syncActive,
   recheckPending,
   requireDomainAuth,
   getSender,

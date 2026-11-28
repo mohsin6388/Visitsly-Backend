@@ -109,8 +109,9 @@ async function createSender({ email, name }) {
     };
   } catch (err) {
     if (
-      err.code === "BREVO_BAD_REQUEST" &&
-      /already|exist|duplicate/i.test(err.providerMessage || "")
+      /already|exist|duplicate|same/i.test(err.providerMessage || "") &&
+      err.code !== "BREVO_AUTH_ERROR" &&
+      err.code !== "BREVO_RATE_LIMIT"
     ) {
       const found = (await listSenders()).find(
         (s) => String(s.email).toLowerCase() === email.toLowerCase(),
@@ -125,6 +126,18 @@ async function createSender({ email, name }) {
         };
     }
     throw err;
+  }
+}
+
+/** true / false when Brevo knows the sender, null when it cannot be read. */
+async function isSenderActive(senderId) {
+  try {
+    const found = (await listSenders()).find(
+      (s) => Number(s.id) === Number(senderId),
+    );
+    return found ? Boolean(found.active) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -223,9 +236,9 @@ async function createDomain(domain) {
       authenticated: false,
     };
   } catch (err) {
+    // Brevo answers 400 or 409 for "Domain with same name already exists": go by the message, not the status.
     if (
-      err.code === "BREVO_BAD_REQUEST" &&
-      /already exist/i.test(err.providerMessage || "")
+      /already exist|same name/i.test(err.providerMessage || err.message || "")
     )
       return getDomain(domain);
     throw err;
@@ -274,6 +287,7 @@ async function deleteDomain(domain) {
 module.exports = {
   configured,
   listSenders,
+  isSenderActive,
   createSender,
   validateSender,
   deleteSender,
